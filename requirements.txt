@@ -1,0 +1,30 @@
+# Core numerics
+numpy>=1.26
+scipy>=1.11
+pandas>=2.1
+
+# Environment API (we implement gymnasium.Env for our own sim)
+gymnasium>=0.29
+
+# Baselines + evaluation metrics (CART baseline, adjusted Rand index)
+scikit-learn>=1.4
+
+# Gradient-boosted baseline to compare split behaviour against
+xgboost>=2.0
+
+# Transition-graph analysis (bottleneck / spectral subgoal discovery, phase 2)
+networkx>=3.2
+
+# Reference implementations of fluctuation / structural-change tests
+statsmodels>=0.14
+
+# Plotting diagnostics (instability bar charts, gain curves, regularisation paths)
+matplotlib>=3.8
+
+# Behaviour tree runtime, for expressing the ground-truth tree once the
+# hand-rolled prototype policy is validated
+py_trees>=2.2
+
+# Dev
+pytest>=8.0
+numba>=0.60

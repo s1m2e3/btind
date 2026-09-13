@@ -1,0 +1,217 @@
+{
+ "rows": {
+  "loss-selected": [
+   {
+    "round": 0,
+    "G": -0.8161316232929291,
+    "ci": 0.39062471053306136,
+    "eaten": 3.255333333333333,
+    "n_clauses": 4,
+    "n_literals": 5,
+    "feats": [
+     "d_food",
+     "d_threat",
+     "pos_x"
+    ],
+    "distractors": [
+     "pos_x"
+    ]
+   },
+   {
+    "round": 1,
+    "G": -0.9863184089515947,
+    "ci": 0.38185193552789687,
+    "eaten": 3.0883333333333334,
+    "n_clauses": 4,
+    "n_literals": 6,
+    "feats": [
+     "d_food",
+     "d_threat",
+     "pos_x",
+     "pos_y"
+    ],
+    "distractors": [
+     "pos_x",
+     "pos_y"
+    ]
+   },
+   {
+    "round": 2,
+    "G": 6.062091552020185,
+    "ci": 0.3689058493811033,
+    "eaten": 5.496,
+    "n_clauses": 5,
+    "n_literals": 6,
+    "feats": [
+     "d_threat",
+     "pos_x",
+     "t_norm"
+    ],
+    "distractors": [
+     "pos_x"
+    ]
+   },
+   {
+    "round": 3,
+    "G": 8.859274464445805,
+    "ci": 0.3604185697492718,
+    "eaten": 7.335,
+    "n_clauses": 7,
+    "n_literals": 8,
+    "feats": [
+     "d_food",
+     "d_threat",
+     "noise",
+     "pos_y",
+     "t_norm"
+    ],
+    "distractors": [
+     "noise",
+     "pos_y"
+    ]
+   },
+   {
+    "round": 4,
+    "G": 2.441348001738531,
+    "ci": 0.3262641757853615,
+    "eaten": 3.7143333333333333,
+    "n_clauses": 4,
+    "n_literals": 5,
+    "feats": [
+     "d_food",
+     "d_threat",
+     "energy",
+     "pos_x"
+    ],
+    "distractors": [
+     "pos_x"
+    ]
+   },
+   {
+    "round": 5,
+    "G": 7.20207077042278,
+    "ci": 0.3251898119200686,
+    "eaten": 6.473333333333334,
+    "n_clauses": 9,
+    "n_literals": 10,
+    "feats": [
+     "d_food",
+     "d_threat",
+     "energy",
+     "pos_y",
+     "t_norm"
+    ],
+    "distractors": [
+     "pos_y"
+    ]
+   },
+   {
+    "round": 6,
+    "G": 6.318747269872212,
+    "ci": 0.33899066255260213,
+    "eaten": 5.939666666666667,
+    "n_clauses": 6,
+    "n_literals": 8,
+    "feats": [
+     "d_threat",
+     "energy",
+     "pos_x",
+     "t_norm"
+    ],
+    "distractors": [
+     "pos_x"
+    ]
+   }
+  ],
+  "rollout-selected": [
+   {
+    "round": 0,
+    "G": -1.1692511084919948,
+    "ci": 0.37695888236561986,
+    "eaten": 3.2346666666666666,
+    "n_clauses": 1,
+    "n_literals": 2,
+    "feats": [
+     "d_threat",
+     "pos_y"
+    ],
+    "distractors": [
+     "pos_y"
+    ]
+   },
+   {
+    "round": 1,
+    "G": 1.6893123207661291,
+    "ci": 0.39890673000028604,
+    "eaten": 3.9606666666666666,
+    "n_clauses": 1,
+    "n_literals": 1,
+    "feats": [
+     "d_threat"
+    ],
+    "distractors": []
+   },
+   {
+    "round": 2,
+    "G": 3.2788200822929423,
+    "ci": 0.3926132973427862,
+    "eaten": 4.5873333333333335,
+    "n_clauses": 1,
+    "n_literals": 1,
+    "feats": [
+     "d_threat"
+    ],
+    "distractors": []
+   },
+   {
+    "round": 3,
+    "G": 7.854726651938808,
+    "ci": 0.379825590243522,
+    "eaten": 6.634,
+    "n_clauses": 2,
+    "n_literals": 2,
+    "feats": [
+     "d_threat"
+    ],
+    "distractors": []
+   },
+   {
+    "round": 4,
+    "G": 7.942996317481779,
+    "ci": 0.3565381298981365,
+    "eaten": 7.221333333333333,
+    "n_clauses": 1,
+    "n_literals": 1,
+    "feats": [
+     "d_threat"
+    ],
+    "distractors": []
+   },
+   {
+    "round": 5,
+    "G": 10.306546494335345,
+    "ci": 0.3665580358557998,
+    "eaten": 8.329666666666666,
+    "n_clauses": 2,
+    "n_literals": 2,
+    "feats": [
+     "d_threat"
+    ],
+    "distractors": []
+   },
+   {
+    "round": 6,
+    "G": 10.3833367310591,
+    "ci": 0.34929213800987874,
+    "eaten": 8.507333333333333,
+    "n_clauses": 2,
+    "n_literals": 2,
+    "feats": [
+     "d_threat"
+    ],
+    "distractors": []
+   }
+  ]
+ },
+ "cem": 12.793583149604268
+}
