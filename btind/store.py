@@ -144,9 +144,16 @@ def summary(root=RUNS):
         return []
     rows = []
     for f in sorted(os.listdir(d)):
+        # The proposal weights live in this directory too, under a name ending
+        # `.weights.json`, and are not banks -- reading them as banks raised a
+        # KeyError from a function whose whole job is a glance before a run.
+        if not f.endswith(".json") or f.endswith(".weights.json"):
+            continue
         with open(os.path.join(d, f), encoding="utf-8") as fh:
             blob = json.load(fh)
-        w = blob["world"]
+        if "banks" not in blob:
+            continue
+        w = blob.get("world", {})
         rows.append(dict(key=f[:-5], n=len(blob["banks"]),
                          best=blob["banks"][0]["G"] if blob["banks"] else None,
                          masked=bool(w.get("vision_r", 0)),
