@@ -26,6 +26,7 @@ import time
 
 import numpy as np
 
+from . import proposal as PR
 from . import store as ST
 from .betasearch import search_beta
 from .grow_bt import failure_states, grow
@@ -55,20 +56,40 @@ def _cover(env, n, rng):
 
 
 def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
-        tag="rlfit"):
+        tag="rlfit", run_seed=None, branch=None, transfer_from=None):
+    """One run. `run_seed` varies the PROPOSALS, never the evaluation.
+
+    The rollout seed stays fixed so every candidate in a run is compared on
+    identical episodes; what varies between runs is which candidates get
+    proposed. Without that, a warm-started run replays itself exactly -- two
+    masked runs returned the same tree to the decimal.
+    """
     cfg = dict(DEFAULTS, **(cfg or {}))
-    rng = rng or np.random.default_rng(0)
+    run_seed = int(np.random.SeedSequence().entropy % 2**31 if run_seed is None
+                   else run_seed)
+    rng = rng or np.random.default_rng(run_seed)
     n_obs = len(names)
     zn0 = mem_names(names, None)
     pol_fn = lambda b: MemBank(b, n_obs)
     t0 = time.time()
 
-    bank, meta = (ST.best(env) if warm else (None, None))
+    # BRANCH, don't always resume the incumbent: a monotone search restarted at
+    # its own optimum has nowhere to go. `branch` picks how far down the kept
+    # population to start; None means occasionally take a lower-ranked bank.
+    if branch is None:
+        branch = int(rng.integers(0, 3)) if rng.random() < 0.35 else 0
+    bank, meta = (ST.best(env, rank=branch) if warm else (None, None))
+    if bank is None and transfer_from is not None:
+        bank, meta = ST.transfer(transfer_from, env)
+        if bank is not None and verbose:
+            print("  transferred a bank from another world: %d arms, it scored "
+                  "%.2f there" % (len(bank["clauses"]), meta["G"]), flush=True)
     if bank is not None:
         bank["names"] = list(names)
         if verbose:
-            print("  warm start: %d arms, stored G %.2f (%s)"
-                  % (len(bank["clauses"]), meta["G"], meta["tag"]), flush=True)
+            print("  warm start: %d arms, stored G %.2f (%s, rank %d) | "
+                  "run_seed %d" % (len(bank["clauses"]), meta["G"],
+                                   meta["tag"], branch, run_seed), flush=True)
     else:
         th, _ = cem_law(env, dict(clauses=[], laws=[],
                                   default=rng.normal(0, .3, (len(zn0) + 1, 2)),
@@ -83,7 +104,21 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                   % score(env, bank, pol_fn, cfg["n_ep"], cfg["T"],
                           cfg["seed"]).mean(), flush=True)
 
-    seeds = ST.clauses(env) if warm else []
+    weights = PR.load(env, len(mem_names(names, None)) + 8)
+    weights.n = len(mem_names(names, None)) + 8
+    if verbose:
+        top = weights.top(mem_names(names, None) + ["mem"] * 8, k=5)
+        if any(t[3] for t in top):
+            print("  learned proposal weights: %s"
+                  % ", ".join("%s %.2f(%d/%d)" % t for t in top), flush=True)
+    # A STORED CLAUSE MAY NOT FIT THIS BANK. The store keeps guards from every
+    # bank for this world, including ones that had a blackboard, and those
+    # reference memory columns that do not exist in a bank without one --
+    # measured, a `have_mem` literal at column 29 proposed into a 27-wide
+    # layout. Seeds are filtered to the layout they are being proposed into.
+    _w0 = len(mem_names(names, bank.get("mem")))
+    seeds = ([c for c in ST.clauses(env) if all(l[0] < _w0 for l in c)]
+             if warm else [])
     if verbose and seeds:
         print("  store offers %d accepted clauses as proposals" % len(seeds),
               flush=True)
@@ -108,9 +143,11 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
 
         import btind.grow_bt as _GB
         _cp = _GB._clause_pool
-        _GB._clause_pool = (lambda rg, al, ZZ, _h, pl, ma, la, sd, _hot=hot:
+        _GB._clause_pool = (lambda rg, al, ZZ, _h, pl, ma, la, sd, *a,
+                            _hot=hot, **kw:
                             _cp(rg, al, ZZ, _hot if len(_hot) else None, pl, ma,
-                                la, sd))
+                                la, sd, *a, **kw))
+        seeds = [c for c in seeds if all(l[0] < Z.shape[1] for l in c)]
         bank, glog = grow(env, bank, names, zn, pol_fn, obs, Z,
                           max_arms=cfg["grow_arms"], pool=cfg["grow_pool"],
                           max_arity=cfg["max_arity"], min_n=cfg["min_n"],
@@ -119,7 +156,8 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           screen_ep=cfg["n_ep"], confirm_ep=cfg["n_ep"],
                           n_confirm=10, T=cfg["T"], seed=cfg["seed"],
                           z=cfg["z"], rng=rng, use_library=False,
-                          verbose=verbose)
+                          weights=weights, verbose=verbose)
+        weights.update_many(glog)
         _GB._clause_pool = _cp
         bank, cur, _ = simplify(env, bank, pol_fn, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=cfg["seed"], z=cfg["z"],
@@ -178,6 +216,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
     from .pipeline import evaluate_bank
     m = evaluate_bank(env, bank, n_obs=n_obs)
     ST.save(env, bank, m, names=mem_names(names, bank.get("mem")), tag=tag)
+    PR.save(env, weights)
     if verbose:
         print("  held-out G %.2f +-%.2f  pickups %.2f -- stored"
               % (m["G"], m["ci"], m["eaten"]), flush=True)

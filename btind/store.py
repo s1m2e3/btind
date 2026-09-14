@@ -71,8 +71,15 @@ def save(env, bank, metrics, names=None, tag="", root=RUNS):
     return p
 
 
-def best(env, root=RUNS, min_G=None):
-    """The highest-scoring stored bank for this world, or None."""
+def best(env, root=RUNS, min_G=None, rank=0):
+    """A stored bank for this world, `rank` places down from the best.
+
+    Branching from somewhere other than the incumbent is how a monotone search
+    leaves a local optimum: every operator here accepts only improvements, so a
+    run resumed from the same bank with the same seeds reproduces itself exactly
+    -- measured, two masked runs returned identical trees. The population is
+    kept for this; using only its first element wastes it.
+    """
     p = _path(env, root)
     if not os.path.exists(p):
         return None, None
@@ -80,10 +87,26 @@ def best(env, root=RUNS, min_G=None):
         blob = json.load(fh)
     if not blob["banks"]:
         return None, None
-    e = blob["banks"][0]
+    e = blob["banks"][min(rank, len(blob["banks"]) - 1)]
     if min_G is not None and e["G"] < min_G:
         return None, None
     return bank_from_json(e["bank"]), e
+
+
+def transfer(src_env, dst_env, root=RUNS):
+    """The best bank from ANOTHER world, to adapt rather than rediscover.
+
+    Masked and unmasked NestWorld are one task seen through different windows,
+    and the unmasked one is solved. Handing the masked search a working
+    seek/carry/flee skeleton is not importing an expert -- it is starting from a
+    controller that was itself found by rollout, and every move made afterwards
+    still has to clear its own paired test on the harder world.
+
+    Only the bank crosses over. The store stays keyed by world signature so
+    nothing is ever resumed across worlds by accident.
+    """
+    b, meta = best(src_env, root)
+    return (b, meta) if b is not None else (None, None)
 
 
 def clauses(env, root=RUNS, max_clauses=40, min_G=None):

@@ -156,16 +156,23 @@ def _prune(cl, Z, lo=0.005, hi=0.90):
     return keep if lo < f < hi else None
 
 
-def _clause_pool(rng, alpha, Z, hot, pool, max_arity, last, seeds):
-    """Random conjunctions, drift of the last accepted arm, and any seeds."""
+def _clause_pool(rng, alpha, Z, hot, pool, max_arity, last, seeds,
+                 weights=None, cols=None):
+    """Random conjunctions, drift of the last accepted arm, and any seeds.
+
+    Columns are drawn from LEARNED weights when they are supplied: a column that
+    has produced accepted arms before is proposed more often, an untried column
+    outranks one that has failed repeatedly, and nothing is ever excluded.
+    """
+    from .proposal import rand_literal
     out = []
     for _ in range(pool):
         # ARITY BIASED LOW. A uniform draw over 1..max_arity spends most of the
         # pool on conjunctions, and a conjunction wins its rollout for one of
         # its literals while the others ride along. Simple guards first.
         k = 1 if rng.random() < 0.6 else 1 + int(rng.integers(max_arity))
-        out.append(dedupe_literals([_rand_literal(rng, alpha, Z, hot)
-                                    for _ in range(k)]))
+        out.append(dedupe_literals([rand_literal(rng, alpha, Z, hot, weights,
+                                                 cols) for _ in range(k)]))
     if last is not None:
         for _ in range(6):
             cl = [l[:] for l in last]
@@ -247,7 +254,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
          w=None, seed_clauses=None, screen_ep=120, confirm_ep=600,
          n_confirm=12, T=400, seed=777, z=2.0, rng=None, verbose=True,
          use_library=False, cem_region=True, cem_top=10, cem_iter=3,
-         cem_K=24, cem_sigma=0.4, cols=None, structural=True):
+         cem_K=24, cem_sigma=0.4, cols=None, structural=True, weights=None):
     """Add arms while a rollout says they pay by more than `min_gain`."""
     rng = rng or np.random.default_rng(0)
     alpha = Alphabet(n_thresholds=9).fit(
@@ -279,7 +286,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
         if hot is not None:
             hot = hot[~claimed[hot]]
         cands = _clause_pool(rng, alpha, Z, hot, pool, max_arity, last,
-                             seed_clauses if k == 0 else None)
+                             seed_clauses if k == 0 else None, weights, cols)
 
         rows = []
         for cl in cands:
@@ -301,6 +308,15 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                       % (k, min_n), flush=True)
             break
         rows.sort(key=lambda r: -r[0])
+        # NEGATIVE EVIDENCE COMES FROM THE SCREEN, not the shortlist. Recording
+        # only the candidates that reach the confirm stage teaches the proposal
+        # weights about winners and nothing about losers -- measured, 525
+        # recorded tries left every top-weighted column at "accepted 0 / 0",
+        # because the columns that keep failing were never written down.
+        for d, cl, th, lname, nrow in rows[n_confirm:]:
+            log.append(dict(arm=k, law=lname, screen=d, rows=nrow,
+                            clause=[l[:] for l in cl], stage="screen",
+                            accepted=False))
 
         # THE BEST LAW FOR THE REGION, found the way everything else here is
         # found. `rsfi` answered "is this region worth having, GIVEN the best
@@ -332,7 +348,8 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                 ok, dl, _ = accept(env, cand, pol_fn, cur_full, confirm_ep, T,
                                    seed, z)
                 log.append(dict(arm=k, law=lname, pos=pos, screen=d, delta=dl,
-                                rows=nrow, accepted=bool(ok and dl > min_gain)))
+                                rows=nrow, clause=[l[:] for l in cl],
+                                accepted=bool(ok and dl > min_gain)))
                 if ok and dl > best_d:
                     best, best_d, best_cl = cand, dl, cl
                     desc = "%s -> %s @%d (%d rows)" % (
