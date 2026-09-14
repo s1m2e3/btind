@@ -50,6 +50,13 @@ def _fast_score(env, bank, n_ep, T, seed):
         return None
     if type(env).__name__ != "NestWorld" or not bank.get("laws_on_z"):
         return None
+    # THE KERNEL NORMALISES; IT DOES NOT ARGMAX. Letting a discrete-head bank
+    # through here would return a unit heading where the caller expects an
+    # action index, and it would do it silently and 200x faster than the path
+    # that is correct -- the exact shape of the law/layout bug that cost three
+    # sites earlier in this project. Refuse until the kernel learns the head.
+    if bank.get("head", "vector") != "vector":
+        return None
     n_obs = len(bank["names"])
     # The kernel sets V_hat and leverage to zero, exactly as MemBank does when
     # no critic is attached. So the only real incompatibility is a GUARD that

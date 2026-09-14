@@ -208,7 +208,13 @@ class MemBank:
         return a
 
     # -- action --------------------------------------------------------------
-    def act(self, obs):
+    def scores(self, obs):
+        """The active arm's law applied to the features -- before any head.
+
+        Every head reads the same affine quantity; they differ only in what
+        they do with it. Splitting it out means the arbitration, the memory and
+        the laws are shared by both heads rather than duplicated per head.
+        """
         Z = self.z(obs)
         a = self.arbitrate(Z)
         Xd = design_matrix(Z) if self.b.get("laws_on_z") else design_matrix(obs)
@@ -216,6 +222,31 @@ class MemBank:
         for c in np.unique(a[a >= 0]):
             m = a == c
             out[m] = Xd[m] @ self.b["laws"][c]
+        return out
+
+    def preferences(self, obs, temp=1.0):
+        """Softmax of the scores: the FUZZY reading of a discrete-head law.
+
+        `argmax` is the defuzzification the environment actually receives; this
+        is the membership it is taken from, and it is what a differentiable
+        fitter would work on if one is ever wanted. Nothing in the search reads
+        it -- CEM scores theta by rollout and never needs a gradient, which is
+        why the discrete head costs this project nothing.
+        """
+        s = self.scores(obs) / max(temp, 1e-9)
+        e = np.exp(s - s.max(axis=1, keepdims=True))
+        return e / e.sum(axis=1, keepdims=True)
+
+    def act(self, obs):
+        out = self.scores(obs)
+        # TWO HEADS, ONE LAW CLASS. `vector` normalises the score into a unit
+        # heading, which is what a holonomic 2-D agent takes. `argmax` reads the
+        # same score as a PREFERENCE over a discrete action set and returns the
+        # index of the winner -- a linear scoring rule per region, which makes
+        # the effective policy piecewise constant on polyhedra nested inside the
+        # partition the tree already carves.
+        if self.b.get("head") == "argmax":
+            return np.argmax(out, axis=1)
         nrm = np.linalg.norm(out, axis=1, keepdims=True)
         return out / np.maximum(nrm, 1e-9)
 
