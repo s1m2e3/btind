@@ -245,9 +245,17 @@ class HighwayBatch:
         V is 15, so the intermediate is 225 floats per episode, which is nothing
         against paying an interpreter 36000 times.
         """
-        lane = lane_of if target_lane is None else target_lane
+        # TWO LANE ARRAYS, NOT ONE. `lane_self` is the lane the vehicle being
+        # scored is considering; `lane_other` is where everyone else actually
+        # is. Passing a single array meant that asking "what if car q moved
+        # left" shifted the WHOLE traffic stream left with it, so MOBIL scored
+        # a candidate against a road that does not exist -- and the fused
+        # kernel, which compares one candidate against the others' real lanes,
+        # disagreed with this model by 25 return units. The kernel was right.
+        lane_self = lane_of if target_lane is None else target_lane
+        lane_other = lane_of
         dx = X[:, None, :] - X[:, :, None]              # [ego i, other j]
-        same = np.abs(lane[:, None, :] - lane[:, :, None]) < 0.5
+        same = np.abs(lane_other[:, None, :] - lane_self[:, :, None]) < 0.5
         d = np.where(same & (dx > 0.0), dx, np.inf)
         n, V = X.shape
         d[:, np.arange(V), np.arange(V)] = np.inf
@@ -266,30 +274,56 @@ class HighwayBatch:
         inter = ACC_COMF * np.power(np.maximum(d_star, 0.0) / _nz(gap), 2.0)
         return free - np.where(gap < FAR, inter, 0.0)
 
+    def _front_one(self, X, S, lane_other, lane_q, q):
+        """Gap and speed of the nearest vehicle ahead of vehicle `q`.
+
+        One vehicle against the rest, so the reduction is (n, V) rather than
+        (n, V, V) -- which is what makes a sequential sweep over vehicles no
+        more expensive than the simultaneous one it replaces.
+        """
+        dx = X - X[:, q:q + 1]
+        same = np.abs(lane_other - lane_q[:, None]) < 0.5
+        d = np.where(same & (dx > 0.0), dx, np.inf)
+        d[:, q] = np.inf
+        j = np.argmin(d, axis=1)
+        best = np.take_along_axis(d, j[:, None], 1)[:, 0]
+        has = np.isfinite(best)
+        return (np.where(has, best, FAR),
+                np.where(has, np.take_along_axis(S, j[:, None], 1)[:, 0], 0.0))
+
     def _mobil(self, X, Y, S, lane, timer):
-        """MOBIL, evaluated only for the traffic and only when its timer is up.
+        """MOBIL, swept over vehicles IN ORDER, which is what highway-env does.
+
+        `road.act()` calls each vehicle's `act()` in a loop, so vehicle q+1
+        decides against a road in which q has ALREADY moved. Deciding every
+        vehicle simultaneously from the old lanes is a different model, and it
+        is the one this had: it agreed with the fused kernel exactly up to three
+        vehicles -- where no lane change ever happens -- and diverged by 25
+        return units at fifteen. The batching that matters is over EPISODES; the
+        vehicle axis is 15 long and sequential.
 
         Politeness is 0.0 in highway-env's default, so the criterion reduces to
-        "the change helps me by at least MIN_GAIN and does not force the new
-        follower to brake harder than MAX_IMPOSED_BRAKING".
+        "the change gains me at least MIN_GAIN".
         """
-        n, V = X.shape
         new_lane = lane.copy()
-        ready = timer >= LANE_CHANGE_DELAY
-        ready[:, 0] = False                          # the ego is not MOBIL-driven
-        if not ready.any():
-            return new_lane
-        gap0, fs0 = self._front(X, Y, S, lane)
-        a0 = self._idm(S, np.full_like(S, 30.0), gap0, fs0)
-        for d in (-1, 1):
-            cand = np.clip(lane + d, 0, self.n_lanes - 1)
-            moved = (cand != lane) & ready
-            if not moved.any():
+        V = X.shape[1]
+        for q in range(1, V):
+            ready = timer[:, q] >= LANE_CHANGE_DELAY
+            if not ready.any():
                 continue
-            gap1, fs1 = self._front(X, Y, S, lane, target_lane=cand)
-            a1 = self._idm(S, np.full_like(S, 30.0), gap1, fs1)
-            take = moved & ((a1 - a0) > MIN_GAIN)
-            new_lane = np.where(take, cand, new_lane)
+            g0, f0 = self._front_one(X, S, new_lane, new_lane[:, q], q)
+            a0 = self._idm(S[:, q], np.full(len(X), 30.0), g0, f0)
+            moved = np.zeros(len(X), bool)
+            for d in (-1.0, 1.0):
+                cand = np.clip(new_lane[:, q] + d, 0, self.n_lanes - 1)
+                live = ready & ~moved & (cand != new_lane[:, q])
+                if not live.any():
+                    continue
+                g1, f1 = self._front_one(X, S, new_lane, cand, q)
+                a1 = self._idm(S[:, q], np.full(len(X), 30.0), g1, f1)
+                take = live & ((a1 - a0) > MIN_GAIN)
+                new_lane[:, q] = np.where(take, cand, new_lane[:, q])
+                moved |= take
         return new_lane
 
     # -- one policy step -----------------------------------------------------

@@ -44,6 +44,8 @@ def score(env, bank, pol_fn, n_ep, T, seed):
 
 def _fast_score(env, bank, n_ep, T, seed):
     """Fused rollout, or None when this bank/world combination cannot use it."""
+    if type(env).__name__ == "HighwayBatch":
+        return _fast_score_highway(env, bank, n_ep, T, seed)
     try:
         from .envs.nest_fast import flatten_mem, params, rollout_mem, uses_vq
     except Exception:
@@ -75,6 +77,32 @@ def _fast_score(env, bank, n_ep, T, seed):
                 f["b_neg"], f["b_start"], f["b_len"], f["sticky"],
                 f["mem_cols"], f["w_col"], f["w_thr"], f["w_neg"], f["laws"],
                 f["n_obs"], T, G)
+    return G
+
+
+def _fast_score_highway(env, bank, n_ep, T, seed):
+    """The highway kernel, which carries the physics and the tree together.
+
+    Measured at 0.065 ms an episode against 3.45 ms for the numpy model and
+    140 ms for highway-env itself. The head must be `argmax` here: this world
+    has no vector head and running one would score a heading as an action index.
+    """
+    try:
+        from .envs.highway_fast import flatten, params, rollout, uses_vq
+    except Exception:
+        return None
+    if bank.get("head") != "argmax" or not bank.get("laws_on_z"):
+        return None
+    n_obs = len(bank["names"])
+    if uses_vq(bank, n_obs):
+        return None
+    s = env.sample_starts(n_ep, np.random.default_rng(seed))
+    f = flatten(bank, n_obs)
+    G = np.empty(len(s))
+    rollout(np.ascontiguousarray(s), params(env), f["lit_col"], f["lit_thr"],
+            f["lit_neg"], f["cl_start"], f["cl_len"], f["b_col"], f["b_thr"],
+            f["b_neg"], f["b_start"], f["b_len"], f["sticky"], f["mem_cols"],
+            f["w_col"], f["w_thr"], f["w_neg"], f["laws"], f["n_obs"], T, G)
     return G
 
 
