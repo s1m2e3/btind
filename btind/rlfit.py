@@ -33,14 +33,16 @@ from .grow_bt import failure_states, grow
 from .lawcem import cem_law, improve_laws
 from .memory import MemBank, emit, mem_names
 from .memsearch import discover as mem_discover, record
-from .structure import (drop_arm, polish_thresholds, reorder, score,
+from .escape import kick
+from .structure import (absorb_universal, drop_arm, polish_thresholds, reorder, score,
                          simplify)
 
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
     grow_pool=60, grow_arms=4, max_arity=3, min_n=400,
     cem_iter=12, cem_K=96, cem_sigma=0.35,
-    mem_at=1, mem_thr=7, beta_at=2, n_cover=6000,
+    mem_at=1, mem_thr=7, mem_refine=3, beta_at=2, n_cover=6000,
+    stall_before_kick=1, kick_size=1,
 )
 
 
@@ -124,6 +126,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
               flush=True)
 
     log = []
+    best_bank, best_G, stalled = bank, None, 0
     for r in range(rounds):
         zn = mem_names(names, bank.get("mem"))
         cov = env.observe(_cover(env, cfg["n_cover"], np.random.default_rng(r)))
@@ -139,7 +142,29 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         p.reset(len(obs))
         Z = p.z(obs, update=False)
         cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], cfg["seed"])
-        rec = dict(round=r, G_in=float(cur.mean()), moves=[])
+        # TIES GO TO THE NEWER BANK. Capturing the incumbent only on a strict
+        # improvement kept a seven-arm tree over the six-arm one a later round
+        # had simplified it into at equal return -- and the seven-arm one still
+        # carried the universal guard that absorb had just removed, so the
+        # revert at the end undid the repair. Equal return, fewer arms, later in
+        # the search: the newer bank is the better incumbent.
+        if best_G is None or cur.mean() >= best_G:
+            best_bank, best_G = bank, float(cur.mean())
+        # THE HOP HAPPENS AFTER A STALLED ROUND, not on a schedule. A round
+        # that accepted something has not run out of monotone moves yet, and
+        # kicking it would throw away progress the test had already bought.
+        if stalled >= cfg["stall_before_kick"]:
+            bank, why = kick(bank, Z, rng, n=cfg["kick_size"])
+            cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], cfg["seed"])
+            if verbose:
+                print("  [round %d] stalled %d rounds -- kick: %s  (G %.2f -> "
+                      "%.2f, to be re-optimised)"
+                      % (r, stalled, why, best_G, cur.mean()), flush=True)
+            stalled = 0
+            rec_kick = why
+        else:
+            rec_kick = None
+        rec = dict(round=r, G_in=float(cur.mean()), moves=[], kick=rec_kick)
 
         import btind.grow_bt as _GB
         _cp = _GB._clause_pool
@@ -162,6 +187,16 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         bank, cur, _ = simplify(env, bank, pol_fn, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=cfg["seed"], z=cfg["z"],
                                 names=zn, verbose=verbose)
+        # BEFORE ANYTHING IS APPENDED, make sure the end of the tree is
+        # reachable. A guard that matches every state turns its arm into a
+        # second default and every arm below it into dead code -- which is
+        # where the memory search puts its arm.
+        bank, cur, absorbed = absorb_universal(env, bank, pol_fn, Z, cur_G=cur,
+                                               n_ep=cfg["n_ep"], T=cfg["T"],
+                                               seed=cfg["seed"], z=cfg["z"],
+                                               names=zn, verbose=verbose)
+        if absorbed:
+            rec["moves"].append("absorb")
         bank, cur, llog = improve_laws(env, bank, pol_fn, cur=cur,
                                        n_ep=cfg["n_ep"], T=cfg["T"],
                                        seed=cfg["seed"], z=cfg["z"],
@@ -186,7 +221,9 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                       screen_ep=cfg["n_ep"],
                                       confirm_ep=cfg["n_ep"], n_confirm=25,
                                       T=cfg["T"], seed=cfg["seed"],
-                                      z=cfg["z"], verbose=verbose)
+                                      z=cfg["z"], verbose=verbose,
+                                      n_refine=cfg["mem_refine"],
+                                      weights=weights, rng=rng)
             if bank.get("mem"):
                 rec["moves"].append("memory")
             cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], cfg["seed"])
@@ -207,11 +244,24 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         rec["G_out"] = float(score(env, bank, pol_fn, cfg["n_ep"], cfg["T"],
                                    cfg["seed"]).mean())
         rec["n_arms"] = len(bank["clauses"])
+        if best_G is None or rec["G_out"] >= best_G:
+            best_bank, best_G = bank, float(rec["G_out"])
+        stalled = 0 if rec["moves"] else stalled + 1
         log.append(rec)
         if verbose:
             print("  [round %d] %-26s G %6.2f -> %6.2f  %d arms  [%.0fs]"
                   % (r, ",".join(rec["moves"]) or "-", rec["G_in"],
                      rec["G_out"], rec["n_arms"], time.time() - t0), flush=True)
+
+    # A HOP IS KEPT ONLY IF IT PAID. Reverting here is what preserves the
+    # monotone guarantee at the outer level: the run can never return a
+    # controller worse than the best one it held, however the kicks landed.
+    final = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], cfg["seed"]).mean()
+    if best_G is not None and final < best_G:
+        if verbose:
+            print("  hops did not pay (%.2f < %.2f) -- reverting to the best "
+                  "bank held" % (final, best_G), flush=True)
+        bank = best_bank
 
     from .pipeline import evaluate_bank
     m = evaluate_bank(env, bank, n_obs=n_obs)

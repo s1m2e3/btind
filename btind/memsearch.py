@@ -205,10 +205,176 @@ def search_memory(env, bank, names, pol_fn, n_obs, U_star, OB, AL,
     return (best or bank), log, ranked
 
 
+# ------------------------------------------------ the second half of a guard
+def z_rows(OB, AL, mem, n_obs, max_rows=60000, rng=None):
+    """Recorded observations laid out in a bank's FULL column order.
+
+    The memory columns are replayed offline by `latched`, the same way the
+    ranking stage builds them, so a guard alphabet over the blackboard costs no
+    extra rollout. `V_hat` and `leverage` are present as zeros and are never
+    offered: a guard that reads them forces the Python path and costs 60x.
+    """
+    rng = rng or np.random.default_rng(0)
+    live = np.flatnonzero(AL.reshape(-1))
+    if len(live) > max_rows:
+        live = rng.choice(live, max_rows, replace=False)
+    O = OB.reshape(-1, OB.shape[2])[live]
+    cols = list(mem["cols"])
+    V, H = latched(OB, cols, mem["write"])
+    V = V.reshape(-1, len(cols))[live]
+    H = H.reshape(-1)[live].astype(float)[:, None]
+    Z = np.hstack([O, np.zeros((len(O), 2)), V, H])
+    offered = list(range(n_obs)) + list(range(n_obs + 2, Z.shape[1] - 1))
+    return Z, offered
+
+
+def refine_guard(env, bank, arm, zn, pol_fn_for, Z, offered, n_thr=7, n_try=48,
+                 screen_ep=120, confirm_ep=600, n_keep=6, T=400, seed=777,
+                 z=2.0, weights=None, rng=None, verbose=True, positions=None,
+                 screen_pos=0, min_cover=0.005):
+    """Conjoin a SECOND literal onto one arm's guard, chosen by rollout.
+
+    THE MEMORY ARM CANNOT WORK AS A SINGLETON. `have_mem > 0.5` is true forever
+    once the blackboard has been written, so the arm is either at the top, where
+    it overrides everything the tree already does well, or at the bottom, where
+    it inherits whatever no other arm claimed. Measured: every one of 10752
+    candidates scored at or below zero, and the accepted gain was +0.00 on every
+    run. The arm needs to say WHEN the remembered value is the thing to act on,
+    and that condition -- in this world, "and you cannot see it now" -- is a
+    second literal, not a different memory rule.
+
+    Writing that conjunct by hand would be the task knowledge this project is
+    trying not to spend, so it is searched from the same alphabet as any other
+    guard, over the same columns, with the same paired test deciding.
+
+    POSITION IS RE-SEARCHED with the narrowed guard, because the reason the arm
+    was pushed to the bottom was that it claimed too much. A guard that fires on
+    8% of states can sit above arms that a guard firing on 90% had to yield to.
+    """
+    from .thresholds import literals
+    rng = rng or np.random.default_rng(0)
+    cl0 = bank["clauses"][arm]
+    cands = []
+    for j in offered:
+        cands += literals(Z[:, j], j, n_thr=n_thr, lo=0.03, hi=0.97,
+                          name=zn[j] if j < len(zn) else str(j))
+    cands = [(c, lb) for c, lb in cands if c[0][0] not in [l[0] for l in cl0]]
+    if weights is not None and len(cands) > n_try:
+        w = weights.probs([c[0][0] for c, _ in cands])
+        p = np.array([w[c[0][0]] for c, _ in cands])
+        p = p / p.sum() if p.sum() > 0 else None
+        cands = [cands[i] for i in rng.choice(len(cands), n_try, replace=False,
+                                              p=p)]
+    elif len(cands) > n_try:
+        cands = [cands[i] for i in rng.choice(len(cands), n_try, replace=False)]
+
+    def _rebuild(cl, laws, at=None):
+        """Carry the per-arm lists (`betas`, `sticky`) through any reshuffle.
+
+        They are indexed BY ARM, so an operator that moves clauses and laws
+        alone leaves them misaligned -- and the failure surfaces far away:
+        `MemBank.arbitrate` broadcasts `sticky` into an array sized by the
+        clause count and raises, rounds later, from an unrelated stage.
+        """
+        out = dict(bank, clauses=cl, laws=laws)
+        for k in ("betas", "sticky"):
+            if bank.get(k):
+                v = list(bank[k])
+                x = v.pop(arm)
+                if at is not None:
+                    v.insert(at, x)
+                out[k] = v
+        return out
+
+    def drop():
+        """The same tree with this arm removed -- the honest reference."""
+        cl = [[l[:] for l in c] for c in bank["clauses"]]
+        laws = list(bank["laws"])
+        cl.pop(arm)
+        laws.pop(arm)
+        return _rebuild(cl, laws)
+
+    def place(lit, pos):
+        cl = [[l[:] for l in c] for c in bank["clauses"]]
+        laws = list(bank["laws"])
+        g = cl.pop(arm) + ([list(lit)] if lit else [])
+        law = laws.pop(arm)
+        p = max(0, min(pos, len(cl)))
+        cl.insert(p, g)
+        laws.insert(p, law)
+        return _rebuild(cl, laws, at=p)
+
+    pol = pol_fn_for(zn)
+    # THE REFERENCE IS THE TREE WITHOUT THE ARM, not the tree with its
+    # unrefined guard. Scored against the bare guard, the winning move is a
+    # conjunct that is never true: measured, `slack_food <= -45.377` scored
+    # +15.14 that way and +0.00 against no memory at all, because all it did
+    # was switch the arm off. Against the arm-free tree that move is worth
+    # exactly zero and the only way to win is to make the arm useful.
+    ref = drop()
+    base = score(env, ref, pol, screen_ep, T, seed)
+    rows = []
+    # SCREEN AT THE TOP, NOT WHERE THE ARM SITS. Scoring a conjunction at the
+    # bottom of the tree asks what it is worth on the states nothing above
+    # claimed, and if the arms above claim nearly all of them every literal
+    # ties -- measured, 48 literals all scored exactly +0.00 in under a second,
+    # which is the arm not running rather than the literals not helping. At the
+    # top the narrowed guard gets first refusal, so the screen measures the
+    # literal; `pos_list` then prices it back into the tree.
+    # SCREENED JOINTLY OVER LITERAL AND POSITION, not literal first. A literal
+    # is only good SOMEWHERE: the conjunct that makes the arm right at depth 6
+    # can be the worst of the 48 at the top, so ranking at one position and
+    # position-searching the survivors drops the winner before it is ever
+    # placed. The rollouts are cheap enough after the fused kernel that the
+    # product is affordable -- 48 x 8 screens run in a few seconds -- and no
+    # staging is worth a systematically missed candidate.
+    pos_list = (list(range(len(bank["clauses"]))) if positions is None
+                else list(positions))
+    placed = []
+    from .landscape import _match_cols
+    cover0 = _match_cols(cl0, Z)
+    for cl, label in cands:
+        # A CONJUNCT THAT EMPTIES THE ARM IS NOT A REFINEMENT. It scores zero
+        # against the arm-free reference by construction, so it cannot win, but
+        # screening it is wasted budget -- and on a noisy 120-episode screen a
+        # tie can still float to the top.
+        if float((cover0 & _match_cols([cl[0]], Z)).mean()) < min_cover:
+            continue
+        for pos in pos_list:
+            g = score(env, place(cl[0], pos), pol, screen_ep, T, seed)
+            placed.append((float((g - base).mean()), cl[0], pos, label))
+    placed.sort(key=lambda r: -r[0])
+    if verbose:
+        print("    guard refinement on arm %d: %d (literal, position) pairs "
+              "screened, best %s @%d %+.2f"
+              % (arm, len(placed), placed[0][3], placed[0][2], placed[0][0])
+              if placed else "    guard refinement: nothing to screen",
+              flush=True)
+
+    cur = score(env, ref, pol, confirm_ep, T, seed)
+    best, best_d, log = None, 0.0, []
+    for d0, lit, pos, label in placed[:n_keep]:
+        cand = place(lit, pos)
+        ok, d, _ = accept(env, cand, pol, cur, confirm_ep, T, seed, z)
+        log.append(dict(lit=label, pos=pos, screen=d0, delta=d,
+                        accepted=bool(ok)))
+        if ok and d > best_d:
+            best, best_d, best_lab = cand, d, "%s @%d" % (label, pos)
+    if verbose:
+        print("    confirmed %d/%d; %s"
+              % (sum(l["accepted"] for l in log), len(log),
+                 ("AND %s %+.2f" % (best_lab, best_d)) if best
+                 else "no conjunct beats dropping the arm"), flush=True)
+    # WHEN NOTHING WINS, RETURN THE ARM-FREE TREE. That is what the reference
+    # was, and keeping an arm that no guard could make worth its place is how a
+    # -15.14 regression survives a stage that reported "nothing accepted".
+    return (best or ref), log
+
+
 # ------------------------------------------------- joint discovery (no proxy)
 def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
              screen_ep=120, confirm_ep=600, n_confirm=25, T=400, seed=777,
-             z=2.0, verbose=True):
+             z=2.0, verbose=True, n_refine=3, weights=None, rng=None):
     """Search (what to store, when to write) jointly with an arm that uses it.
 
     TWO THINGS THIS LEARNED THE HARD WAY.
@@ -234,7 +400,7 @@ def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
     if verbose:
         print("    memory grid: %d joint candidates" % len(cands), flush=True)
 
-    def with_mem(mem, pos=None):
+    def with_mem(mem, pos=None, extra=None):
         """Install the rule plus an arm that reads it, AT A CHOSEN POSITION.
 
         Appending was the default and it is wrong: in a Fallback the last arm
@@ -250,7 +416,8 @@ def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
         cl = [[l[:] for l in c] for c in bank["clauses"]]
         laws = list(b["laws"])
         p = len(cl) if pos is None else max(0, min(pos, len(cl)))
-        cl.insert(p, [[idx["have_mem"], 0.5, False]])
+        cl.insert(p, [[idx["have_mem"], 0.5, False]]
+                  + ([list(extra)] if extra is not None else []))
         laws.insert(p, prim["to_mem"])
         return dict(b, mem=mem, clauses=cl, laws=laws), zn
 
@@ -259,16 +426,45 @@ def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
     # fires so its rule can be judged, the bottom is where it belongs if the
     # arms above already handle everything it would.
     positions = (0, len(bank["clauses"]))
+
+    # THE BARE GUARD ANTI-RANKS THE RIGHT ANSWER. `have_mem > 0.5` is true
+    # forever after the first write, so an arm carrying a store that genuinely
+    # works claims far more than it should and SCORES WORSE than one carrying a
+    # store that does nothing. Measured on the absorbed masked bank, best
+    # position each:
+    #
+    #     store                      bare have_mem      AND NOT(write)
+    #     pos_x + pos_y                    -14.20              +8.53
+    #     t_norm + noise (planted)         -13.53              -6.58
+    #     bear_food_x + bear_food_y        -14.54              -9.75
+    #
+    # Bare, the three are indistinguishable and all negative, so ranking on it
+    # is ranking noise -- which is what 8832 candidates screening between -0.09
+    # and 0.00 actually was. The refinement stage only sees the top few and so
+    # never reached the winner.
+    #
+    # THE CONJUNCT IS `NOT write`, and that is a structural prior about the FORM
+    # of a memory rule -- write the value down when the condition holds, act on
+    # what was written when it no longer does -- of exactly the same kind as
+    # "adjacent columns form a vector". It names no column and no task: it is
+    # read off whichever write event the candidate happens to propose. The
+    # refinement stage afterwards is free to replace it with any literal in the
+    # alphabet, and does; this only has to make the screen see the candidate.
+    #
+    # `None` stays in the set, so this can never screen worse than before.
     t0, rows = time.time(), []
     for i, (cols, write, label) in enumerate(cands):
         mem = dict(cols=list(cols), write=write, clear=None)
+        conj = [None] + [[int(l[0]), float(l[1]), not bool(l[2])]
+                         for l in write]
         best = None
         for pos in positions:
-            b, zn = with_mem(mem, pos)
-            g = score(env, b, pol_fn_for(zn), screen_ep, T, seed)
-            d = float((g - base_cheap).mean())
-            if best is None or d > best[0]:
-                best = (d, pos)
+            for cj in conj:
+                b, zn = with_mem(mem, pos, cj)
+                g = score(env, b, pol_fn_for(zn), screen_ep, T, seed)
+                d = float((g - base_cheap).mean())
+                if best is None or d > best[0]:
+                    best = (d, pos)
         rows.append((best[0], mem, "%s @%d" % (label, best[1])))
         if verbose and (i + 1) % 600 == 0:
             print("      screened %d/%d  best %+.2f  [%.0fs]"
@@ -277,7 +473,7 @@ def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
     rows.sort(key=lambda r: -r[0])
 
     base_full = score(env, bank, pol_fn_for(zn0), confirm_ep, T, seed)
-    best, best_d, log = None, 0.0, []
+    best, best_d, log, best_label = None, 0.0, [], None
     for d_screen, mem, label in rows[:n_confirm]:
         pos = int(label.rsplit("@", 1)[1])
         b, zn = with_mem(mem, pos)
@@ -292,4 +488,33 @@ def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
               % (sum(l["accepted"] for l in log), len(log),
                  ("winner %s %+.2f" % (best_label, best_d)) if best
                   else "nothing cleared the test"), flush=True)
+
+    # THE SINGLETON GUARD IS THE HANDICAP, not the memory rule, so the best
+    # SCREENED candidates are refined whether or not they were accepted -- a
+    # rule that cannot pay for itself while its arm claims every state after the
+    # first write may well pay once the arm says when to use it.
+    for d_screen, mem, label in rows[:n_refine]:
+        pos = int(label.rsplit("@", 1)[1])
+        # Refine from the guard the SCREEN used, so the stage starts where the
+        # ranking left off rather than from the bare guard it already rejected.
+        b, zn = with_mem(mem, pos, [int(mem["write"][0][0]),
+                                    float(mem["write"][0][1]),
+                                    not bool(mem["write"][0][2])])
+        Z, offered = z_rows(OB, AL, mem, n_obs, rng=rng)
+        b2, rlog = refine_guard(env, b, pos, zn, pol_fn_for, Z, offered,
+                                screen_ep=screen_ep, confirm_ep=confirm_ep,
+                                T=T, seed=seed, z=z, weights=weights, rng=rng,
+                                verbose=verbose)
+        log += [dict(l, label="%s + %s" % (label, l["lit"])) for l in rlog]
+        if b2 is b:
+            continue
+        ok, dl, _ = accept(env, b2, pol_fn_for(zn), base_full, confirm_ep, T,
+                           seed, z)
+        if verbose:
+            print("    refined %-34s vs no memory: %+.2f  %s"
+                  % (label, dl, "accepted" if ok else "rejected"), flush=True)
+        if ok and dl > best_d:
+            best, best_d, best_label = b2, dl, label + " (refined)"
+    if verbose and best is not None:
+        print("    memory: %s  %+.2f" % (best_label, best_d), flush=True)
     return (best or bank), log

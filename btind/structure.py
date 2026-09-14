@@ -210,9 +210,59 @@ def simplify(env, bank, pol_fn, cur_G=None, n_ep=400, T=400, seed=777, z=2.0,
     return bank, cur, log
 
 
+def coverage(clause, Z):
+    """Fraction of states an arm's guard matches, ignoring the arms above it."""
+    from .landscape import _match_cols
+    return float(_match_cols(clause, Z).mean())
+
+
+def absorb_universal(env, bank, pol_fn, Z, cur_G=None, n_ep=600, T=400,
+                     seed=777, z=2.0, max_cover=0.98, names=None, verbose=True):
+    """An arm that matches everything IS the default. Say so, and reclaim the tail.
+
+    Measured on the stored masked bank: arm 6 was `is_night > -0.040` and
+    `is_night` takes the values {0, 1}, so the guard matched 100% of states. The
+    default was reached on 0.0% of ticks and every arm below arm 6 was dead
+    code -- which is exactly where `discover` appends the memory arm. That is
+    the whole explanation for "memory gains +0.00 on every run": the arm was
+    never executed, so all 10752 candidates and all 48 refinement literals
+    scored identically zero, and the search was ranking noise.
+
+    Nothing here changes behaviour -- the universal arm's law becomes the
+    default's law and the dead arms below it are removed -- so the move is
+    priced with the paired test and kept only if it is non-inferior. What it
+    changes is REACHABILITY: after it, an appended arm is once again above the
+    default and can fire.
+    """
+    cur = (score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G)
+    for c in range(len(bank["clauses"])):
+        if coverage(bank["clauses"][c], Z) < max_cover:
+            continue
+        cand = dict(bank, clauses=[[l[:] for l in x] for x in bank["clauses"][:c]],
+                    laws=list(bank["laws"][:c]), default=bank["laws"][c])
+        for k in ("betas", "sticky"):
+            if bank.get(k):
+                cand[k] = list(bank[k])[:c]
+        # NON-INFERIORITY, because this is an equivalence move: the arm's law
+        # becomes the default's law and only unreachable arms are removed, so
+        # the honest expected delta is exactly 0.00 -- which a gain test rejects.
+        ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed, z,
+                          side="noninferior", margin=0.25)
+        if verbose:
+            nm = (names[bank["clauses"][c][0][0]] if names else c)
+            print("    universal guard on arm %d (%s) matches %.0f%% -- "
+                  "%s as default, %d dead arms below (%+.2f)"
+                  % (c, nm, 100 * coverage(bank["clauses"][c], Z),
+                     "absorbed" if ok else "NOT absorbed",
+                     len(bank["clauses"]) - c - 1, d), flush=True)
+        if ok:
+            return cand, g, True
+    return bank, cur, False
+
+
 def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,
                       seed=777, z=2.0, min_gain=0.1, steps=(0.04, 0.1, 0.25, 0.6, 1.2),
-                      max_sweeps=4, names=None, verbose=True):
+                      max_sweeps=4, names=None, verbose=True, max_cover=0.98):
     """Coordinate-wise line search on every threshold, decided by rollout.
 
     A threshold arrives wherever the random draw that proposed it happened to
@@ -247,6 +297,15 @@ def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,
                         new = thr + sgn * mult * abs(iqr[j])
                         cl = [[l[:] for l in x] for x in bank["clauses"]]
                         cl[c][k][1] = float(new)
+                        # A THRESHOLD MAY NOT SLIDE PAST THE END OF ITS COLUMN.
+                        # `is_night` is {0,1} with an IQR of 1, so one step of
+                        # 0.6 took `> 0.5` to `> -0.04` -- a guard matching every
+                        # state. It was accepted, correctly, as non-inferior:
+                        # the arm's law simply replaced the default's. But it
+                        # silently made the default and every arm below it
+                        # unreachable, and the memory search appends there.
+                        if coverage(cl[c], Z) > max_cover:
+                            continue
                         cand = dict(bank, clauses=cl)
                         ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed,
                                           z)
