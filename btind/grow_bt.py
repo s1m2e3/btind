@@ -57,6 +57,48 @@ from .structure import accept, score
 from .valuesplit import fit_value_law
 
 
+def failure_states(env, bank, pol_fn, n_ep=400, T=400, seed=11, lookback=8):
+    """Observations from the steps just before the controller dies.
+
+    `evotm` anchored newborn literals on the worst-fit quartile of a regression
+    residual, and `_hot_rows` does the on-policy version with a critic. Neither
+    is available in pure-RL mode -- but a rollout reports something better than
+    a residual: WHERE IT WENT WRONG. The states in the few steps before a catch
+    or a starvation are exactly the region a new arm should be carved around.
+
+    This is what the quantile alphabet cannot reach on its own. Coverage states
+    put `d_threat` uniformly in [0.08, 0.80], so its 5% quantile is 0.11 and no
+    threshold below that is ever proposed -- while the region worth +5.87 is
+    `d_threat <= 0.09`. Thresholds taken from failure states sit where the
+    trouble is, not where the sampling happens to be dense.
+    """
+    from .memory import MemBank
+    pol = pol_fn(bank)
+    rng = np.random.default_rng(seed)
+    env.seed_kernels(seed)
+    s = (env.sample_starts(n_ep, rng) if hasattr(env, "sample_starts")
+         else env.sample_states(n_ep, rng))
+    if hasattr(pol, "reset"):
+        pol.reset(n_ep)
+    alive = np.ones(n_ep, bool)
+    hist = []
+    out = []
+    for t in range(T):
+        o = env.observe(s)
+        hist.append(o.copy())
+        if len(hist) > lookback:
+            hist.pop(0)
+        s, r, done = env.step(s, pol.act(o))
+        died = done & alive & (r < -1.0)          # caught or starved, not a step cost
+        if died.any():
+            for h in hist:
+                out.append(h[died])
+        alive &= ~done
+        if not alive.any():
+            break
+    return np.concatenate(out, 0) if out else np.zeros((0, hist[0].shape[1]))
+
+
 def _hot_rows(bank, obs, Z, qhat, frac=0.25):
     """Rows where the controller is leaving the most value on the table.
 
@@ -79,15 +121,25 @@ def _hot_rows(bank, obs, Z, qhat, frac=0.25):
     return np.flatnonzero(n >= np.quantile(n, 1 - frac))
 
 
-def _prune(cl, Z, lo=0.10, hi=0.90):
+def _prune(cl, Z, lo=0.005, hi=0.90):
     """Drop literals that say nothing, and clauses that select nothing.
 
     `dedupe_literals` merges literals sharing a FEATURE AND DIRECTION, so it
     cannot see that `carrying<=1.000` is vacuous beside `carrying>0.000` -- the
-    directions differ. A literal matching 97% of rows adds no region and one
-    matching 3% adds a sliver; both only cost a reader something to hold.
-    Measured output before this: `carrying<=1.000 AND bear_nest_x>0.007 AND
-    carrying>0.000`, which is two literals pretending to be three.
+    directions differ. A literal matching 90% of rows adds no region and only
+    costs a reader something to hold.
+
+    THE FLOOR IS DELIBERATELY TINY, and this was learned the hard way. A 10%
+    floor plus `min_n=400` (6.7% of the coverage rows) excluded `d_threat<=0.09`
+    -- 1.3% of states, and the single most valuable region in the task: adding
+    that one arm by hand took the tree from 6.84 to 11.60, past the hand-written
+    reference. Both filters were added the same day to stop junk slivers worth
+    +0.16, and they threw out the region worth +5.87 with them.
+
+    SIZE DOES NOT DISTINGUISH A SLIVER FROM A CRISIS. `bear_food_x<=-0.986` and
+    `d_threat<=0.09` are the same size and differ only in value, which the
+    rollout already measures and `min_gain` already filters. Cutting on size was
+    filtering the one thing we can measure with the one thing we cannot.
     """
     keep = []
     for j, t, n in cl:
@@ -191,7 +243,7 @@ def best_default(env, bank, names, zn, pol_fn, n_ep, T, seed, verbose=True):
 
 
 def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
-         max_arity=3, min_n=400, min_gain=0.3, n_law=8, labels=None, qhat=None,
+         max_arity=3, min_n=60, min_gain=0.3, n_law=8, labels=None, qhat=None,
          w=None, seed_clauses=None, screen_ep=120, confirm_ep=600,
          n_confirm=12, T=400, seed=777, z=2.0, rng=None, verbose=True,
          use_library=False, cem_region=True, cem_top=10, cem_iter=3,
