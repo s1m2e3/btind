@@ -76,6 +76,55 @@ def structural_primitives(names, d=None):
     return out
 
 
+def discrete_primitives(names, n_act, d, rng=None, n_sample=None):
+    """The law vocabulary for an argmax head. It names NOTHING but the actions.
+
+    Two families, and both are structural in the same sense
+    `structural_primitives` is -- they assert a SHAPE for a useful law, not a
+    strategy for the task.
+
+        CONSTANT PREFERENCE    bias on action k, zero elsewhere: "always k".
+                               These are the honest null. The only thing named
+                               is the action set, which the environment defines
+                               and hands us; choosing among them is the search's
+                               job, and a one-arm bank carrying one of them is
+                               exactly the constant-action baseline it has to
+                               beat.
+
+        SINGLE-COLUMN SCORE    theta[j, k] = +-1: "prefer action k in proportion
+                               to column j". Every column against every action,
+                               both signs, including the planted `t_norm` and
+                               `noise` -- which is the point. A vocabulary that
+                               excluded the distractors could not be caught
+                               buying them.
+
+    There is deliberately no pairing here. On a vector head, adjacent columns
+    are a direction and `to[a|b]` means something; an argmax over preferences
+    has no such geometry, so inventing combinations would be inventing task
+    knowledge. Anything richer than a single column is left to CEM, which
+    refines theta as a whole and needs no vocabulary at all.
+    """
+    rng = rng or np.random.default_rng(0)
+    out = {}
+    for k in range(n_act):
+        th = np.zeros((d, n_act))
+        th[-1, k] = 1.0
+        out["always[%d]" % k] = th
+    pool = []
+    for j in range(len(names)):
+        for k in range(n_act):
+            for sgn in (1.0, -1.0):
+                pool.append((j, k, sgn))
+    if n_sample is not None and len(pool) > n_sample:
+        idx = rng.choice(len(pool), n_sample, replace=False)
+        pool = [pool[i] for i in idx]
+    for j, k, sgn in pool:
+        th = np.zeros((d, n_act))
+        th[j, k] = sgn
+        out["%s%s->%d" % ("+" if sgn > 0 else "-", names[j], k)] = th
+    return out
+
+
 def primitives(names, extras=()):
     """The affine vocabulary a world's observation columns admit.
 

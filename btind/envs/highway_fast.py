@@ -94,8 +94,20 @@ def flatten(bank, n_obs):
 
 
 def uses_vq(bank, n_obs):
-    from ..memory import _reads_vq
-    return _reads_vq(bank, n_obs)
+    """Only a GUARD can force the Python path, never a law's coefficients.
+
+    The kernel sets V_hat and leverage to zero exactly as MemBank does with no
+    critic attached, so a law coefficient on either multiplies a zero and the
+    two paths agree. A guard COMPARING against them is the real
+    incompatibility.
+
+    Asking `_reads_vq` instead -- which is true as soon as any law touches those
+    columns -- silently refuses every bank CEM has ever perturbed, because CEM
+    makes theta dense. That cost NestWorld 63x once already; here it turned a
+    10-second smoke test into a 500-second one before it was noticed.
+    """
+    from ..memory import _guards_read_vq
+    return _guards_read_vq(bank, n_obs)
 
 
 @njit(cache=True, inline="always")
@@ -228,6 +240,9 @@ def rollout(states, p, lit_col, lit_thr, lit_neg, cl_start, cl_len,
                     z[b + 2] = y[best] - y[0]
                     z[b + 3] = v[best] * np.cos(h[best]) - z[2]
                     z[b + 4] = v[best] * np.sin(h[best]) - z[3]
+            base = 4 + 5 * (OV - 1)
+            z[base] = t / duration                 # t_norm    (planted)
+            z[base + 1] = states[i, 6 * V + 4]     # noise     (planted)
             z[n_obs] = 0.0
             z[n_obs + 1] = 0.0
             if nmem > 0:

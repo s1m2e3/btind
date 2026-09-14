@@ -70,11 +70,25 @@ def _nz(x, eps=1e-2):
 
 
 def feature_names(n_obs_veh):
+    """Named columns, plus two PLANTED DISTRACTORS.
+
+    `t_norm` is the fraction of the episode elapsed and `noise` is a constant
+    drawn once per episode. Neither carries anything about the road, and both
+    are there so that self-discovery is FALSIFIABLE: a search that guards on
+    them, or stores them in the blackboard, is buying junk, and without them in
+    the alphabet there is no way to tell that from a search that is working.
+    NestWorld carries the same two for the same reason -- the memory stage there
+    ranked `noise` at rank 1 of 3774 on an in-sample criterion, which is exactly
+    the failure they exist to expose.
+
+    They sit at the END of the layout so adding them cannot shift the index of
+    any real column.
+    """
     out = ["ego_x", "ego_y", "ego_vx", "ego_vy"]
     for i in range(1, n_obs_veh):
         out += ["v%d_seen" % i, "v%d_dx" % i, "v%d_dy" % i,
                 "v%d_dvx" % i, "v%d_dvy" % i]
-    return out
+    return out + ["t_norm", "noise"]
 
 
 class HighwayBatch:
@@ -154,6 +168,7 @@ class HighwayBatch:
             s[:, 5 * V + i] = rng.uniform(0.0, LANE_CHANGE_DELAY, n)
         s[:, 6 * V + 0] = 1.0                      # ego speed index -> 25 m/s
         s[:, 6 * V + 2] = 1.0                      # on road
+        s[:, 6 * V + 4] = rng.normal(0.0, 1.0, n)  # the planted distractor
         return s
 
     def sample_starts(self, n, rng):
@@ -182,6 +197,7 @@ class HighwayBatch:
             s[:, 5 * V + i] = rng.uniform(0.0, LANE_CHANGE_DELAY, n)
         s[:, 6 * V + 0] = 1.0
         s[:, 6 * V + 2] = 1.0
+        s[:, 6 * V + 4] = rng.normal(0.0, 1.0, n)  # the planted distractor
         return s
 
     # -- views onto the flat state ------------------------------------------
@@ -202,7 +218,7 @@ class HighwayBatch:
         """
         X, Y, H, S, TL, TM, EX = self._unpack(s)
         n = len(s)
-        out = np.zeros((n, 4 + 5 * (self.n_obs_veh - 1)))
+        out = np.zeros((n, 4 + 5 * (self.n_obs_veh - 1) + 2))
         out[:, 0], out[:, 1] = X[:, 0], Y[:, 0]
         out[:, 2] = S[:, 0] * np.cos(H[:, 0])
         out[:, 3] = S[:, 0] * np.sin(H[:, 0])
@@ -222,6 +238,9 @@ class HighwayBatch:
             out[:, b + 2] = np.where(seen[:, j] > 0.5, gy[:, j], FAR)
             out[:, b + 3] = np.where(seen[:, j] > 0.5, gvx[:, j], 0.0)
             out[:, b + 4] = np.where(seen[:, j] > 0.5, gvy[:, j], 0.0)
+        base = 4 + 5 * (self.n_obs_veh - 1)
+        out[:, base] = EX[:, 3] / max(self.duration, 1)          # t_norm
+        out[:, base + 1] = EX[:, 4]                              # noise
         return out
 
     # -- control -------------------------------------------------------------

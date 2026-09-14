@@ -199,7 +199,17 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
     """
     out = list(lib)
     if structural:
-        out += list(structural_primitives(zn, np.shape(arm_parent)[0]).items())
+        d_law, n_out = np.shape(arm_parent)
+        if n_out == 2:
+            out += list(structural_primitives(zn, d_law).items())
+        else:
+            # AN ARGMAX HEAD HAS NO GEOMETRY, so the paired "toward/away"
+            # vocabulary means nothing on it. `discrete_primitives` offers the
+            # constant preferences and single-column scores instead, which name
+            # only the action set the environment defines.
+            from .lawsearch import discrete_primitives
+            out += list(discrete_primitives(zn, n_out, d_law, rng=rng,
+                                            n_sample=60).items())
     Xd = design_matrix(Z if bank.get("laws_on_z") else obs)
     if labels is not None:
         U, M = labels

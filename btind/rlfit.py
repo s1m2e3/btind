@@ -68,6 +68,12 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
     masked runs returned the same tree to the decimal.
     """
     cfg = dict(DEFAULTS, **(cfg or {}))
+    # THE HEAD COMES FROM THE WORLD, not from a flag. A world that offers a
+    # discrete action set says so (`n_act`), and the law simply gets that many
+    # outputs instead of two. Everything downstream -- CEM, grow, simplify,
+    # thresholds, beta -- is indifferent, because it scores theta by rollout.
+    n_act = int(getattr(env, "n_act", 2))
+    head = "argmax" if n_act != 2 else "vector"
     run_seed = int(np.random.SeedSequence().entropy % 2**31 if run_seed is None
                    else run_seed)
     rng = rng or np.random.default_rng(run_seed)
@@ -94,14 +100,19 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                   "run_seed %d" % (len(bank["clauses"]), meta["G"],
                                    meta["tag"], branch, run_seed), flush=True)
     else:
-        th, _ = cem_law(env, dict(clauses=[], laws=[],
-                                  default=rng.normal(0, .3, (len(zn0) + 1, 2)),
-                                  names=list(names), laws_on_z=True),
-                        -1, pol_fn, n_iter=cfg["cem_iter"], K=cfg["cem_K"],
-                        sigma0=cfg["cem_sigma"], n_ep=cfg["n_ep"], T=cfg["T"],
-                        seed=cfg["seed"], rng=rng)
-        bank = dict(clauses=[], laws=[], default=th, names=list(names),
-                    laws_on_z=True)
+        # The null for a discrete head is every action tied at zero: it prefers
+        # nothing, so CEM starts from no opinion about which manoeuvre is good.
+        # A random init would already be an opinion, and on this world the
+        # constant actions span 20.2 to 25.9, so a lucky draw is worth points
+        # the search would then appear to have found.
+        th0 = (np.zeros((len(zn0) + 1, n_act)) if head == "argmax"
+               else rng.normal(0, .3, (len(zn0) + 1, 2)))
+        seed_bank = dict(clauses=[], laws=[], default=th0, names=list(names),
+                         laws_on_z=True, head=head, n_act=n_act)
+        th, _ = cem_law(env, seed_bank, -1, pol_fn, n_iter=cfg["cem_iter"],
+                        K=cfg["cem_K"], sigma0=cfg["cem_sigma"],
+                        n_ep=cfg["n_ep"], T=cfg["T"], seed=cfg["seed"], rng=rng)
+        bank = dict(seed_bank, default=th)
         if verbose:
             print("  cold start: default law by CEM, G %.2f"
                   % score(env, bank, pol_fn, cfg["n_ep"], cfg["T"],
@@ -246,7 +257,18 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         if any(x["accepted"] for x in plog):
             rec["moves"].append("thresholds")
 
-        if r == cfg["mem_at"]:
+        # THE MEMORY STAGE IS NOT READY FOR A DISCRETE HEAD, and it says so
+        # rather than producing a shaped-wrong law and a silent wrong answer.
+        # `memory_primitives` builds `mem_c - c` as a 2-output direction, which
+        # is meaningful for a holonomic agent and meaningless as a preference
+        # over named manoeuvres. The discrete analogue -- score each action by
+        # the gap between a remembered value and the current one -- is the next
+        # increment, not a thing to improvise mid-run.
+        if r == cfg["mem_at"] and head == "argmax":
+            if verbose:
+                print("  [round %d] memory stage skipped: no discrete-head "
+                      "blackboard primitive yet" % r, flush=True)
+        elif r == cfg["mem_at"]:
             env.seed_kernels(3)
             OB, _, AL = record(env, pol_fn(bank), np.random.default_rng(3),
                                n_ep=200, T=cfg["T"])
