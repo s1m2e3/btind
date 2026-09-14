@@ -74,6 +74,12 @@ def bank_json(bank, names=None, bt=None):
         laws=[np.asarray(t).tolist() for t in bank["laws"]],
         default=np.asarray(bank["default"]).tolist(),
         betas=_jsonable(bank.get("betas")),
+        # laws_on_z IS PART OF THE BANK, not a runtime detail: a law sized for
+        # the augmented layout multiplied by design_matrix(obs) is either a
+        # crash or, when the widths happen to match, a controller whose every
+        # coefficient is attached to the wrong feature.
+        laws_on_z=bool(bank.get("laws_on_z")),
+        mem=_jsonable(bank.get("mem")), sticky=_jsonable(bank.get("sticky")),
         names=list(names) if names is not None else None, bt=bt)
 
 
@@ -82,7 +88,9 @@ def bank_from_json(d):
                          for cl in d["clauses"]],
                 laws=[np.asarray(t, float) for t in d["laws"]],
                 default=np.asarray(d["default"], float),
-                betas=d.get("betas"), names=d.get("names"))
+                betas=d.get("betas"), names=d.get("names"),
+                laws_on_z=bool(d.get("laws_on_z")), mem=d.get("mem"),
+                sticky=d.get("sticky"))
 
 
 class Tee:

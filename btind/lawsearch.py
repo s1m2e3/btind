@@ -48,12 +48,44 @@ def _theta(d, spec):
     return th
 
 
+def structural_primitives(names, d=None):
+    """Toward, away and both tangents for EVERY ADJACENT COLUMN PAIR.
+
+    No column is named. The only assumption is that a world reporting a
+    direction reports its two components side by side, which is the same
+    structural prior the memory search uses to decide what may be stored
+    together -- and it is a PRIOR, not a discovery: it asserts that sparse
+    selectors on paired columns are the laws worth trying.
+
+    It has to be said plainly because it is load-bearing. Measured with the
+    right partition, selector laws scored 23.95 where laws fitted to planner
+    labels scored 13.43, and cross-entropy search from a random law stalls at
+    -11.6: in 44 dimensions it essentially never finds `u = bear_food`. The
+    junk pairs this enumerates -- `(t_norm, noise)` and the like -- cost nothing
+    but a rollout each, and the rollout rejects them.
+    """
+    d = (len(names) + 1) if d is None else d
+    out = {}
+    for j in range(len(names) - 1):
+        a, b = j, j + 1
+        tag = "%s|%s" % (names[a], names[b])
+        out["to[" + tag + "]"] = _theta(d, [(a, 0, 1.0), (b, 1, 1.0)])
+        out["from[" + tag + "]"] = _theta(d, [(a, 0, -1.0), (b, 1, -1.0)])
+        out["cw[" + tag + "]"] = _theta(d, [(b, 0, -1.0), (a, 1, 1.0)])
+        out["ccw[" + tag + "]"] = _theta(d, [(b, 0, 1.0), (a, 1, -1.0)])
+    return out
+
+
 def primitives(names, extras=()):
     """The affine vocabulary a world's observation columns admit.
 
     For every `bear_<x>_x` / `bear_<x>_y` pair: toward, away, and both tangents.
     A tangent is the 90-degree rotation (-by, bx), which is still affine and is
     how a slower pursuer is evaded without being cornered.
+
+    This version reads column NAMES, which is a stronger prior than
+    `structural_primitives` -- it knows which pairs are directions. Kept for the
+    named worlds; the structural one is what a new world gets.
     """
     d = len(names) + 1
     idx = {n: i for i, n in enumerate(names)}

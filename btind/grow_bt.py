@@ -79,11 +79,39 @@ def _hot_rows(bank, obs, Z, qhat, frac=0.25):
     return np.flatnonzero(n >= np.quantile(n, 1 - frac))
 
 
+def _prune(cl, Z, lo=0.10, hi=0.90):
+    """Drop literals that say nothing, and clauses that select nothing.
+
+    `dedupe_literals` merges literals sharing a FEATURE AND DIRECTION, so it
+    cannot see that `carrying<=1.000` is vacuous beside `carrying>0.000` -- the
+    directions differ. A literal matching 97% of rows adds no region and one
+    matching 3% adds a sliver; both only cost a reader something to hold.
+    Measured output before this: `carrying<=1.000 AND bear_nest_x>0.007 AND
+    carrying>0.000`, which is two literals pretending to be three.
+    """
+    keep = []
+    for j, t, n in cl:
+        f = float((Z[:, j] <= t).mean() if n else (Z[:, j] > t).mean())
+        if lo < f < hi:
+            keep.append([int(j), float(t), bool(n)])
+    if not keep:
+        return None
+    m = np.ones(len(Z), bool)
+    for j, t, n in keep:
+        above = Z[:, j] > t
+        m &= (~above if n else above)
+    f = m.mean()
+    return keep if lo < f < hi else None
+
+
 def _clause_pool(rng, alpha, Z, hot, pool, max_arity, last, seeds):
     """Random conjunctions, drift of the last accepted arm, and any seeds."""
     out = []
     for _ in range(pool):
-        k = 1 + int(rng.integers(max_arity))
+        # ARITY BIASED LOW. A uniform draw over 1..max_arity spends most of the
+        # pool on conjunctions, and a conjunction wins its rollout for one of
+        # its literals while the others ride along. Simple guards first.
+        k = 1 if rng.random() < 0.6 else 1 + int(rng.integers(max_arity))
         out.append(dedupe_literals([_rand_literal(rng, alpha, Z, hot)
                                     for _ in range(k)]))
     if last is not None:
@@ -95,11 +123,13 @@ def _clause_pool(rng, alpha, Z, hot, pool, max_arity, last, seeds):
                 cl[i][1] + rng.normal(0, 0.06 * (alpha.hi[j] - alpha.lo[j])),
                 alpha.lo[j], alpha.hi[j]))
             out.append(dedupe_literals(cl))
-    return out + [[l[:] for l in c] for c in (seeds or [])]
+    out = out + [[l[:] for l in c] for c in (seeds or [])]
+    pruned = [_prune(c, Z) for c in out]
+    return [c for c in pruned if c is not None]
 
 
 def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
-              etas=(0.05, 0.2)):
+              etas=(0.05, 0.2), n_perturb=8, sigma=0.4, rng=None):
     """Every law worth trying on one candidate region, from every source.
 
     THE FITTED LAW IS THE PRIMARY SOURCE, as it has been since e18: solve the
@@ -123,6 +153,16 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
         gr = (ww[:, None] * Xd[region]).T @ qhat.grad_u(obs[region], u)
         for e in etas:
             out.append(("grad%.2f" % e, th + e * gr / max(ww.sum(), 1e-9)))
+    # PERTURBATIONS OF THE PARENT LAW, which need nothing at all. Without a
+    # planner, a critic or a library there is no other source, and an arm whose
+    # law equals its parent's changes no behaviour, so every rollout ties and no
+    # region is ever bought. These are the seeds a per-arm CEM then refines.
+    if n_perturb:
+        rng = rng or np.random.default_rng(0)
+        for i in range(n_perturb):
+            out.append(("rand%d" % i,
+                        arm_parent + sigma * rng.standard_normal(
+                            np.shape(arm_parent))))
     return out
 
 
@@ -151,10 +191,12 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
          max_arity=3, min_n=400, min_gain=0.3, n_law=8, labels=None, qhat=None,
          w=None, seed_clauses=None, screen_ep=120, confirm_ep=600,
          n_confirm=12, T=400, seed=777, z=2.0, rng=None, verbose=True,
-         use_library=False):
+         use_library=False, cem_region=True, cem_top=10, cem_iter=3,
+         cem_K=24, cem_sigma=0.4, cols=None):
     """Add arms while a rollout says they pay by more than `min_gain`."""
     rng = rng or np.random.default_rng(0)
-    alpha = Alphabet(n_thresholds=9).fit(Z, list(range(Z.shape[1])))
+    alpha = Alphabet(n_thresholds=9).fit(
+        Z, list(range(Z.shape[1])) if cols is None else list(cols))
     lib = (library(names, None, zn=zn, mem=bank.get("mem"))
            if use_library else [])
 
@@ -167,10 +209,10 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
     # criterion deciding what a regional search may consider is the same
     # mistake as every proxy failure here, one level up.
     if verbose:
-        print("    law sources: %s%s%s"
+        print("    law sources: %s%s%sparent-perturbations"
               % ("fitted " if labels is not None else "",
                  "gradient " if qhat is not None else "",
-                 ("library(%d)" % len(lib)) if lib else ""), flush=True)
+                 ("library(%d) " % len(lib)) if lib else ""), flush=True)
 
     claimed = np.zeros(len(Z), bool)
     last, log, t0 = None, [], time.time()
@@ -191,7 +233,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                 continue
             parent = bank["default"]
             for lname, th in _laws_for(bank, region, names, zn, obs, Z, labels,
-                                       qhat, w, lib, parent):
+                                       qhat, w, lib, parent, rng=rng):
                 g = score(env, _insert(bank, cl, th, 0), pol_fn, screen_ep, T,
                           seed)
                 rows.append((float((g - cur_cheap).mean()), cl, th, lname,
@@ -202,6 +244,29 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                       % (k, min_n), flush=True)
             break
         rows.sort(key=lambda r: -r[0])
+
+        # THE BEST LAW FOR THE REGION, found the way everything else here is
+        # found. `rsfi` answered "is this region worth having, GIVEN the best
+        # law for it" with a least-squares fit to planner labels. Without a
+        # planner the same question is answered by cross-entropy search on the
+        # law parameters, scored by rollout -- 72 rollouts per region, which at
+        # 1.2ms is under a tenth of a second. A random perturbation of the
+        # parent law cannot answer it: in 44 dimensions it almost never lands on
+        # the direction a region actually wants, so real regions score like
+        # noise and the grower buys neither.
+        if cem_region:
+            from .lawcem import cem_law
+            tuned = []
+            for d, cl, th, lname, nrow in rows[:cem_top]:
+                probe = _insert(bank, cl, th, 0)
+                th2, _ = cem_law(env, probe, 0, pol_fn, n_iter=cem_iter,
+                                 K=cem_K, sigma0=cem_sigma, n_ep=screen_ep,
+                                 T=T, seed=seed, rng=rng)
+                g = score(env, _insert(bank, cl, th2, 0), pol_fn, screen_ep, T,
+                          seed)
+                tuned.append((float((g - cur_cheap).mean()), cl, th2,
+                              lname + "+cem", nrow))
+            rows = sorted(tuned + rows, key=lambda r: -r[0])
 
         best, best_d, desc = None, min_gain, None
         for d, cl, th, lname, nrow in rows[:n_confirm]:

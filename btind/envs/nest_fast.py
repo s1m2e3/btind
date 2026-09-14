@@ -119,6 +119,19 @@ def _obs_row(px, py, fx, fy, tx, ty, en, tt, cr, nx, ny, nz, p, o):
     else:
         o[18] = 1.0
 
+    cap = 100.0
+    drain = p[4] + p[12] * cr
+    v = (o[0] - p[2]) / max(p[1], _EPS)
+    o[19] = v if v < cap else cap
+    v = o[3] / max(drain, _EPS)
+    o[20] = v if v < cap else cap
+    v = o[4] / max(p[0], _EPS)
+    o[21] = v if v < cap else cap
+    v = o[12] / max(p[0], _EPS)
+    o[22] = v if v < cap else cap
+    o[23] = o[19] - o[21]
+    o[24] = o[19] - o[22]
+
 
 @njit(cache=True, parallel=True)
 def rollout_bank(states, p, lit_col, lit_thr, lit_neg, cl_start, cl_len, laws,

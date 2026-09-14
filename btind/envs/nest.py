@@ -91,6 +91,17 @@ OBS_NAMES = [
     "t_to_switch",    # 16 steps to dawn/dusk, normalised -- a deadline
     "food_seen",      # 17 0 when food is outside the sensing radius
     "threat_seen",    # 18 0 when the threat is outside the sensing radius
+    # --- PREDICTIVE: what a model of the dynamics tells you about the future.
+    # Closed form here because this world's dynamics are known, which is exactly
+    # what a LEARNED dynamics model would have to approximate elsewhere. They
+    # are the quantities a person writes behaviour-tree guards on -- not "how
+    # far is the bear" but "how long have I got".
+    "t_capture",      # 19 steps until the threat reaches me if I stand still
+    "t_starve",       # 20 steps until energy runs out at the current drain
+    "t_food",         # 21 steps to reach the food at full speed
+    "t_nest",         # 22 steps to reach the nest at full speed
+    "slack_food",     # 23 t_capture - t_food : can I get there before it gets me
+    "slack_nest",     # 24 t_capture - t_nest : can I get home before it does
 ]
 OBS_DIM = len(OBS_NAMES)
 DISTRACTORS = [7, 8, 9, 10]
@@ -287,6 +298,17 @@ class NestWorld:
             o[~t_seen, 1:3] = 0.0
         else:
             o[:, 18] = 1.0
+
+        # --- predictive columns, from the observation the agent actually has
+        CAP = 100.0
+        drain = self.e_decay + self.carry_decay * o[:, 11]
+        o[:, 19] = np.minimum((o[:, 0] - self.catch_r)
+                              / max(self.threat_speed, _EPS), CAP)
+        o[:, 20] = np.minimum(o[:, 3] / np.maximum(drain, _EPS), CAP)
+        o[:, 21] = np.minimum(o[:, 4] / max(self.agent_speed, _EPS), CAP)
+        o[:, 22] = np.minimum(o[:, 12] / max(self.agent_speed, _EPS), CAP)
+        o[:, 23] = o[:, 19] - o[:, 21]
+        o[:, 24] = o[:, 19] - o[:, 22]
         return o
 
     def observe_full(self, s):

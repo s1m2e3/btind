@@ -168,3 +168,43 @@ def reorder(env, bank, pol_fn, cur_G, match_fn, Z, n_ep=1000, T=200, seed=777,
         if ok:
             return cand, g, log
     return bank, cur_G, log
+
+
+def simplify(env, bank, pol_fn, cur_G=None, n_ep=400, T=400, seed=777, z=2.0,
+             margin=0.25, verbose=True, names=None):
+    """Drop literals the tree does not need, one at a time, while it can.
+
+    A random conjunction that wins a rollout wins it for ONE of its literals;
+    the rest came along. Measured output before this: `noise>-1.292 AND
+    t_capture>9.979`, where the first matches 90% of states and is a planted
+    distractor -- the arm is really `t_capture>9.979` wearing a passenger.
+
+    The test is `drop_arm`'s, one level down: a literal goes only if removing it
+    costs less than `margin` AND the paired test cannot show a loss. Statistical
+    inconclusiveness is not equivalence, and on a deterministic world the test
+    has no noise to be inconclusive about.
+    """
+    cur = (score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G)
+    changed, log = True, []
+    while changed:
+        changed = False
+        for c, cl in enumerate(bank["clauses"]):
+            if len(cl) < 2:
+                continue
+            for k in range(len(cl)):
+                cls = [[l[:] for l in x] for x in bank["clauses"]]
+                del cls[c][k]
+                cand = dict(bank, clauses=cls)
+                ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed, z,
+                                  side="noninferior", margin=margin)
+                log.append(dict(arm=c, lit=k, delta=d, accepted=bool(ok)))
+                if ok:
+                    if verbose:
+                        nm = (names[cl[k][0]] if names else cl[k][0])
+                        print("    simplify: arm %d drops %s (%+.2f)"
+                              % (c, nm, d), flush=True)
+                    bank, cur, changed = cand, g, True
+                    break
+            if changed:
+                break
+    return bank, cur, log
