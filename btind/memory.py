@@ -238,6 +238,64 @@ def relayout(theta, old_zn, new_zn):
     return out
 
 
+# --------------------------------------------------- arms and their per-arm state
+# `betas` and `sticky` are indexed BY ARM, exactly like `clauses` and `laws`,
+# and every operator that adds, removes or reorders an arm has to move all four
+# together. Most of them did not: `drop_arm`, `reorder`, both `_insert`s,
+# `materialise_default` and the memory search each rebuilt `clauses` and `laws`
+# and left the other two behind.
+#
+# THE FAILURE IS NOT LOCAL, which is why it survived so long. A bank with a
+# mismatched `sticky` runs perfectly until `arbitrate` tries to broadcast it
+# into an array sized by the clause count, so the traceback points at whatever
+# stage happened to roll a rollout next -- observed twice, from `failure_states`
+# several rounds after the stage that actually caused it, once after a kick and
+# once after a beta was accepted and a later `simplify` dropped an arm. Before
+# terminations existed both lists were empty and nothing could go wrong; they
+# are the new thing, so every arm operator now goes through here.
+PER_ARM = ("betas", "sticky")
+_PER_ARM_FILL = {"betas": None, "sticky": False}
+
+
+def reindex(bank, order):
+    """The same bank with its arms permuted or filtered by `order`."""
+    out = dict(bank, clauses=[bank["clauses"][i] for i in order],
+               laws=[bank["laws"][i] for i in order])
+    for k in PER_ARM:
+        if bank.get(k) is not None:
+            v = list(bank[k])
+            out[k] = [v[i] if i < len(v) else _PER_ARM_FILL[k] for i in order]
+    return out
+
+
+def insert_arm(bank, clause, law, pos, beta=None, sticky=False):
+    """Add an arm at `pos`, extending every per-arm list in step."""
+    cl = [[l[:] for l in c] for c in bank["clauses"]]
+    laws = list(bank["laws"])
+    pos = max(0, min(pos, len(cl)))
+    cl.insert(pos, [l[:] for l in clause])
+    laws.insert(pos, law)
+    out = dict(bank, clauses=cl, laws=laws)
+    for k, x in (("betas", beta), ("sticky", sticky)):
+        if bank.get(k) is not None:
+            v = list(bank[k])
+            v += [_PER_ARM_FILL[k]] * (len(cl) - 1 - len(v))
+            v.insert(pos, x)
+            out[k] = v
+    return out
+
+
+def check_arms(bank, where=""):
+    """Raise where the misalignment HAPPENS, not several rounds downstream."""
+    n = len(bank["clauses"])
+    if len(bank["laws"]) != n:
+        raise ValueError("%s: %d laws for %d arms" % (where, len(bank["laws"]), n))
+    for k in PER_ARM:
+        if bank.get(k) is not None and len(bank[k]) != n:
+            raise ValueError("%s: %d %s for %d arms" % (where, len(bank[k]), k, n))
+    return bank
+
+
 def widen(bank, old_zn, new_zn):
     """Relayout every law in a bank. Guard literals are unaffected: memory
     columns are APPENDED, so existing column indices keep their meaning."""

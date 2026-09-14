@@ -135,7 +135,23 @@ def features_used(bank, names=OBS_NAMES):
 
 
 def evaluate_bank(env, bank, vhat=None, qhat=None, seeds=(11, 12, 13),
-                  n_ep=3000, T=200, n_obs=None):
+                  n_ep=3000, T=400, n_obs=None):
+    """Held-out return on seeds no stage of the search ever uses.
+
+    THE HORIZON HAS TO MATCH THE ONE BEING OPTIMISED. This defaulted to T=200
+    while every `score` call in the search runs T=400, so the reported number
+    was measuring a different task -- half an episode, on a world where food is
+    gathered over time under a 0.995 discount -- and it read about 4.5 return
+    units low as a result. That offset was constant, so the RANKINGS this
+    reported were never wrong, but none of its numbers could be compared with a
+    number from inside the search or with a hand-written reference measured at
+    T=400, and both comparisons were being made.
+
+    The three layers are now distinct and each has a job: the search trains on a
+    seed that ROTATES every round, selects the bank it returns on one fixed
+    VALIDATION seed it never accepts a move against, and reports here on seeds
+    reserved for reporting.
+    """
     # MemBank, NOT LandscapeBank: once a bank carries `laws_on_z` its laws are
     # sized for the augmented layout, and a policy that multiplies
     # design_matrix(obs) either raises (if the widths differ) or silently binds

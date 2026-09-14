@@ -437,5 +437,5 @@ def materialise_default(bank):
     dc = default_clause(bank["clauses"])
     if dc is None:
         return bank, False
-    return dict(bank, clauses=[[l[:] for l in c] for c in bank["clauses"]] + [dc],
-                laws=list(bank["laws"]) + [bank["default"]]), True
+    from .memory import insert_arm
+    return insert_arm(bank, dc, bank["default"], len(bank["clauses"])), True

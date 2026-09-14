@@ -229,11 +229,8 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
 
 
 def _insert(bank, clause, law, pos):
-    cl = [[l[:] for l in c] for c in bank["clauses"]]
-    laws = list(bank["laws"])
-    cl.insert(pos, [l[:] for l in clause])
-    laws.insert(pos, law)
-    return dict(bank, clauses=cl, laws=laws)
+    from .memory import insert_arm
+    return insert_arm(bank, clause, law, pos)
 
 
 def best_default(env, bank, names, zn, pol_fn, n_ep, T, seed, verbose=True):

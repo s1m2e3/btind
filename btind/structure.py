@@ -21,6 +21,8 @@ Three operators, one acceptance rule, and one asymmetry that matters:
 """
 import numpy as np
 
+from .memory import reindex
+
 from .policies import evaluate
 
 
@@ -91,12 +93,9 @@ def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
 
 def _insert(bank, clause, law, arm):
     """Above the arm it specialises; a specialisation of the default goes last."""
-    pos = len(bank["clauses"]) if arm < 0 else arm
-    cl = [[l[:] for l in c] for c in bank["clauses"]]
-    laws = list(bank["laws"])
-    cl.insert(pos, [l[:] for l in clause])
-    laws.insert(pos, law)
-    return dict(bank, clauses=cl, laws=laws)
+    from .memory import insert_arm
+    return insert_arm(bank, clause, law,
+                      len(bank["clauses"]) if arm < 0 else arm)
 
 
 def add_arm(env, bank, proposals, fit_law, pol_fn, cur_G, n_try=6, n_ep=1000,
@@ -137,9 +136,7 @@ def drop_arm(env, bank, pol_fn, cur_G, n_ep=1000, T=200, seed=777, z=2.0,
     """Remove an arm only if it is worth less than `margin` return units."""
     log = []
     for c in range(len(bank["clauses"])):
-        cand = dict(bank,
-                    clauses=[x for i, x in enumerate(bank["clauses"]) if i != c],
-                    laws=[x for i, x in enumerate(bank["laws"]) if i != c])
+        cand = reindex(bank, [i for i in range(len(bank["clauses"])) if i != c])
         ok, d, g = accept(env, cand, pol_fn, cur_G, n_ep, T, seed, z,
                           side="noninferior", margin=margin)
         log.append(dict(kind="drop", arm=c, delta=d, accepted=ok))
@@ -157,11 +154,9 @@ def reorder(env, bank, pol_fn, cur_G, match_fn, Z, n_ep=1000, T=200, seed=777,
                   & match_fn(bank["clauses"][c + 1], Z)).sum())
         if ov < min_overlap:
             continue
-        cl = [[l[:] for l in x] for x in bank["clauses"]]
-        laws = list(bank["laws"])
-        cl[c], cl[c + 1] = cl[c + 1], cl[c]
-        laws[c], laws[c + 1] = laws[c + 1], laws[c]
-        cand = dict(bank, clauses=cl, laws=laws)
+        order = list(range(len(bank["clauses"])))
+        order[c], order[c + 1] = order[c + 1], order[c]
+        cand = reindex(bank, order)
         ok, d, g = accept(env, cand, pol_fn, cur_G, n_ep, T, seed, z)
         log.append(dict(kind="reorder", arm=c, overlap=ov, delta=d,
                         accepted=ok))
@@ -238,11 +233,7 @@ def absorb_universal(env, bank, pol_fn, Z, cur_G=None, n_ep=600, T=400,
     for c in range(len(bank["clauses"])):
         if coverage(bank["clauses"][c], Z) < max_cover:
             continue
-        cand = dict(bank, clauses=[[l[:] for l in x] for x in bank["clauses"][:c]],
-                    laws=list(bank["laws"][:c]), default=bank["laws"][c])
-        for k in ("betas", "sticky"):
-            if bank.get(k):
-                cand[k] = list(bank[k])[:c]
+        cand = dict(reindex(bank, list(range(c))), default=bank["laws"][c])
         # NON-INFERIORITY, because this is an equivalence move: the arm's law
         # becomes the default's law and only unreachable arms are removed, so
         # the honest expected delta is exactly 0.00 -- which a gain test rejects.

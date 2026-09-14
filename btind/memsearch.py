@@ -37,6 +37,7 @@ import time
 import numpy as np
 
 from .collect import design_matrix
+from .memory import insert_arm, reindex
 from .landscape import _match_cols
 from .structure import accept, score
 
@@ -268,41 +269,19 @@ def refine_guard(env, bank, arm, zn, pol_fn_for, Z, offered, n_thr=7, n_try=48,
     elif len(cands) > n_try:
         cands = [cands[i] for i in rng.choice(len(cands), n_try, replace=False)]
 
-    def _rebuild(cl, laws, at=None):
-        """Carry the per-arm lists (`betas`, `sticky`) through any reshuffle.
-
-        They are indexed BY ARM, so an operator that moves clauses and laws
-        alone leaves them misaligned -- and the failure surfaces far away:
-        `MemBank.arbitrate` broadcasts `sticky` into an array sized by the
-        clause count and raises, rounds later, from an unrelated stage.
-        """
-        out = dict(bank, clauses=cl, laws=laws)
-        for k in ("betas", "sticky"):
-            if bank.get(k):
-                v = list(bank[k])
-                x = v.pop(arm)
-                if at is not None:
-                    v.insert(at, x)
-                out[k] = v
-        return out
+    n_arm = len(bank["clauses"])
 
     def drop():
         """The same tree with this arm removed -- the honest reference."""
-        cl = [[l[:] for l in c] for c in bank["clauses"]]
-        laws = list(bank["laws"])
-        cl.pop(arm)
-        laws.pop(arm)
-        return _rebuild(cl, laws)
+        return reindex(bank, [i for i in range(n_arm) if i != arm])
 
     def place(lit, pos):
-        cl = [[l[:] for l in c] for c in bank["clauses"]]
-        laws = list(bank["laws"])
-        g = cl.pop(arm) + ([list(lit)] if lit else [])
-        law = laws.pop(arm)
-        p = max(0, min(pos, len(cl)))
-        cl.insert(p, g)
-        laws.insert(p, law)
-        return _rebuild(cl, laws, at=p)
+        """This arm moved to `pos`, with `lit` conjoined onto its guard."""
+        g = [l[:] for l in bank["clauses"][arm]] + ([list(lit)] if lit else [])
+        beta = (bank.get("betas") or [None] * n_arm)[arm]
+        st = (bank.get("sticky") or [False] * n_arm)[arm]
+        return insert_arm(drop(), g, bank["laws"][arm], pos, beta=beta,
+                          sticky=st)
 
     pol = pol_fn_for(zn)
     # THE REFERENCE IS THE TREE WITHOUT THE ARM, not the tree with its
@@ -416,10 +395,10 @@ def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
         cl = [[l[:] for l in c] for c in bank["clauses"]]
         laws = list(b["laws"])
         p = len(cl) if pos is None else max(0, min(pos, len(cl)))
-        cl.insert(p, [[idx["have_mem"], 0.5, False]]
-                  + ([list(extra)] if extra is not None else []))
-        laws.insert(p, prim["to_mem"])
-        return dict(b, mem=mem, clauses=cl, laws=laws), zn
+        g = ([[idx["have_mem"], 0.5, False]]
+             + ([list(extra)] if extra is not None else []))
+        return dict(insert_arm(dict(b, clauses=cl, laws=laws), g,
+                               prim["to_mem"], p), mem=mem), zn
 
     base_cheap = score(env, bank, pol_fn_for(zn0), screen_ep, T, seed)
     # Screen at the TOP and at the BOTTOM: the top guarantees the arm actually
