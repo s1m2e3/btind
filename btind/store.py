@@ -25,6 +25,7 @@ THE KEY IS THE WORLD, NOT THE RUN. Banks are indexed by the environment's full
 parameter signature, so a controller grown on a masked world is never resumed on
 an unmasked one -- they are different tasks that happen to share a class name.
 """
+import hashlib
 import json
 import os
 
@@ -34,9 +35,17 @@ from .runlog import RUNS, bank_json, bank_from_json, env_signature
 
 
 def _key(env):
+    """A key that is the same in every process.
+
+    `hash()` on a string is salted per interpreter, so a key built from it
+    changes on every run -- the store looked like it worked because the first
+    warm-start test ran cold and warm inside ONE process. Across processes every
+    lookup missed and every run silently started from nothing, which is the
+    exact failure the store exists to prevent.
+    """
     sig = env_signature(env)
-    return "%s_%s" % (sig["class"],
-                      abs(hash(json.dumps(sig, sort_keys=True))) % (10 ** 10))
+    h = hashlib.sha1(json.dumps(sig, sort_keys=True).encode()).hexdigest()
+    return "%s_%s" % (sig["class"], h[:12])
 
 
 def _path(env, root=RUNS):

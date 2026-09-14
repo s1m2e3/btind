@@ -52,7 +52,7 @@ import numpy as np
 
 from .collect import design_matrix
 from .evotm import Alphabet, _match, _rand_literal, dedupe_literals
-from .lawsearch import library
+from .lawsearch import library, structural_primitives
 from .structure import accept, score
 from .valuesplit import fit_value_law
 
@@ -129,7 +129,8 @@ def _clause_pool(rng, alpha, Z, hot, pool, max_arity, last, seeds):
 
 
 def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
-              etas=(0.05, 0.2), n_perturb=8, sigma=0.4, rng=None):
+              etas=(0.05, 0.2), n_perturb=8, sigma=0.4, rng=None,
+              structural=True):
     """Every law worth trying on one candidate region, from every source.
 
     THE FITTED LAW IS THE PRIMARY SOURCE, as it has been since e18: solve the
@@ -138,6 +139,8 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
     not discovering it, so it is off by default and reported separately when on.
     """
     out = list(lib)
+    if structural:
+        out += list(structural_primitives(zn, np.shape(arm_parent)[0]).items())
     Xd = design_matrix(Z if bank.get("laws_on_z") else obs)
     if labels is not None:
         U, M = labels
@@ -192,7 +195,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
          w=None, seed_clauses=None, screen_ep=120, confirm_ep=600,
          n_confirm=12, T=400, seed=777, z=2.0, rng=None, verbose=True,
          use_library=False, cem_region=True, cem_top=10, cem_iter=3,
-         cem_K=24, cem_sigma=0.4, cols=None):
+         cem_K=24, cem_sigma=0.4, cols=None, structural=True):
     """Add arms while a rollout says they pay by more than `min_gain`."""
     rng = rng or np.random.default_rng(0)
     alpha = Alphabet(n_thresholds=9).fit(
@@ -209,7 +212,8 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
     # criterion deciding what a regional search may consider is the same
     # mistake as every proxy failure here, one level up.
     if verbose:
-        print("    law sources: %s%s%sparent-perturbations"
+        print("    law sources: %s%s%s%s"
+              % ("structural " if structural else "", "", "", "") + "%s%s%sparent-perturbations"
               % ("fitted " if labels is not None else "",
                  "gradient " if qhat is not None else "",
                  ("library(%d) " % len(lib)) if lib else ""), flush=True)
@@ -233,7 +237,8 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                 continue
             parent = bank["default"]
             for lname, th in _laws_for(bank, region, names, zn, obs, Z, labels,
-                                       qhat, w, lib, parent, rng=rng):
+                                       qhat, w, lib, parent, rng=rng,
+                                       structural=structural):
                 g = score(env, _insert(bank, cl, th, 0), pol_fn, screen_ep, T,
                           seed)
                 rows.append((float((g - cur_cheap).mean()), cl, th, lname,

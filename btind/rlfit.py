@@ -32,7 +32,7 @@ from .grow_bt import grow
 from .lawcem import cem_law, improve_laws
 from .memory import MemBank, emit, mem_names
 from .memsearch import discover as mem_discover, record
-from .structure import drop_arm, reorder, score
+from .structure import drop_arm, reorder, score, simplify
 
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
@@ -106,7 +106,10 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           n_confirm=10, T=cfg["T"], seed=cfg["seed"],
                           z=cfg["z"], rng=rng, use_library=False,
                           verbose=verbose)
-        bank, cur, llog = improve_laws(env, bank, pol_fn, cur=None,
+        bank, cur, _ = simplify(env, bank, pol_fn, n_ep=cfg["n_ep"],
+                                T=cfg["T"], seed=cfg["seed"], z=cfg["z"],
+                                names=zn, verbose=verbose)
+        bank, cur, llog = improve_laws(env, bank, pol_fn, cur=cur,
                                        n_ep=cfg["n_ep"], T=cfg["T"],
                                        seed=cfg["seed"], z=cfg["z"],
                                        min_gain=cfg["min_gain"], rng=rng,
@@ -158,3 +161,36 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         print("  held-out G %.2f +-%.2f  pickups %.2f -- stored"
               % (m["G"], m["ci"], m["eaten"]), flush=True)
     return bank, log, m
+
+
+def critic_quality(env, bank, names, rng=None, n=300, h=15):
+    """How well a fitted critic agrees with a re-probed reference field.
+
+    Returns (median cosine, ceiling). The ceiling is the reference's agreement
+    with itself, so a score near it means the critic is as good as the
+    measurement allows and a score near zero means the gradient is noise. Call
+    it before deciding whether gradient steps belong in the loop.
+    """
+    from .critic import QFeatures, fit_qhat, grad_score, local_q_grad
+    from .landscape import landscape_rollout, subsample
+    from .vhat import fit_vhat
+    rng = rng or np.random.default_rng(5)
+    n_obs = len(names)
+    pol_fn = lambda b: MemBank(b, n_obs)
+    vh = fit_vhat(env, pol_fn(bank), n_ep=400, T=400, n_step=20, sweeps=2,
+                  seed=21)
+    L = subsample(landscape_rollout(env, pol_fn(bank), vh, rng, n_ep=400,
+                                    T=400, k=10), 8000, rng)
+    S = L["state"][:n]
+    p = pol_fn(bank)
+    p.reset(len(S))
+    u = p.act(env.observe(S))
+    g1 = local_q_grad(env, pol_fn(bank), S, u, vh, np.random.default_rng(1),
+                      K=96, n_rep=8, h=h, seed=11)
+    g2 = local_q_grad(env, pol_fn(bank), S, u, vh, np.random.default_rng(2),
+                      K=96, n_rep=8, h=h, seed=77)
+    qh, info = fit_qhat(env, pol_fn(bank), L["state"], vh, rng, seed=3, h=h,
+                        n_rep=3)
+    sc = grad_score(qh.grad_u(env.observe(S), u), 0.5 * (g1 + g2))
+    return dict(median_cos=sc["cos_med"], agree=sc["agree"], r2=info["r2"],
+                ceiling=grad_score(g1, g2)["cos_med"], qhat=qh, vhat=vh)
