@@ -68,7 +68,7 @@ def record(env, policy, rng, n_ep=400, T=400):
     return OB, ST, AL
 
 
-def latched(OB, cols, write, zb=None):
+def latched(OB, cols, write, zb=None, with_age=False):
     """Replay a write rule over recorded observations, offline.
 
     Returns (values (n,T,k), have (n,T)) as they WOULD have been had the rule
@@ -82,14 +82,21 @@ def latched(OB, cols, write, zb=None):
     vals = OB[:, :, cols]
     out = np.zeros_like(vals)
     have = np.zeros((n, T), bool)
+    age = np.zeros((n, T))
     cur = np.zeros((n, len(cols)))
     hv = np.zeros(n, bool)
+    ag = np.zeros(n)
     for t in range(T):
         f = fire[:, t]
+        ag = np.where(hv, ag + 1, 0.0)
         cur[f] = vals[f, t]
         hv |= f
+        ag[f] = 0.0
         out[:, t] = cur
         have[:, t] = hv
+        age[:, t] = ag
+    if with_age:
+        return out, have, age
     return out, have
 
 
@@ -221,11 +228,17 @@ def z_rows(OB, AL, mem, n_obs, max_rows=60000, rng=None):
         live = rng.choice(live, max_rows, replace=False)
     O = OB.reshape(-1, OB.shape[2])[live]
     cols = list(mem["cols"])
-    V, H = latched(OB, cols, mem["write"])
+    V, H, AG = latched(OB, cols, mem["write"], with_age=True)
     V = V.reshape(-1, len(cols))[live]
     H = H.reshape(-1)[live].astype(float)[:, None]
-    Z = np.hstack([O, np.zeros((len(O), 2)), V, H])
-    offered = list(range(n_obs)) + list(range(n_obs + 2, Z.shape[1] - 1))
+    AG = AG.reshape(-1)[live][:, None]
+    parts = [O, np.zeros((len(O), 2)), V, H, AG]
+    if mem.get("countdown"):
+        parts.append(V - AG)
+    Z = np.hstack(parts)
+    # every memory column is offered as a guard, the age included; V_hat and
+    # leverage are not, and the intercept is not a column
+    offered = list(range(n_obs)) + list(range(n_obs + 2, Z.shape[1]))
     return Z, offered
 
 
@@ -278,10 +291,11 @@ def refine_guard(env, bank, arm, zn, pol_fn_for, Z, offered, n_thr=7, n_try=48,
     def place(lit, pos):
         """This arm moved to `pos`, with `lit` conjoined onto its guard."""
         g = [l[:] for l in bank["clauses"][arm]] + ([list(lit)] if lit else [])
-        beta = (bank.get("betas") or [None] * n_arm)[arm]
-        st = (bank.get("sticky") or [False] * n_arm)[arm]
-        return insert_arm(drop(), g, bank["laws"][arm], pos, beta=beta,
-                          sticky=st)
+        per = {k: (bank.get(k) or [None] * n_arm)[arm]
+               for k in ("betas", "sticky", "steps", "fails")}
+        return insert_arm(drop(), g, bank["laws"][arm], pos, beta=per["betas"],
+                          sticky=bool(per["sticky"]), steps=per["steps"],
+                          fails=per["fails"])
 
     pol = pol_fn_for(zn)
     # THE REFERENCE IS THE TREE WITHOUT THE ARM, not the tree with its

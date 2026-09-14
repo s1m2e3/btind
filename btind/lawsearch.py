@@ -125,6 +125,29 @@ def discrete_primitives(names, n_act, d, rng=None, n_sample=None):
     return out
 
 
+def scalar_primitives(names, d, lo, hi, scales=(1.0, 0.1)):
+    """The law vocabulary for a one-output continuous head. Names nothing.
+
+    CONSTANT LEVELS across the world's range -- the honest null for a command
+    that is clipped to [lo, hi] -- and single-column proportional terms at two
+    scales, both signs: "command in proportion to column j". The scale is
+    needed because a column in metres and a column in {0, 1} cannot share one
+    coefficient; CEM refines whatever the rollout picks.
+    """
+    out = {}
+    for f in (0.0, 0.25, 0.5, 0.75, 1.0):
+        th = np.zeros((d, 1))
+        th[-1, 0] = lo + f * (hi - lo)
+        out["const[%.3g]" % th[-1, 0]] = th
+    for j in range(len(names)):
+        for sc in scales:
+            for sgn in (1.0, -1.0):
+                th = np.zeros((d, 1))
+                th[j, 0] = sgn * sc
+                out["%s%.3g*%s" % ("+" if sgn > 0 else "-", sc, names[j])] = th
+    return out
+
+
 def primitives(names, extras=()):
     """The affine vocabulary a world's observation columns admit.
 

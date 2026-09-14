@@ -30,7 +30,9 @@ def _bank(n=4, d=6):
                 laws=[np.full((d, 2), float(i)) for i in range(n)],
                 default=np.zeros((d, 2)),
                 betas=[None, [[1, 0.2, True]], None, None],
-                sticky=[False, True, False, True])
+                sticky=[False, True, False, True],
+                steps=[None, None, None, [([[2, 0.7, False]], np.ones((d, 2)))]],
+                fails=[None, None, [[0, 0.9, False]], None])
 
 
 def test_insert_keeps_lists_aligned():
@@ -41,15 +43,54 @@ def test_insert_keeps_lists_aligned():
         shift = lambda i: i + (1 if i >= pos else 0)
         assert b["sticky"][shift(1)] is True and b["sticky"][shift(3)] is True
         assert b["betas"][shift(1)] == [[1, 0.2, True]]
+        assert b["fails"][shift(2)] == [[0, 0.9, False]]
+        assert b["steps"][shift(3)] is not None and b["steps"][pos] is None
+
+
+def test_insert_with_steps_forces_sticky():
+    b = insert_arm(_bank(), [[0, 0.1, False]], np.zeros((6, 2)), 1,
+                   steps=[([[1, 0.5, True]], np.zeros((6, 2)))])
+    check_arms(b, "insert-steps")
+    assert b["sticky"][1] is True and len(b["steps"][1]) == 1
+    # a bank that never had the lists gets them when an arm brings one
+    plain = dict(clauses=[[[0, 0.5, False]]], laws=[np.zeros((6, 2))],
+                 default=np.zeros((6, 2)))
+    b = insert_arm(plain, [[1, 0.1, False]], np.zeros((6, 2)), 0,
+                   fails=[[2, 0.3, True]])
+    check_arms(b, "insert-fails-into-plain")
+    assert b["fails"] == [[[2, 0.3, True]], None] and b.get("steps") is None
 
 
 def test_reindex_permutes_and_filters():
     b = reindex(_bank(), [3, 2, 1, 0])
     check_arms(b, "reverse")
     assert b["sticky"] == [True, False, True, False]
+    assert b["steps"][0] is not None and b["fails"][1] is not None
     b = reindex(_bank(), [0, 2, 3])
     check_arms(b, "drop")
     assert b["sticky"] == [False, False, True] and b["betas"][2] is None
+    assert b["fails"][1] == [[0, 0.9, False]] and b["steps"][2] is not None
+
+
+def test_check_arms_requires_sticky_for_steps():
+    b = dict(_bank(), sticky=[False, True, False, False])
+    try:
+        check_arms(b, "unsticky-steps")
+    except ValueError:
+        return
+    raise AssertionError("check_arms passed a multi-step arm that is not sticky")
+
+
+def test_json_round_trip_keeps_steps_and_fails():
+    from btind.runlog import bank_from_json, bank_json
+    import json
+    b = _bank()
+    d = json.loads(json.dumps(bank_json(b, names=list("abcdef"[:4]))))
+    r = bank_from_json(d)
+    check_arms(r, "json")
+    assert r["fails"] == b["fails"] and r["steps"][:3] == [None] * 3
+    adv, th = r["steps"][3][0]
+    assert adv == [[2, 0.7, False]] and np.array_equal(th, np.ones((6, 2)))
 
 
 def test_kicks_keep_lists_aligned():

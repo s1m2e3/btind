@@ -1,0 +1,208 @@
+"""Discovering STEPS and FAILURE conditions: the Sequence and the status.
+
+An arm today is `Sequence[guard, action]`, one action. A hand-written tree has
+sequences of several actions and children that can fail, and both are now in
+the representation (`tick.py`): an arm carries `steps` -- further
+(advance_clause, law) pairs it moves through while latched -- and a `fails`
+clause that releases it and hands the tick to the arms below. This file
+proposes them, from the tree's own rollouts and nothing else, and the paired
+test decides.
+
+THE NULL IS INSIDE THE CLASS, which is what makes the search safe. A step whose
+advance clause never fires, and a fail clause that never fires, leave every
+episode's return unchanged (tests/test_steps.py holds the kernels to that), so
+the incumbent is a member of the candidate set and the search can only fail to
+find an improvement. That required one decision measured the hard way: `betas`
+is the termination of the WHOLE arm, checked at every step. With it checked on
+the last step only, a never-firing advance trapped the arm forever and the
+identity move did not exist.
+
+WHERE THE CANDIDATES COME FROM. Advance and fail literals are drawn from the
+same alphabet as every guard -- `beta_candidates`, the arm's own columns first
+and at finer resolution, then the rest, planted distractors included. The law of
+a new step comes from the same vocabulary the grower uses: the arm's current law
+(identity), the constant preferences and single-column scores on a discrete
+head, the structural directions on a vector head, and perturbations of the
+parent. Nothing is named by hand and no expert labels anything.
+
+WHAT THE HIGHWAY WORLD SAID ABOUT THIS (experiments/e26). Steps run -- a
+hand-written two-step arm reached its second step in 68% of episodes -- and the
+fail clause was worth +2.5 to +3.0 INSIDE the family of overtaking sequences.
+But no sequence, hysteresis or fail variant beat the flat reactive "brake when
+the lead is close" tree: the meta-actions are already macro-actions the
+low-level controller completes, and the world punishes commitment. So on that
+world this search should accept fail clauses where they repair a committed arm
+and little else, and its silence on steps there is the world, not the operator.
+The world where sequences are load-bearing by construction is the next one.
+
+ONE MOVE PER CALL, the most-run arm first, as `search_beta` does: a step changes
+which states every arm below sees, so two at once would be priced against each
+other's stale distribution.
+"""
+import numpy as np
+
+from .betasearch import beta_candidates, churn
+from .lawsearch import discrete_primitives, structural_primitives
+from .memory import check_arms
+from .structure import accept, score
+from .tick import law_of, n_steps_of
+
+
+def with_step(bank, arm, adv, theta):
+    """The bank with (adv, theta) appended as arm `arm`'s new last step.
+
+    A stepped arm has to be sticky; an arm that was not is made so with no
+    termination, so preemption and the new step's own future beta are what end
+    it. That is a change of class the paired test prices like any other.
+    """
+    C = len(bank["clauses"])
+    steps = list(bank.get("steps") or [None] * C)
+    steps[arm] = list(steps[arm] or []) + [([l[:] for l in adv],
+                                            np.asarray(theta, float))]
+    sticky = list(bank.get("sticky") or [False] * C)
+    sticky[arm] = True
+    return check_arms(dict(bank, steps=steps, sticky=sticky), "with_step")
+
+
+def with_fail(bank, arm, clause):
+    C = len(bank["clauses"])
+    fails = list(bank.get("fails") or [None] * C)
+    fails[arm] = [l[:] for l in clause] if clause is not None else None
+    return check_arms(dict(bank, fails=fails), "with_fail")
+
+
+def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4):
+    """Laws a new step may carry, from the same sources the grower uses."""
+    parent = np.asarray(law_of(bank, arm, n_steps_of(bank, arm) - 1), float)
+    d, n_out = parent.shape
+    out = [("same", parent)]
+    head = bank.get("head", "vector" if n_out == 2 else "argmax")
+    if head in ("scalar", "duration"):
+        from .lawsearch import scalar_primitives
+        lo, hi = bank.get("u_range", (-1.0, 1.0))
+        out += list(scalar_primitives(zn, d, lo, hi).items())
+    elif head == "argmax":
+        out += list(discrete_primitives(zn, n_out, d, rng=rng,
+                                        n_sample=n_sample).items())
+    else:
+        out += list(structural_primitives(zn, d).items())
+    for i in range(n_perturb):
+        out.append(("rand%d" % i, parent + sigma * rng.standard_normal(parent.shape)))
+    return out
+
+
+def _pick(cands, own_cols, n, rng, weights=None):
+    """Every literal on the arm's own columns, then a draw from the rest.
+
+    The hysteresis and the "advance once the manoeuvre has started" cases both
+    live on the arm's own variables, so those are never sampled away; the
+    remaining budget goes to the other columns, steered by the learned
+    proposal weights when there are any.
+    """
+    own = [c for c in cands if c[0][0][0] in own_cols]
+    rest = [c for c in cands if c[0][0][0] not in own_cols]
+    k = max(0, n - len(own))
+    if len(rest) > k:
+        p = None
+        if weights is not None:
+            w = weights.probs([c[0][0][0] for c in rest])
+            p = np.array([w[c[0][0][0]] for c in rest])
+            p = p / p.sum() if p.sum() > 0 else None
+        rest = [rest[i] for i in rng.choice(len(rest), k, replace=False, p=p)]
+    return own + rest
+
+
+def search_steps(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_adv=16,
+                 screen_ep=120, confirm_ep=600, n_confirm=8, T=400, seed=777,
+                 z=2.0, min_gain=0.3, max_steps=3, rng=None, weights=None,
+                 verbose=True, n_law_sample=40):
+    """Append one step to one arm, the (advance, law) pair that wins its rollout."""
+    rng = rng or np.random.default_rng(0)
+    C = len(bank["clauses"])
+    if not C:
+        return bank, []
+    ch = churn(env, bank, pol_fn, T=T)
+    order = (list(arms) if arms is not None else
+             sorted(range(C), key=lambda c: -ch[c]["share"]))
+    cur = score(env, bank, pol_fn, confirm_ep, T, seed) if cur_G is None else cur_G
+    log = []
+    for c in order:
+        if ch[c]["share"] < 0.02 or n_steps_of(bank, c) >= max_steps:
+            continue
+        own = {l[0] for l in bank["clauses"][c]}
+        advs = _pick(beta_candidates(Z, zn, bank["clauses"][c]), own, n_adv,
+                     rng, weights)
+        laws = _law_pool(bank, zn, c, rng, n_sample=n_law_sample)
+        cheap = score(env, bank, pol_fn, screen_ep, T, seed)
+        rows = []
+        for adv, alab in advs:
+            for lname, th in laws:
+                g = score(env, with_step(bank, c, adv, th), pol_fn, screen_ep,
+                          T, seed)
+                rows.append((float((g - cheap).mean()), adv, alab, lname, th))
+        rows.sort(key=lambda r: -r[0])
+        for dlt, adv, alab, lname, th in rows[n_confirm:]:
+            log.append(dict(kind="step", arm=c, clause=adv, adv=alab, law=lname,
+                            screen=dlt, stage="screen", accepted=False))
+        best, best_d = None, min_gain
+        for dlt, adv, alab, lname, th in rows[:n_confirm]:
+            cand = with_step(bank, c, adv, th)
+            ok, d, g = accept(env, cand, pol_fn, cur, confirm_ep, T, seed, z)
+            keep = bool(ok and d > min_gain)
+            log.append(dict(kind="step", arm=c, clause=adv, adv=alab, law=lname,
+                            screen=dlt, delta=d, accepted=keep))
+            if keep and d > best_d:
+                best, best_d, best_lab = cand, d, "%s -> %s" % (alab, lname)
+        if verbose:
+            print("    steps on arm %d (share %.0f%%, %d steps): %s"
+                  % (c, 100 * ch[c]["share"], n_steps_of(bank, c),
+                     ("then %s  %+.2f" % (best_lab, best_d)) if best
+                     else "no step cleared %+.2f" % min_gain), flush=True)
+        if best is not None:
+            return best, log
+    return bank, log
+
+
+def search_fails(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_try=24,
+                 n_ep=600, T=400, seed=777, z=2.0, min_gain=0.3, rng=None,
+                 weights=None, verbose=True):
+    """Give one latched arm the fail clause that wins its rollout.
+
+    Only sticky arms are offered one: a fail clause acts on a RUNNING arm, and a
+    reactive arm is re-chosen every tick anyway, so on it the move is a no-op
+    the paired test could not distinguish from the incumbent.
+    """
+    rng = rng or np.random.default_rng(0)
+    C = len(bank["clauses"])
+    if not C:
+        return bank, []
+    sticky = bank.get("sticky") or [False] * C
+    fails = bank.get("fails") or [None] * C
+    ch = churn(env, bank, pol_fn, T=T)
+    order = (list(arms) if arms is not None else
+             sorted(range(C), key=lambda c: -ch[c]["share"]))
+    cur = score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G
+    log = []
+    for c in order:
+        if not sticky[c] or fails[c] is not None or ch[c]["share"] < 0.02:
+            continue
+        own = {l[0] for l in bank["clauses"][c]}
+        cands = _pick(beta_candidates(Z, zn, bank["clauses"][c]), own, n_try,
+                      rng, weights)
+        best, best_d = None, min_gain
+        for cl, label in cands:
+            cand = with_fail(bank, c, cl)
+            ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed, z)
+            keep = bool(ok and d > min_gain)
+            log.append(dict(kind="fail", arm=c, clause=cl, fail=label, delta=d,
+                            accepted=keep))
+            if keep and d > best_d:
+                best, best_d, best_lab = cand, d, label
+        if verbose:
+            print("    fail on arm %d (share %.0f%%): %s"
+                  % (c, 100 * ch[c]["share"],
+                     ("%s  %+.2f" % (best_lab, best_d)) if best
+                     else "no fail clause cleared %+.2f" % min_gain), flush=True)
+        if best is not None:
+            return best, log
+    return bank, log

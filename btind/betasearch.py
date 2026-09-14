@@ -43,6 +43,8 @@ def churn(env, bank, pol_fn, n_ep=200, T=400, seed=11):
          else env.sample_states(n_ep, rng))
     if hasattr(pol, "reset"):
         pol.reset(n_ep)
+    if hasattr(env, "_search_bank"):
+        env._search_bank = bank
     alive = np.ones(n_ep, bool)
     hist, al = [], []
     for t in range(T):
@@ -51,17 +53,25 @@ def churn(env, bank, pol_fn, n_ep=200, T=400, seed=11):
         a = (pol.arbitrate(Z) if hasattr(pol, "arbitrate")
              else np.zeros(len(o), int))
         hist.append(a.copy())
-        al.append(alive.copy())
+        # ONE ROW PER UNIT, NOT PER EPISODE. A world that runs the tree once
+        # per vehicle observes k rows per episode; a row counts only while
+        # its unit is active (`row_alive`), and every row of a finished
+        # episode is dead.
+        rows_alive = np.repeat(alive, len(o) // n_ep)
+        if hasattr(env, "row_alive"):
+            rows_alive = rows_alive & env.row_alive(s)
+        al.append(rows_alive)
         s, _, done = env.step(s, pol.act(o))
         alive &= ~done
         if not alive.any():
             break
     A = np.array(hist).T
     AL = np.array(al).T
+    n_rows = A.shape[0]
     out = {}
     for c in range(len(bank["clauses"])):
         runs, reent = [], 0
-        for i in range(n_ep):
+        for i in range(n_rows):
             row = A[i][AL[i]]
             if not len(row):
                 continue
@@ -79,7 +89,7 @@ def churn(env, bank, pol_fn, n_ep=200, T=400, seed=11):
             reent += max(seen - 1, 0)
         out[c] = dict(dwell=float(np.mean(runs)) if runs else 0.0,
                       reentries=reent / max(n_ep, 1),
-                      share=float((A[AL] == c).mean()))
+                      share=float((A[AL] == c).mean()) if AL.any() else 0.0)
     return out
 
 

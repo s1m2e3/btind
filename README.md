@@ -41,11 +41,30 @@ tied with a planted distractor). What has never mis-ranked is a short rollout.
 
 ## Layout
 
-    btind/envs/      ForageWorld and NestWorld, batched numba kernels
+    btind/envs/      ForageWorld, NestWorld, a fused model of highway-env, and
+                     IntersectionBatch: a signalised intersection on SUMO's
+                     geometry where one shared tree drives every vehicle and a
+                     second tree runs the signal (signal visible near the box,
+                     or delivered once as a V2I message; optional occlusion;
+                     discrete or continuous leaves per agent)
     btind/           search, collect, valuesplit, evotm, rollout_select   stage 1
                      critic, qwire, landscape, structure, lawsearch       stage 2
                      memory, memsearch, betasearch, grow_bt, loop         temporal
-    experiments/     e18-e22, each with its findings in the docstring
+                     tick        the ONE compiled arbitration both kernels run:
+                                 fallback, latch, steps, success, failure
+                     stepsearch  proposes a Sequence's further steps and a
+                                 child's FAILURE condition, by rollout
+                     explore     counterfactual deviations: an exact advantage
+                                 for one action or one manoeuvre, paired
+                     memtransient  a message-shaped blackboard for a discrete
+                                 head: a transient column, its arrival as the
+                                 event, a countdown, and the arms that read it
+                     rlfit       the pure-RL loop, no expert anywhere
+    experiments/     e18-e32, each with its findings in the docstring
+                     e26-e27: highway and the reactive intersection do NOT
+                     reward sequences (progress is observable); e29, e32: the
+                     event-mode and occluded intersections DO reward memory
+                     (+36 and +6.5 hand-written); e28, e30: discovery from zero
     data/, figs/     measured results
     fit_bt.py        entry point
 

@@ -13,15 +13,17 @@ both were worth about 25 return units.
 WHAT IS PINNED. Constant-action banks and banks exercising the tree, the
 blackboard and stickiness agree EXACTLY -- every episode, to the last bit.
 
-THE ONE KNOWN DISCREPANCY, stated rather than tuned away: on a bank with random
-laws, 3 episodes in 400 diverge, always late (the worst agreed bit-for-bit for
-34 consecutive steps before parting at step 35), and the mean return moves by
-0.006%. Two explanations were tested and BOTH FAILED -- it is not a tie in the
-argmax (the margin at the diverging step was 29.4, not rounding) and it is not
-drift in the physics (constant-action banks agree exactly over 2000 episodes of
-the same dynamics). The cause is not established, so the test bounds it instead
-of asserting a reason: at least 98% of episodes must agree exactly and the mean
-must agree to 0.01. A systematic error would fail both; this does not.
+THE DISCREPANCY THAT WAS OPEN, AND WHAT IT WAS. On a bank with random laws, 3
+episodes in 400 used to diverge, always late, and two explanations had failed:
+not an argmax tie, not physics drift. The cause was numba's cache. `cache=True`
+is keyed on the kernel's own source file, so constants imported from
+`highway_batch` (frozen at compile time) and, later, the arbitration inlined
+from `tick.py` could change without the cached kernel being recompiled -- the
+kernel then ran a slightly different world or a different tree from the numpy
+model it was compared with. Measured after `tick._drop_stale_kernel_caches`
+was added: 1200 random-law episodes over three seeds agree to the bit, worst
+difference 1.8e-15. So the bound this test used to carry (98% exact, mean to
+0.01) is gone and the random-law case is held to exact agreement like the rest.
 """
 import os
 import sys
@@ -55,13 +57,11 @@ def _numpy_G(bank, s):
 
 
 def _fused_G(bank, s):
+    from btind.tick import no_dev, no_trace, tick_args, world_args
     f = flatten(bank, NOBS)
     G = np.empty(len(s))
-    rollout(np.ascontiguousarray(s), params(ENV), f["lit_col"], f["lit_thr"],
-            f["lit_neg"], f["cl_start"], f["cl_len"], f["b_col"], f["b_thr"],
-            f["b_neg"], f["b_start"], f["b_len"], f["sticky"], f["mem_cols"],
-            f["w_col"], f["w_thr"], f["w_neg"], f["laws"], f["n_obs"],
-            ENV.duration, G)
+    rollout(np.ascontiguousarray(s), params(ENV), *world_args(f), ENV.duration,
+            G, no_trace(), no_dev(), *tick_args(f))
     return G
 
 
@@ -93,7 +93,7 @@ def _tree_bank(rng, mem=None, sticky=None, betas=None):
 
 
 def test_tree_and_blackboard_and_sticky_agree():
-    """Exact on the structured banks; the random-law case is bounded, not exact."""
+    """Exact, random laws included -- see the docstring for why that is now safe."""
     s = _starts()
     mem = dict(cols=[N.index("v1_dx"), N.index("v1_dvx")],
                write=[[N.index("v1_dx"), 15.0, True]], clear=None)
@@ -106,10 +106,8 @@ def test_tree_and_blackboard_and_sticky_agree():
     for name, b in cases:
         gn, gf = _numpy_G(b, s), _fused_G(b, s)
         d = np.abs(gn - gf)
-        exact = float((d < 1e-12).mean())
-        assert exact >= 0.98, "%s: only %.1f%% of episodes agree" % (name, 100 * exact)
-        assert abs(gn.mean() - gf.mean()) < 0.01, \
-            "%s: mean %.4f vs %.4f" % (name, gn.mean(), gf.mean())
+        assert d.max() < 1e-9, "%s: %d episodes differ, worst %.3e" % (
+            name, int((d >= 1e-9).sum()), d.max())
 
 
 def test_write_rules_agree_exactly():

@@ -29,6 +29,15 @@ THE ARBITRATION, and the one comparison that is the whole of it:
 not be interrupted, and an agent committed to "return to nest" would walk into a
 bear rather than reconsider.
 
+STEPS AND STATUS, added on top of that rule and documented in `tick.py`, which
+is the single compiled copy both kernels run. An arm may carry `steps` -- further
+(advance_clause, law) pairs it moves through while latched -- and a `fails`
+clause that releases it AND excludes it from this tick's Fallback, so the arms
+below it get the state: a child returning FAILURE. `betas` remains the
+termination of the arm, now checked at every step. The implementation here is
+the vectorised numpy REFERENCE; the kernels are the other implementation, and
+the tests compare them.
+
 NESTING IS THE SAFETY PROPERTY. With `sticky` all false and no write rule, the
 arbitration collapses to `a_t = f_t` and the blackboard columns are constant --
 exactly the memoryless controller, bit for bit. So the memoryless policy class
@@ -59,7 +68,50 @@ def mem_names(names, mem):
     inserted, so adding a slot cannot invalidate a clause that already exists."""
     out = base_names(names)
     if mem:
-        out += ["mem_%s" % names[j] for j in mem["cols"]] + ["have_mem"]
+        # `mem_age` is HOW LONG AGO the slot was written, in ticks. A guard on
+        # it is a remembered clock: "told green 12 ticks ago" is a condition a
+        # tree can act on after the message itself is gone. Zero until the
+        # first write, like `have_mem`.
+        out += (["mem_%s" % names[j] for j in mem["cols"]]
+                + ["have_mem", "mem_age"])
+        if mem.get("countdown"):
+            # `left_<c>` = mem_<c> - mem_age: what is left of a remembered
+            # DURATION, in ticks. A message "green for 24 ticks" becomes a
+            # column that reaches zero when the light changes, so a guard can
+            # read the remembered clock as one number. Whether a stored column
+            # is a duration is not known here; the flag is a candidate the
+            # memory search prices like any other, and on a stored bearing the
+            # column is harmless junk the rollout ignores.
+            out += ["left_%s" % names[j] for j in mem["cols"]]
+    return out
+
+
+def all_clauses(bank):
+    """Every clause a bank evaluates: guards, terminations, fail and advance
+    conditions, and the blackboard's write and clear rules. None entries skipped."""
+    out = list(bank.get("clauses") or [])
+    out += [c for c in (bank.get("betas") or []) if c]
+    out += [c for c in (bank.get("fails") or []) if c]
+    for st in (bank.get("steps") or []):
+        out += [adv for adv, _ in (st or [])]
+    m = bank.get("mem")
+    if m:
+        out.append(m["write"])
+        if m.get("clear"):
+            out.append(m["clear"])
+    return out
+
+
+def all_laws(bank):
+    """Every law a bank can act with: each arm's steps, then the default."""
+    out = []
+    for c, th in enumerate(bank.get("laws") or []):
+        out.append(th)
+        st = bank.get("steps")
+        if st and st[c]:
+            out += [t for _, t in st[c]]
+    if bank.get("default") is not None:
+        out.append(bank["default"])
     return out
 
 
@@ -74,29 +126,17 @@ def _guards_read_vq(bank, n_obs):
     off the fused kernel and onto the Python path, 63x slower.
     """
     cols = {n_obs, n_obs + 1}
-    for c in list(bank.get("clauses") or []) + list(
-            filter(None, bank.get("betas") or [])):
-        if any(l[0] in cols for l in c):
-            return True
-    m = bank.get("mem")
-    if m and any(l[0] in cols for l in m["write"] + (m.get("clear") or [])):
-        return True
-    return False
+    return any(l[0] in cols for c in all_clauses(bank) for l in c)
 
 
 def _reads_vq(bank, n_obs):
     """Does any clause, termination, write rule or LAW mention V_hat/leverage?"""
-    cols = {n_obs, n_obs + 1}
-    for c in list(bank.get("clauses") or []) + list(
-            filter(None, bank.get("betas") or [])):
-        if any(l[0] in cols for l in c):
-            return True
-    m = bank.get("mem")
-    if m and any(l[0] in cols for l in m["write"] + (m.get("clear") or [])):
+    if _guards_read_vq(bank, n_obs):
         return True
+    cols = [n_obs, n_obs + 1]
     if bank.get("laws_on_z"):
-        for th in list(bank.get("laws") or []) + [bank.get("default")]:
-            if th is not None and np.abs(np.asarray(th)[list(cols)]).max() > 0:
+        for th in all_laws(bank):
+            if np.abs(np.asarray(th)[cols]).max() > 0:
                 return True
     return False
 
@@ -106,8 +146,13 @@ class MemBank:
 
     bank keys beyond the memoryless ones:
         betas    list, one per clause; None means "no termination" (the arm runs
-                 until preempted or until its own guard is re-evaluated)
+                 until preempted or until its own guard is re-evaluated). On a
+                 multi-step arm it terminates the whole arm at any step.
         sticky   list of bool, one per clause; all False = memoryless
+        steps    list, one per clause; None or [(advance_clause, law), ...] for
+                 steps 1..K-1 -- a Sequence of actions inside the arm
+        fails    list, one per clause; None or a clause that releases the arm
+                 and hands this tick to the arms BELOW it (FAILURE status)
         mem      None, or dict(cols=[j...], write=clause, clear=clause|None)
     """
 
@@ -121,26 +166,45 @@ class MemBank:
         # that times out. Almost no emitted bank mentions them.
         self.need_vq = _reads_vq(bank, n_obs)
         self.mem = bank.get("mem")
-        self.betas = bank.get("betas") or [None] * len(bank["clauses"])
-        self.sticky = bank.get("sticky") or [False] * len(bank["clauses"])
+        C = len(bank["clauses"])
+        self.betas = bank.get("betas") or [None] * C
+        self.sticky = bank.get("sticky") or [False] * C
+        self.steps = bank.get("steps") or [None] * C
+        self.fails = bank.get("fails") or [None] * C
+        self.n_steps = [1 + len(s or []) for s in self.steps]
         self.latch = None
+        self.step = None
         self.slots = None
+        self._k = None            # the step each row acted with on the last tick
 
     # -- state ---------------------------------------------------------------
     def reset(self, n):
         self.latch = np.full(n, -1, dtype=int)
+        self.step = np.zeros(n, dtype=int)
         k = len(self.mem["cols"]) if self.mem else 0
         self.slots = np.zeros((n, k))
         self.have = np.zeros(n, bool)
+        self.age = np.zeros(n, int)
 
-    def set_state(self, latch, slots, have):
+    def set_state(self, latch, slots, have, step=None, age=None):
         """Restore a recorded controller state, for probing and for replay."""
         self.latch = np.asarray(latch, int).copy()
         self.slots = np.asarray(slots, float).copy()
         self.have = np.asarray(have, bool).copy()
+        self.step = (np.zeros(len(self.latch), int) if step is None
+                     else np.asarray(step, int).copy())
+        self.age = (np.zeros(len(self.latch), int) if age is None
+                    else np.asarray(age, int).copy())
 
     def state(self):
-        return (self.latch.copy(), self.slots.copy(), self.have.copy())
+        return (self.latch.copy(), self.slots.copy(), self.have.copy(),
+                self.step.copy(), self.age.copy())
+
+    def law_of(self, c, k=0):
+        """The law arm `c` acts with at step `k`; `c < 0` is the default."""
+        if c < 0:
+            return self.b["default"]
+        return self.b["laws"][c] if k == 0 else self.steps[c][k - 1][1]
 
     def _ensure(self, n):
         if self.latch is None or len(self.latch) != n:
@@ -167,45 +231,92 @@ class MemBank:
             return zb
         if update:
             fire = _match_cols(self.mem["write"], zb)
+            # the age counts ticks SINCE the write: 0 on the write tick, and
+            # it only runs once something has been written
+            self.age = np.where(self.have, self.age + 1, 0)
             if fire.any():
                 self.slots[fire] = obs[np.ix_(fire, self.mem["cols"])]
                 self.have[fire] = True
+                self.age[fire] = 0
             clr = self.mem.get("clear")
             if clr:
                 c = _match_cols(clr, zb)
                 self.have[c] = False
                 self.slots[c] = 0.0
-        return np.hstack([zb, self.slots, self.have[:, None].astype(float)])
+                self.age[c] = 0
+        cols = [zb, self.slots, self.have[:, None].astype(float),
+                self.age[:, None].astype(float)]
+        if self.mem.get("countdown"):
+            cols.append(self.slots - self.age[:, None])
+        return np.hstack(cols)
 
     # -- arbitration ---------------------------------------------------------
     def arbitrate(self, Z):
-        """Returns the active arm per row and updates the latch."""
-        n, C = len(Z), len(self.b["clauses"])
-        M = (np.stack([_match_cols(c, Z) for c in self.b["clauses"]], 1)
-             if C else np.zeros((n, 0), bool))
-        f = np.full(n, -1, dtype=int)
-        for c in range(C - 1, -1, -1):
-            f[M[:, c]] = c
+        """Returns the active arm per row (-1 = default) and updates latch and step.
 
-        lat = self.latch
+        The tick, in the order `tick.py` fixes: fail, match (skipping the arm
+        that failed), preempt, advance, success, keep. Vectorised over rows;
+        the kernels run the same rule per row, compiled, and the tests hold the
+        two to bit-exact agreement.
+        """
+        self._ensure(len(Z))
+        n, C = len(Z), len(self.b["clauses"])
+        lat, stp = self.latch.copy(), self.step.copy()
         live = lat >= 0
-        # beta is evaluated only for rows whose latched arm has one
-        fired = np.zeros(n, bool)
+
+        # 1  FAIL: the latched arm's fail clause releases it and excludes it.
+        failed = np.zeros(n, bool)
         for c in range(C):
-            if self.betas[c] is None:
+            if self.fails[c] is None:
                 continue
             rows = live & (lat == c)
             if rows.any():
-                fired[rows] = _match_cols(self.betas[c], Z)[rows]
+                failed[rows] = _match_cols(self.fails[c], Z)[rows]
+        excl = np.where(failed, lat, -1)
+        lat[failed], stp[failed] = -1, 0
+        live = lat >= 0
 
-        preempt = (f >= 0) & live & (f < lat)
-        keep = live & ~preempt & ~fired
-        a = np.where(keep, lat, f)
+        # 2  MATCH, first clause wins, the failed arm skipped on its own row.
+        M = (np.stack([_match_cols(c, Z) for c in self.b["clauses"]], 1)
+             if C else np.zeros((n, 0), bool))
+        if failed.any():
+            M[np.flatnonzero(failed), excl[failed]] = False
+        f = np.full(n, C, dtype=int)
+        for c in range(C - 1, -1, -1):
+            f[M[:, c]] = c
+
+        # 3  PREEMPT: rows where f < lat simply take f. The rest of the latched
+        #    rows are the "zone" where the arm may advance, finish or keep.
+        zone = live & (f >= lat)
+        adv = np.zeros(n, bool)
+        succ = np.zeros(n, bool)
+        for c in range(C):
+            rows = zone & (lat == c)
+            if not rows.any():
+                continue
+            # 4  SUCCESS: the arm's beta releases it, at whatever step it is on.
+            if self.betas[c] is not None:
+                succ[rows] = _match_cols(self.betas[c], Z)[rows]
+            # 5  ADVANCE: step k -> k+1 on the tick step k+1's clause fires.
+            for k in range(self.n_steps[c] - 1):
+                r = rows & ~succ & (stp == k)
+                if r.any():
+                    adv[r] = _match_cols(self.steps[c][k][0], Z)[r]
+
+        # 6  KEEP everything in the zone that did not finish.
+        keep = zone & ~succ
+        a = f.copy()
+        a[keep] = lat[keep]
+        k_new = np.zeros(n, dtype=int)
+        k_new[keep] = stp[keep] + adv[keep]
 
         st = np.zeros(C + 1, bool)
         st[:C] = self.sticky
-        self.latch = np.where(st[a], a, -1)      # st[-1] is the default arm slot
-        return a
+        latched = st[a]                           # st[C] is the default slot
+        self.latch = np.where(latched, a, -1)
+        self.step = np.where(latched, k_new, 0)
+        self._k = k_new
+        return np.where(a == C, -1, a)
 
     # -- action --------------------------------------------------------------
     def scores(self, obs):
@@ -220,8 +331,9 @@ class MemBank:
         Xd = design_matrix(Z) if self.b.get("laws_on_z") else design_matrix(obs)
         out = Xd @ self.b["default"]
         for c in np.unique(a[a >= 0]):
-            m = a == c
-            out[m] = Xd[m] @ self.b["laws"][c]
+            for k in np.unique(self._k[a == c]):
+                m = (a == c) & (self._k == k)
+                out[m] = Xd[m] @ self.law_of(int(c), int(k))
         return out
 
     def preferences(self, obs, temp=1.0):
@@ -247,6 +359,12 @@ class MemBank:
         # partition the tree already carves.
         if self.b.get("head") == "argmax":
             return np.argmax(out, axis=1)
+        if self.b.get("head") in ("scalar", "duration"):
+            # A CONTINUOUS LEAF: the affine score IS the command -- an
+            # acceleration, a green time -- and the WORLD clips it to its
+            # physical range, because the range is the world's to know. The
+            # arbitration above the leaf is as discrete as ever.
+            return out[:, 0]
         nrm = np.linalg.norm(out, axis=1, keepdims=True)
         return out / np.maximum(nrm, 1e-9)
 
@@ -284,8 +402,8 @@ def relayout(theta, old_zn, new_zn):
 # once after a beta was accepted and a later `simplify` dropped an arm. Before
 # terminations existed both lists were empty and nothing could go wrong; they
 # are the new thing, so every arm operator now goes through here.
-PER_ARM = ("betas", "sticky")
-_PER_ARM_FILL = {"betas": None, "sticky": False}
+PER_ARM = ("betas", "sticky", "steps", "fails")
+_PER_ARM_FILL = {"betas": None, "sticky": False, "steps": None, "fails": None}
 
 
 def reindex(bank, order):
@@ -299,19 +417,26 @@ def reindex(bank, order):
     return out
 
 
-def insert_arm(bank, clause, law, pos, beta=None, sticky=False):
-    """Add an arm at `pos`, extending every per-arm list in step."""
+def insert_arm(bank, clause, law, pos, beta=None, sticky=False, steps=None,
+               fails=None):
+    """Add an arm at `pos`, extending every per-arm list in step.
+
+    An arm with `steps` is made sticky whether or not the caller said so: a
+    step index lives inside the latch and is meaningless without one.
+    """
     cl = [[l[:] for l in c] for c in bank["clauses"]]
     laws = list(bank["laws"])
     pos = max(0, min(pos, len(cl)))
     cl.insert(pos, [l[:] for l in clause])
     laws.insert(pos, law)
     out = dict(bank, clauses=cl, laws=laws)
-    for k, x in (("betas", beta), ("sticky", sticky)):
-        if bank.get(k) is not None:
-            v = list(bank[k])
+    sticky = bool(sticky or steps)
+    given = dict(betas=beta, sticky=sticky, steps=steps, fails=fails)
+    for k in PER_ARM:
+        if bank.get(k) is not None or given[k] not in (None, False):
+            v = list(bank.get(k) or [])
             v += [_PER_ARM_FILL[k]] * (len(cl) - 1 - len(v))
-            v.insert(pos, x)
+            v.insert(pos, given[k])
             out[k] = v
     return out
 
@@ -324,7 +449,21 @@ def check_arms(bank, where=""):
     for k in PER_ARM:
         if bank.get(k) is not None and len(bank[k]) != n:
             raise ValueError("%s: %d %s for %d arms" % (where, len(bank[k]), k, n))
+    st = bank.get("steps")
+    if st:
+        sticky = bank.get("sticky") or [False] * n
+        for c in range(n):
+            if st[c] and not sticky[c]:
+                raise ValueError("%s: arm %d has %d steps but is not sticky"
+                                 % (where, c, 1 + len(st[c])))
     return bank
+
+
+def _relayout_steps(steps, old_zn, new_zn):
+    if not steps:
+        return steps
+    return [([(adv, relayout(th, old_zn, new_zn)) for adv, th in s]
+             if s else None) for s in steps]
 
 
 def widen(bank, old_zn, new_zn):
@@ -333,7 +472,32 @@ def widen(bank, old_zn, new_zn):
     return dict(bank,
                 laws=[relayout(t, old_zn, new_zn) for t in bank["laws"]],
                 default=relayout(bank["default"], old_zn, new_zn),
+                steps=_relayout_steps(bank.get("steps"), old_zn, new_zn),
                 laws_on_z=True)
+
+
+def upgrade_layout(bank, names):
+    """Bring a stored bank onto the current column layout, by name.
+
+    A bank saved before `mem_age` existed has laws one column narrower than
+    `mem_names` now says; multiplying them by today's design matrix would
+    either raise or bind every coefficient past the slots to the wrong column.
+    The old layout is known -- names, V_hat, leverage, the slots, have_mem --
+    so the laws are relaid out by name and the new column is zero-filled.
+    """
+    if not bank.get("mem") or not bank.get("laws_on_z"):
+        return bank
+    want = len(mem_names(names, bank["mem"])) + 1
+    have = np.asarray(bank["default"]).shape[0]
+    if have == want:
+        return bank
+    old_zn = (base_names(names)
+              + ["mem_%s" % names[j] for j in bank["mem"]["cols"]] + ["have_mem"])
+    if len(old_zn) + 1 != have:
+        raise ValueError("stored bank has %d law rows; neither the current "
+                         "layout (%d) nor the pre-age one (%d)"
+                         % (have, want, len(old_zn) + 1))
+    return widen(bank, old_zn, mem_names(names, bank["mem"]))
 
 
 def without_memory(bank, names):
@@ -343,19 +507,25 @@ def without_memory(bank, names):
     is multiplied by a design matrix three columns narrower than it expects.
     Arms whose guards read a memory column go too: they can no longer be
     evaluated, and leaving them in would silently change which arm claims what.
+    A termination, fail or advance clause that read a memory column is dropped
+    from the kept arm for the same reason.
     """
     zn_old = mem_names(names, bank.get("mem"))
     zn_new = mem_names(names, None)
-    keep = [i for i, c in enumerate(bank["clauses"])
-            if not any(l[0] >= len(zn_new) for l in c)]
-    out = dict(bank, mem=None,
-               clauses=[[l[:] for l in bank["clauses"][i]] for i in keep],
-               laws=[relayout(bank["laws"][i], zn_old, zn_new) for i in keep],
-               default=relayout(bank["default"], zn_old, zn_new),
-               betas=([bank["betas"][i] for i in keep]
-                      if bank.get("betas") else None),
-               sticky=([bank["sticky"][i] for i in keep]
-                       if bank.get("sticky") else None))
+    w = len(zn_new)
+    fits = lambda cl: cl is not None and not any(l[0] >= w for l in cl)
+    keep = [i for i, c in enumerate(bank["clauses"]) if fits(c)]
+    out = reindex(bank, keep)
+    out = widen(out, zn_old, zn_new)
+    out["mem"] = None
+    out["clauses"] = [[l[:] for l in c] for c in out["clauses"]]
+    if out.get("betas"):
+        out["betas"] = [b if fits(b) else None for b in out["betas"]]
+    if out.get("fails"):
+        out["fails"] = [b if fits(b) else None for b in out["fails"]]
+    if out.get("steps"):
+        out["steps"] = [([(adv, th) for adv, th in s if fits(adv)] or None)
+                        if s else None for s in out["steps"]]
     return out
 
 
@@ -383,28 +553,60 @@ def test_equivalence(env, bank, n_obs, n_ep=300, T=200, seed=11):
     return worst
 
 
+def law_label(theta, bank):
+    """A readable name for a law where one exists, else the generic form.
+
+    On an argmax head a law that is a bias on one action IS that action, and
+    saying so is the difference between `Action(u = K x + b)` and `LANE_LEFT`.
+    """
+    th = np.asarray(theta)
+    if bank.get("head") in ("scalar", "duration"):
+        body, bias = th[:-1, 0], th[-1, 0]
+        nz = np.flatnonzero(np.abs(body) > 1e-9)
+        if not len(nz):
+            return "%s(%.3g)" % ("Accel" if bank.get("head") == "scalar"
+                                 else "Green", bias)
+        return "%s(theta z)" % ("Accel" if bank.get("head") == "scalar" else "Green")
+    if bank.get("head") == "argmax":
+        body, bias = th[:-1], th[-1]
+        if not np.any(body) and np.count_nonzero(bias) == 1:
+            k = int(np.argmax(bias))
+            acts = bank.get("actions")
+            return acts[k] if acts and k < len(acts) else "always[%d]" % k
+        return "Prefer(argmax theta z)"
+    return "Action(u = K x + b)"
+
+
 def emit(bank, names):
     """The tree as text, including the temporal nodes when a bank has them."""
+    C = len(bank["clauses"])
     zn = mem_names(names, bank.get("mem"))
-    betas = bank.get("betas") or [None] * len(bank["clauses"])
-    sticky = bank.get("sticky") or [False] * len(bank["clauses"])
+    betas = bank.get("betas") or [None] * C
+    sticky = bank.get("sticky") or [False] * C
+    steps = bank.get("steps") or [None] * C
+    fails = bank.get("fails") or [None] * C
     lit = lambda l: "%s%s%.3f" % (zn[l[0]], "<=" if l[2] else ">", l[1])
+    conj = lambda cl: " AND ".join(lit(l) for l in cl)
     out = []
     if bank.get("mem"):
         m = bank["mem"]
         out.append("Blackboard: mem <- [%s]  when  %s%s"
-                   % (", ".join(names[j] for j in m["cols"]),
-                      " AND ".join(lit(l) for l in m["write"]),
-                      ("   cleared when " + " AND ".join(lit(l)
-                       for l in m["clear"])) if m.get("clear") else ""))
+                   % (", ".join(names[j] for j in m["cols"]), conj(m["write"]),
+                      ("   cleared when " + conj(m["clear"]))
+                      if m.get("clear") else ""))
     out.append("Fallback")
     for c, cl in enumerate(bank["clauses"]):
-        guard = " AND ".join(lit(l) for l in cl)
-        body = "Sequence[ %s , Action(u = K x + b) ]" % guard
+        acts = [law_label(bank["laws"][c], bank)]
+        for adv, th in (steps[c] or []):
+            acts[-1] += " until " + conj(adv)
+            acts.append(law_label(th, bank))
+        body = "Sequence[ %s , %s ]" % (conj(cl), " , ".join(acts))
         if sticky[c]:
-            b = (" AND ".join(lit(l) for l in betas[c]) if betas[c]
-                 else "never")
+            b = conj(betas[c]) if betas[c] else "never"
             body = "KeepRunningUntilFailure( %s )   beta: %s" % (body, b)
+        if fails[c]:
+            body += "   fail: " + conj(fails[c])
         out.append("|-- " + body)
-    out.append("\\-- Action(default)          # totality guard")
+    out.append("\\-- %s          # totality guard" % law_label(bank["default"], bank)
+               .replace("Action(u = K x + b)", "Action(default)"))
     return "\n".join(out)

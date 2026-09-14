@@ -26,6 +26,7 @@ import time
 
 import numpy as np
 
+from . import explore as EX
 from . import proposal as PR
 from . import store as ST
 from .betasearch import search_beta
@@ -34,14 +35,16 @@ from .lawcem import cem_law, improve_laws
 from .memory import MemBank, emit, mem_names
 from .memsearch import discover as mem_discover, record
 from .escape import kick
-from .structure import (absorb_universal, drop_arm, polish_thresholds, reorder, score,
-                         simplify)
+from .stepsearch import search_fails, search_steps
+from .structure import (absorb_universal, collapse_bottom, drop_arm,
+                         polish_thresholds, reorder, score, simplify)
 
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
     grow_pool=60, grow_arms=4, max_arity=3, min_n=400,
     cem_iter=12, cem_K=96, cem_sigma=0.35,
-    mem_at=1, mem_thr=7, mem_refine=3, beta_at=2, n_cover=6000,
+    mem_at=1, mem_thr=7, mem_refine=3, beta_at=2, steps_at=2, n_cover=6000,
+    explore_ep=300, explore_ks=(1, 3, 8), explore_frac=0.25,
     stall_before_kick=2, kick_size=1, hop_budget=2,
     seed_stride=1009, val_seed=90210, val_ep=1200,
 )
@@ -73,7 +76,10 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
     # outputs instead of two. Everything downstream -- CEM, grow, simplify,
     # thresholds, beta -- is indifferent, because it scores theta by rollout.
     n_act = int(getattr(env, "n_act", 2))
-    head = "argmax" if n_act != 2 else "vector"
+    # A world that names its head wins over the count: the intersection's
+    # signal has exactly two actions, and "two outputs means a heading" would
+    # have normalised EXTEND/SWITCH into a unit vector.
+    head = getattr(env, "head", None) or ("argmax" if n_act != 2 else "vector")
     run_seed = int(np.random.SeedSequence().entropy % 2**31 if run_seed is None
                    else run_seed)
     rng = rng or np.random.default_rng(run_seed)
@@ -95,6 +101,8 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                   "%.2f there" % (len(bank["clauses"]), meta["G"]), flush=True)
     if bank is not None:
         bank["names"] = list(names)
+        from .memory import upgrade_layout
+        bank = upgrade_layout(bank, names)
         if verbose:
             print("  warm start: %d arms, stored G %.2f (%s, rank %d) | "
                   "run_seed %d" % (len(bank["clauses"]), meta["G"],
@@ -105,10 +113,20 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         # A random init would already be an opinion, and on this world the
         # constant actions span 20.2 to 25.9, so a lucky draw is worth points
         # the search would then appear to have found.
-        th0 = (np.zeros((len(zn0) + 1, n_act)) if head == "argmax"
-               else rng.normal(0, .3, (len(zn0) + 1, 2)))
+        if head == "argmax":
+            th0 = np.zeros((len(zn0) + 1, n_act))
+        elif head in ("scalar", "duration"):
+            # the null command for a continuous leaf: the middle of the range
+            th0 = np.zeros((len(zn0) + 1, 1))
+            lo, hi = env.u_range
+            th0[-1, 0] = 0.5 * (lo + hi)
+        else:
+            th0 = rng.normal(0, .3, (len(zn0) + 1, 2))
         seed_bank = dict(clauses=[], laws=[], default=th0, names=list(names),
-                         laws_on_z=True, head=head, n_act=n_act)
+                         laws_on_z=True, head=head, n_act=n_act,
+                         actions=list(getattr(env, "actions", []) or []) or None)
+        if head in ("scalar", "duration"):
+            seed_bank["u_range"] = tuple(env.u_range)
         th, _ = cem_law(env, seed_bank, -1, pol_fn, n_iter=cfg["cem_iter"],
                         K=cfg["cem_K"], sigma0=cfg["cem_sigma"],
                         n_ep=cfg["n_ep"], T=cfg["T"], seed=cfg["seed"], rng=rng)
@@ -169,15 +187,45 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
     for r in range(rounds):
         rseed = cfg["seed"] + cfg["seed_stride"] * r
         zn = mem_names(names, bank.get("mem"))
-        cov = env.observe(_cover(env, cfg["n_cover"], np.random.default_rng(r)))
         # ANCHOR ON FAILURES. The quantile alphabet built from coverage states
         # cannot express the thresholds that matter: d_threat is uniform on
         # [0.08, 0.80] there, so its 5% quantile is 0.11 while the region worth
         # +5.87 is `d_threat <= 0.09`. Observations from the steps before a
         # death put the candidate thresholds where the trouble is.
-        fail = failure_states(env, bank, pol_fn, n_ep=300, T=cfg["T"])
-        obs = np.vstack([cov, fail]) if len(fail) else cov
+        if hasattr(env, "coverage_rows"):
+            # A MULTI-AGENT WORLD HAS NO OBSERVATION AT A START STATE -- every
+            # vehicle is still pending -- so coverage and failure rows both come
+            # from traced rollouts of the agent under search (`coverage_rows`).
+            cov, fail = env.coverage_rows(bank, n_ep=cfg.get("cover_ep", 150),
+                                          seed=r)
+            if len(cov) > cfg["n_cover"]:
+                cov = cov[np.random.default_rng(r).choice(len(cov), cfg["n_cover"],
+                                                          replace=False)]
+        else:
+            cov = env.observe(_cover(env, cfg["n_cover"], np.random.default_rng(r)))
+            fail = failure_states(env, bank, pol_fn, n_ep=300, T=cfg["T"])
+        # EXPLORE BY COUNTERFACTUAL. A random action, or a random manoeuvre of a
+        # few ticks, taken at a random tick of the tree's own episode and paired
+        # against the undeviated episode -- an exact advantage on this world
+        # (`explore.py`). The rows where a deviation paid most join the failure
+        # rows as anchors: they are where the tree measurably leaves return on
+        # the table, which is the on-policy complement of where it dies.
+        ex = (EX.deviations(env, bank, n_ep=cfg["explore_ep"], T=cfg["T"],
+                            seed=rseed, rng=rng, ks=cfg["explore_ks"])
+              if cfg["explore_ep"] else None)
+        ex_obs = (ex["z0"][EX.hot_rows(ex, frac=cfg["explore_frac"]), :n_obs]
+                  if ex is not None else np.zeros((0, n_obs)))
+        anchors = [a for a in (fail, ex_obs) if len(a)]
+        obs = np.vstack([cov] + anchors) if anchors else cov
         hot = np.arange(len(cov), len(obs))
+        if verbose and ex is not None:
+            sm = EX.summary(ex, actions=bank.get("actions"))
+            print("  explore: %d deviations, %.0f%% paid, mean %+.2f, best %+.2f%s"
+                  % (sm["n"], 100 * sm["frac_positive"], sm["mean_adv"],
+                     sm["best"],
+                     ("; by k " + " ".join("%d:%+.2f" % (k, v["mean"])
+                                          for k, v in sm["by_k"].items()))),
+                  flush=True)
         p = pol_fn(bank)
         p.reset(len(obs))
         Z = p.z(obs, update=False)
@@ -242,6 +290,17 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                                names=zn, verbose=verbose)
         if absorbed:
             rec["moves"].append("absorb")
+        # A GUARD THAT IS A PASSENGER GOES. The bottom arm's law is offered
+        # as the default; non-inferior means the split was buying nothing.
+        # Repeats while it keeps succeeding, because a tree can carry several.
+        for _ in range(len(bank["clauses"])):
+            bank, cur, did = collapse_bottom(env, bank, pol_fn, cur_G=cur,
+                                             n_ep=cfg["n_ep"], T=cfg["T"],
+                                             seed=rseed, z=cfg["z"], names=zn,
+                                             verbose=verbose)
+            if not did:
+                break
+            rec["moves"].append("collapse")
         bank, cur, llog = improve_laws(env, bank, pol_fn, cur=cur,
                                        n_ep=cfg["n_ep"], T=cfg["T"],
                                        seed=rseed, z=cfg["z"],
@@ -264,10 +323,30 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         # over named manoeuvres. The discrete analogue -- score each action by
         # the gap between a remembered value and the current one -- is the next
         # increment, not a thing to improvise mid-run.
-        if r == cfg["mem_at"] and head == "argmax":
-            if verbose:
-                print("  [round %d] memory stage skipped: no discrete-head "
-                      "blackboard primitive yet" % r, flush=True)
+        if r == cfg["mem_at"] and head == "argmax" and not bank.get("mem"):
+            # THE DISCRETE-HEAD MEMORY STAGE: a message-shaped blackboard --
+            # a transient column, its arrival as the event, with or without a
+            # countdown -- and the arms that read it, grown on the widened
+            # layout and priced against the memoryless tree (`memtransient`).
+            from .memtransient import discover_transient
+            if hasattr(env, "record_traces"):
+                OB, AL = env.record_traces(bank, n_ep=cfg.get("record_ep", 80),
+                                           seed=3)
+            else:
+                env.seed_kernels(3)
+                OB, _, AL = record(env, pol_fn(bank), np.random.default_rng(3),
+                                   n_ep=200, T=cfg["T"])
+            bank, mlog = discover_transient(
+                env, bank, names, pol_fn, OB, AL, n_obs,
+                screen_ep=min(cfg["n_ep"], 120), confirm_ep=cfg["n_ep"],
+                T=cfg["T"], seed=rseed, z=cfg["z"],
+                min_gain=max(cfg["min_gain"], 0.5), rng=rng, weights=weights,
+                verbose=verbose)
+            if bank.get("mem"):
+                rec["moves"].append("memory")
+            cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
+        elif r == cfg["mem_at"] and head == "argmax":
+            pass                                  # a blackboard already exists
         elif r == cfg["mem_at"]:
             env.seed_kernels(3)
             OB, _, AL = record(env, pol_fn(bank), np.random.default_rng(3),
@@ -294,6 +373,34 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                         z=cfg["z"], verbose=verbose)
             if any(b["accepted"] for b in blog):
                 rec["moves"].append("beta")
+            cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
+
+        # --- steps and failure conditions: the Sequence and the status --------
+        # After beta, on the same round: a step lives inside a latch, so the
+        # arms have to have been offered stickiness first. One step and one fail
+        # clause per round at most, each priced on the tree the other left.
+        if r == cfg["steps_at"]:
+            zn = mem_names(names, bank.get("mem"))
+            p = pol_fn(bank)
+            p.reset(len(obs))
+            Zs = p.z(obs, update=False)
+            bank, slog = search_steps(env, bank, zn, Zs, pol_fn, cur_G=cur,
+                                      screen_ep=min(cfg["n_ep"], 120),
+                                      confirm_ep=cfg["n_ep"], T=cfg["T"],
+                                      seed=rseed, z=cfg["z"],
+                                      min_gain=cfg["min_gain"], rng=rng,
+                                      weights=weights, verbose=verbose)
+            if any(s["accepted"] for s in slog):
+                rec["moves"].append("steps")
+                cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
+            bank, flog = search_fails(env, bank, zn, Zs, pol_fn, cur_G=cur,
+                                      n_ep=cfg["n_ep"], T=cfg["T"], seed=rseed,
+                                      z=cfg["z"], min_gain=cfg["min_gain"],
+                                      rng=rng, weights=weights, verbose=verbose)
+            if any(f["accepted"] for f in flog):
+                rec["moves"].append("fail")
+                cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
+            weights.update_many(slog + flog)
 
         bank, cur, _ = drop_arm(env, bank, pol_fn, cur, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=rseed, z=cfg["z"])
@@ -319,6 +426,13 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                 rec["moves"].append("hop-abandoned")
         stalled = 0 if rec["moves"] else stalled + 1
         log.append(rec)
+        # CHECKPOINT. A run killed in round 4 used to leave nothing behind, and
+        # the next run rediscovered everything it had. Every round's best bank
+        # goes to the store with its validation-seed score, under this run's
+        # tag, so a resume (warm start, rank 0) picks up where this left off.
+        ST.save(env, best_bank, dict(G=best_V), tag="%s@r%d" % (tag, r),
+                names=mem_names(names, best_bank.get("mem")))
+        PR.save(env, weights)
         if verbose:
             print("  [round %d] %-26s G %6.2f -> %6.2f  val %6.2f (gap %+.2f)"
                   "  %d arms  [%.0fs]"
@@ -337,13 +451,19 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                   flush=True)
         bank = best_bank
 
-    from .pipeline import evaluate_bank
-    m = evaluate_bank(env, bank, n_obs=n_obs, T=cfg["T"])
+    from .structure import heldout
+    m = None
+    if hasattr(env, "coverage_rows"):
+        m = heldout(env, bank, n_ep=1000, T=cfg["T"])
+    if m is None:
+        from .pipeline import evaluate_bank
+        m = evaluate_bank(env, bank, n_obs=n_obs, T=cfg["T"])
     ST.save(env, bank, m, names=mem_names(names, bank.get("mem")), tag=tag)
     PR.save(env, weights)
     if verbose:
-        print("  held-out G %.2f +-%.2f  pickups %.2f -- stored"
-              % (m["G"], m["ci"], m["eaten"]), flush=True)
+        print("  held-out G %.2f +-%.2f%s -- stored"
+              % (m["G"], m["ci"], ("  pickups %.2f" % m["eaten"]) if "eaten" in m
+                 else ""), flush=True)
     return bank, log, m
 
 

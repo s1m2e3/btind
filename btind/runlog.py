@@ -80,17 +80,29 @@ def bank_json(bank, names=None, bt=None):
         # coefficient is attached to the wrong feature.
         laws_on_z=bool(bank.get("laws_on_z")),
         mem=_jsonable(bank.get("mem")), sticky=_jsonable(bank.get("sticky")),
+        # steps carry laws, so they go through the same ndarray -> list path
+        steps=_jsonable(bank.get("steps")), fails=_jsonable(bank.get("fails")),
+        head=bank.get("head"), actions=bank.get("actions"),
+        u_range=bank.get("u_range"),
         names=list(names) if names is not None else None, bt=bt)
 
 
 def bank_from_json(d):
-    return dict(clauses=[[[int(j), float(t), bool(n)] for j, t, n in cl]
-                         for cl in d["clauses"]],
-                laws=[np.asarray(t, float) for t in d["laws"]],
-                default=np.asarray(d["default"], float),
-                betas=d.get("betas"), names=d.get("names"),
-                laws_on_z=bool(d.get("laws_on_z")), mem=d.get("mem"),
-                sticky=d.get("sticky"))
+    steps = d.get("steps")
+    if steps:
+        steps = [([(adv, np.asarray(th, float)) for adv, th in s] if s else None)
+                 for s in steps]
+    out = dict(clauses=[[[int(j), float(t), bool(n)] for j, t, n in cl]
+                        for cl in d["clauses"]],
+               laws=[np.asarray(t, float) for t in d["laws"]],
+               default=np.asarray(d["default"], float),
+               betas=d.get("betas"), names=d.get("names"),
+               laws_on_z=bool(d.get("laws_on_z")), mem=d.get("mem"),
+               sticky=d.get("sticky"), steps=steps, fails=d.get("fails"))
+    for k in ("head", "actions", "u_range"):
+        if d.get(k) is not None:
+            out[k] = tuple(d[k]) if k == "u_range" else d[k]
+    return out
 
 
 class Tee:

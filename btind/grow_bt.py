@@ -200,7 +200,14 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
     out = list(lib)
     if structural:
         d_law, n_out = np.shape(arm_parent)
-        if n_out == 2:
+        head = bank.get("head", "vector" if n_out == 2 else "argmax")
+        if head in ("scalar", "duration"):
+            # A CONTINUOUS LEAF: constants across the world's range and
+            # proportional terms, from `u_range` the world declares.
+            from .lawsearch import scalar_primitives
+            lo, hi = bank.get("u_range", (-1.0, 1.0))
+            out += list(scalar_primitives(zn, d_law, lo, hi).items())
+        elif head == "vector":
             out += list(structural_primitives(zn, d_law).items())
         else:
             # AN ARGMAX HEAD HAS NO GEOMETRY, so the paired "toward/away"

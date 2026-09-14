@@ -32,6 +32,7 @@ remains the reference implementation either way.
 import numpy as np
 from numba import njit, prange
 
+from ..tick import _fires, _tick, flatten as flatten_tick
 from .nest_kernels import _advance, is_night
 
 _EPS = 1e-9
@@ -196,48 +197,9 @@ def params(env):
 
 
 def flatten_mem(bank, n_obs):
-    """Bank with memory/latch -> flat arrays. Layout mirrors `mem_names`.
-
-        z = [ obs , V_hat , leverage , slots... , have , 1 ]
-
-    V_hat and leverage are zero here: the kernel cannot run an xgboost predict
-    or a critic solve, so a bank whose guards mention them must stay on the
-    Python path. `uses_vq` says which.
-    """
-    C = len(bank["clauses"])
-    cols, thrs, negs, start, ln = [], [], [], [], []
-    for cl in bank["clauses"]:
-        start.append(len(cols)); ln.append(len(cl))
-        for j, t, n in cl:
-            cols.append(int(j)); thrs.append(float(t)); negs.append(bool(n))
-
-    betas = bank.get("betas") or [None] * C
-    bcol, bthr, bneg, bstart, blen = [], [], [], [], []
-    for b in betas:
-        bstart.append(len(bcol)); blen.append(0 if b is None else len(b))
-        for j, t, n in (b or []):
-            bcol.append(int(j)); bthr.append(float(t)); bneg.append(bool(n))
-
-    m = bank.get("mem")
-    mcols = np.array(m["cols"] if m else [], np.int64)
-    wcol, wthr, wneg = [], [], []
-    for j, t, n in ((m or {}).get("write") or []):
-        wcol.append(int(j)); wthr.append(float(t)); wneg.append(bool(n))
-
-    laws = np.stack([np.asarray(t, float) for t in bank["laws"]]
-                    + [np.asarray(bank["default"], float)]) if C else \
-        np.asarray(bank["default"], float)[None]
-    st = np.array(bank.get("sticky") or [False] * C, np.bool_)
-    return dict(
-        lit_col=np.array(cols, np.int64), lit_thr=np.array(thrs, np.float64),
-        lit_neg=np.array(negs, np.bool_), cl_start=np.array(start, np.int64),
-        cl_len=np.array(ln, np.int64),
-        b_col=np.array(bcol, np.int64), b_thr=np.array(bthr, np.float64),
-        b_neg=np.array(bneg, np.bool_), b_start=np.array(bstart, np.int64),
-        b_len=np.array(blen, np.int64), sticky=st, mem_cols=mcols,
-        w_col=np.array(wcol, np.int64), w_thr=np.array(wthr, np.float64),
-        w_neg=np.array(wneg, np.bool_),
-        laws=np.ascontiguousarray(laws), n_obs=np.int64(n_obs))
+    """Bank with memory/latch/steps -> flat arrays. One flattening for every
+    kernel; it lives in `tick.py` beside the arbitration that reads it."""
+    return flatten_tick(bank, n_obs)
 
 
 def uses_vq(bank, n_obs):
@@ -246,31 +208,34 @@ def uses_vq(bank, n_obs):
     return _reads_vq(bank, n_obs)
 
 
-@njit(cache=True, inline="always")
-def _fires(z, col, thr, neg, start, ln):
-    for k in range(start, start + ln):
-        above = z[col[k]] > thr[k]
-        if neg[k]:
-            above = not above
-        if not above:
-            return False
-    return True
-
-
 @njit(cache=True, parallel=True)
-def rollout_mem(states, p, lit_col, lit_thr, lit_neg, cl_start, cl_len,
-                b_col, b_thr, b_neg, b_start, b_len, sticky, mem_cols,
-                w_col, w_thr, w_neg, laws, n_obs, T, G):
-    """As `rollout_bank`, plus the latch and the blackboard.
+def rollout_mem(states, p, laws, mem_cols, w_col, w_thr, w_neg, n_obs, T, G,
+                trace, dev,
+                lit_col, lit_thr, lit_neg, cl_start, cl_len,
+                b_col, b_thr, b_neg, b_start, b_len,
+                f_col, f_thr, f_neg, f_start, f_len,
+                a_col, a_thr, a_neg, a_start, a_len,
+                law_start, n_steps, sticky):
+    """As `rollout_bank`, plus the latch, the step index and the blackboard.
 
-    Both are per-row state that persists across ticks -- which in this kernel is
-    simply a local variable, because the episode loop lives INSIDE the row loop.
-    The Python implementation needs arrays and masks for the same thing.
+    All three are per-row state that persists across ticks -- which in this
+    kernel is simply a local variable, because the episode loop lives INSIDE the
+    row loop. The arbitration itself is `tick._tick`, shared with the highway
+    kernel; call as
+    `rollout_mem(s, p, *world_args(f), T, G, trace, dev, *tick_args(f))`.
+
+    `trace` (n, T, d + 5) records z, law index, ux, uy, latch, step per tick;
+    `dev` (n, 4) is (t0, k, ux, uy): for k > 0 the heading at ticks
+    t0 <= t < t0 + k is (ux, uy) regardless of the tree. See the highway kernel.
     """
     n = states.shape[0]
-    C = cl_start.shape[0]
     d = laws.shape[1]
+    countdown = n_obs >= 1048576          # tick.COUNTDOWN_FLAG
+    if countdown:
+        n_obs = n_obs - 1048576
     nmem = mem_cols.shape[0]
+    tracing = trace.shape[0] == n
+    deviating = dev.shape[0] == n
     for i in prange(n):
         px = states[i, 0]; py = states[i, 1]
         fx = states[i, 2]; fy = states[i, 3]
@@ -281,7 +246,9 @@ def rollout_mem(states, p, lit_col, lit_thr, lit_neg, cl_start, cl_len,
         z = np.zeros(d)
         slots = np.zeros(max(nmem, 1))
         have = False
+        age = 0
         latch = -1
+        step = 0
         g = 0.0
         disc = 1.0
         for t in range(T):
@@ -289,44 +256,55 @@ def rollout_mem(states, p, lit_col, lit_thr, lit_neg, cl_start, cl_len,
             z[n_obs] = 0.0          # V_hat     (not available in the kernel)
             z[n_obs + 1] = 0.0      # leverage
             if nmem > 0:
+                if have:
+                    age += 1
                 if w_col.shape[0] > 0 and _fires(z, w_col, w_thr, w_neg, 0,
                                                  w_col.shape[0]):
                     for q in range(nmem):
                         slots[q] = z[mem_cols[q]]
                     have = True
+                    age = 0
                 for q in range(nmem):
                     z[n_obs + 2 + q] = slots[q]
                 z[n_obs + 2 + nmem] = 1.0 if have else 0.0
+                z[n_obs + 3 + nmem] = age
+                if countdown:
+                    for q in range(nmem):
+                        z[n_obs + 4 + nmem + q] = slots[q] - age
             z[d - 1] = 1.0
 
-            f = C
-            for c in range(C):
-                if _fires(z, lit_col, lit_thr, lit_neg, cl_start[c], cl_len[c]):
-                    f = c
-                    break
-            arm = f
-            if latch >= 0:
-                preempt = f < latch
-                if not preempt:
-                    fired = False
-                    if b_len[latch] > 0:
-                        fired = _fires(z, b_col, b_thr, b_neg, b_start[latch],
-                                       b_len[latch])
-                    if not fired:
-                        arm = latch
-            latch = arm if (arm < C and sticky[arm]) else -1
+            law, latch, step = _tick(z, latch, step,
+                                     lit_col, lit_thr, lit_neg, cl_start, cl_len,
+                                     b_col, b_thr, b_neg, b_start, b_len,
+                                     f_col, f_thr, f_neg, f_start, f_len,
+                                     a_col, a_thr, a_neg, a_start, a_len,
+                                     law_start, n_steps, sticky)
 
             ux = 0.0
             uy = 0.0
             for q in range(d):
-                ux += z[q] * laws[arm, q, 0]
-                uy += z[q] * laws[arm, q, 1]
+                ux += z[q] * laws[law, q, 0]
+                uy += z[q] * laws[law, q, 1]
             nrm = np.sqrt(ux * ux + uy * uy)
             if nrm < 1e-9:
                 nrm = 1e-9
+            ux /= nrm
+            uy /= nrm
+            if deviating and dev[i, 1] > 0.0 and t >= dev[i, 0] \
+                    and t < dev[i, 0] + dev[i, 1]:
+                ux = dev[i, 2]
+                uy = dev[i, 3]
+            if tracing and t < trace.shape[1]:
+                for q in range(d):
+                    trace[i, t, q] = z[q]
+                trace[i, t, d] = law
+                trace[i, t, d + 1] = ux
+                trace[i, t, d + 2] = uy
+                trace[i, t, d + 3] = latch
+                trace[i, t, d + 4] = step
             (px, py, fx, fy, tx, ty, en, tt, cr, nx, ny, nz, r,
              done) = _advance(px, py, fx, fy, tx, ty, en, tt, cr, nx, ny, nz,
-                              ux / nrm, uy / nrm, p)
+                              ux, uy, p)
             g += disc * r
             disc *= p[9]
             if done:

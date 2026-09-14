@@ -31,6 +31,8 @@ is worse than no kernel, because it is fast enough to be trusted.
 import numpy as np
 from numba import njit, prange
 
+from ..tick import (_fires, _tick, flatten, no_dev,  # noqa: F401  (re-exported)
+                    no_trace)
 from .highway_batch import (ACC_COMF, ACC_MAX, D0, DELTA, FAR, KP_A,
                             KP_HEADING, KP_LATERAL, LANE_CHANGE_DELAY, LANE_W,
                             LENGTH, MAX_SPEED, MAX_STEER, MIN_GAIN, MIN_SPEED,
@@ -42,55 +44,6 @@ def params(env):
     """Every scalar the kernel needs, in one float array."""
     return np.array([env.n_lanes, env.n_veh, env.n_obs_veh, env.duration,
                      env.n_sub, env.dt, env.gamma], np.float64)
-
-
-def flatten(bank, n_obs):
-    """Bank -> flat arrays, laid out exactly as `nest_fast.flatten_mem`.
-
-        z = [ obs , V_hat , leverage , slots... , have , 1 ]
-
-    The only difference is the law's last axis, which is the action set rather
-    than a 2-vector.
-    """
-    C = len(bank["clauses"])
-    cols, thrs, negs, start, ln = [], [], [], [], []
-    for cl in bank["clauses"]:
-        start.append(len(cols))
-        ln.append(len(cl))
-        for j, t, n in cl:
-            cols.append(int(j))
-            thrs.append(float(t))
-            negs.append(bool(n))
-    betas = bank.get("betas") or [None] * C
-    bcol, bthr, bneg, bstart, blen = [], [], [], [], []
-    for b in betas:
-        bstart.append(len(bcol))
-        blen.append(0 if b is None else len(b))
-        for j, t, n in (b or []):
-            bcol.append(int(j))
-            bthr.append(float(t))
-            bneg.append(bool(n))
-    m = bank.get("mem")
-    wcol, wthr, wneg = [], [], []
-    for j, t, n in ((m or {}).get("write") or []):
-        wcol.append(int(j))
-        wthr.append(float(t))
-        wneg.append(bool(n))
-    laws = (np.stack([np.asarray(t, float) for t in bank["laws"]]
-                     + [np.asarray(bank["default"], float)]) if C
-            else np.asarray(bank["default"], float)[None])
-    return dict(
-        lit_col=np.array(cols, np.int64), lit_thr=np.array(thrs, np.float64),
-        lit_neg=np.array(negs, np.bool_), cl_start=np.array(start, np.int64),
-        cl_len=np.array(ln, np.int64),
-        b_col=np.array(bcol, np.int64), b_thr=np.array(bthr, np.float64),
-        b_neg=np.array(bneg, np.bool_), b_start=np.array(bstart, np.int64),
-        b_len=np.array(blen, np.int64),
-        sticky=np.array(bank.get("sticky") or [False] * C, np.bool_),
-        mem_cols=np.array((m or {}).get("cols", []), np.int64),
-        w_col=np.array(wcol, np.int64), w_thr=np.array(wthr, np.float64),
-        w_neg=np.array(wneg, np.bool_),
-        laws=np.ascontiguousarray(laws), n_obs=np.int64(n_obs))
 
 
 def uses_vq(bank, n_obs):
@@ -117,17 +70,6 @@ def _nz(x):
     if x < -1e-2:
         return x
     return 1e-2 if x >= 0.0 else -1e-2
-
-
-@njit(cache=True, inline="always")
-def _fires(z, col, thr, neg, start, ln):
-    for k in range(start, start + ln):
-        above = z[col[k]] > thr[k]
-        if neg[k]:
-            above = not above
-        if not above:
-            return False
-    return True
 
 
 @njit(cache=True, inline="always")
@@ -171,12 +113,37 @@ def _steer(y, h, v, tl):
 
 
 @njit(cache=True, parallel=True)
-def rollout(states, p, lit_col, lit_thr, lit_neg, cl_start, cl_len,
-            b_col, b_thr, b_neg, b_start, b_len, sticky, mem_cols,
-            w_col, w_thr, w_neg, laws, n_obs, T, G):
+def rollout(states, p, laws, mem_cols, w_col, w_thr, w_neg, n_obs, T, G, trace,
+            dev,
+            lit_col, lit_thr, lit_neg, cl_start, cl_len,
+            b_col, b_thr, b_neg, b_start, b_len,
+            f_col, f_thr, f_neg, f_start, f_len,
+            a_col, a_thr, a_neg, a_start, a_len,
+            law_start, n_steps, sticky):
+    """Physics and tree together; call as
+    `rollout(s, p, *world_args(f), T, G, trace, dev, *tick_args(f))` with
+    `f = flatten(...)`. The arbitration is `tick._tick`, shared with the
+    NestWorld kernel.
+
+    `trace` is (n, T, d + 5) to record, per episode and tick, the full `z`
+    followed by (law index, action, 0, latch, step); pass `tick.no_trace()` to
+    skip it. A rollout that can be replayed tick by tick is what makes a
+    disagreement with the numpy model localisable rather than merely detectable.
+
+    `dev` is (n, 4): per episode (t0, k, a, unused). For k > 0 the action at
+    ticks t0 <= t < t0 + k is `a` REGARDLESS of the tree, which then resumes.
+    The tree's own latch and step keep evolving underneath, exactly as they
+    would if the world had taken that action. Pass `tick.no_dev()` for none.
+    Paired with the undeviated rollout on the same start this is an exact
+    counterfactual: the return of doing `a` here instead of what the tree does.
+    """
     n = states.shape[0]
-    C = cl_start.shape[0]
     d = laws.shape[1]
+    countdown = n_obs >= 1048576          # tick.COUNTDOWN_FLAG
+    if countdown:
+        n_obs = n_obs - 1048576
+    tracing = trace.shape[0] == n
+    deviating = dev.shape[0] == n
     nA = laws.shape[2]
     nmem = mem_cols.shape[0]
     n_lanes = int(p[0])
@@ -202,7 +169,9 @@ def rollout(states, p, lit_col, lit_thr, lit_neg, cl_start, cl_len,
         z = np.zeros(d)
         slots = np.zeros(max(nmem, 1))
         have = False
+        age = 0
         latch = -1
+        step = 0
         g = 0.0
         disc = 1.0
         gap = np.empty(V)
@@ -246,42 +215,51 @@ def rollout(states, p, lit_col, lit_thr, lit_neg, cl_start, cl_len,
             z[n_obs] = 0.0
             z[n_obs + 1] = 0.0
             if nmem > 0:
+                if have:
+                    age += 1
                 if w_col.shape[0] > 0 and _fires(z, w_col, w_thr, w_neg, 0,
                                                  w_col.shape[0]):
                     for q in range(nmem):
                         slots[q] = z[mem_cols[q]]
                     have = True
+                    age = 0
                 for q in range(nmem):
                     z[n_obs + 2 + q] = slots[q]
                 z[n_obs + 2 + nmem] = 1.0 if have else 0.0
+                z[n_obs + 3 + nmem] = age
+                if countdown:
+                    for q in range(nmem):
+                        z[n_obs + 4 + nmem + q] = slots[q] - age
             z[d - 1] = 1.0
 
             # ---- the tree ---------------------------------------------------
-            f = C
-            for c in range(C):
-                if _fires(z, lit_col, lit_thr, lit_neg, cl_start[c], cl_len[c]):
-                    f = c
-                    break
-            arm = f
-            if latch >= 0:
-                if f >= latch:
-                    fired = False
-                    if b_len[latch] > 0:
-                        fired = _fires(z, b_col, b_thr, b_neg, b_start[latch],
-                                       b_len[latch])
-                    if not fired:
-                        arm = latch
-            latch = arm if (arm < C and sticky[arm]) else -1
+            law, latch, step = _tick(z, latch, step,
+                                     lit_col, lit_thr, lit_neg, cl_start, cl_len,
+                                     b_col, b_thr, b_neg, b_start, b_len,
+                                     f_col, f_thr, f_neg, f_start, f_len,
+                                     a_col, a_thr, a_neg, a_start, a_len,
+                                     law_start, n_steps, sticky)
 
             best_a = 0
             best_s = -1e18
             for k in range(nA):
                 sc = 0.0
                 for q in range(d):
-                    sc += z[q] * laws[arm, q, k]
+                    sc += z[q] * laws[law, q, k]
                 if sc > best_s:
                     best_s = sc
                     best_a = k
+            if deviating and dev[i, 1] > 0.0 and t >= dev[i, 0] \
+                    and t < dev[i, 0] + dev[i, 1]:
+                best_a = int(dev[i, 2])
+            if tracing and t < trace.shape[1]:
+                for q in range(d):
+                    trace[i, t, q] = z[q]
+                trace[i, t, d] = law
+                trace[i, t, d + 1] = best_a
+                trace[i, t, d + 2] = 0.0
+                trace[i, t, d + 3] = latch
+                trace[i, t, d + 4] = step
 
             # ---- the meta-action --------------------------------------------
             if best_a == 0:

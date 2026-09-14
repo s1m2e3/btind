@@ -39,71 +39,119 @@ def score(env, bank, pol_fn, n_ep, T, seed):
     if g is not None:
         return g
     env.seed_kernels(seed)
+    if hasattr(env, "_search_bank"):
+        env._search_bank = bank          # the head its actions are in
     return evaluate(env, pol_fn(bank), n_ep=n_ep, T=T, seed=seed)["G"]
+
+
+def kernel_for(env, bank):
+    """(params, rollout) of the fused kernel this bank may run on, or None.
+
+    One place decides whether a bank is allowed onto a kernel, so the scoring
+    path and the exploration path cannot disagree about it. Refusals, each
+    measured once the hard way: a head the kernel does not implement (the
+    NestWorld kernel normalises, the highway one argmaxes -- letting the other
+    head through returns a heading where an action index is expected, silently
+    and 200x faster than the path that is correct); laws not yet on the z
+    layout; and a GUARD that compares against V_hat or leverage, which need an
+    xgboost predict per tick. A law's coefficients on those columns are fine:
+    the kernel zeroes them exactly as MemBank does with no critic attached.
+    """
+    if not bank.get("laws_on_z"):
+        return None
+    from .memory import _guards_read_vq
+    if _guards_read_vq(bank, len(bank["names"])):
+        return None
+    kind = type(env).__name__
+    try:
+        if kind == "IntersectionBatch":
+            ok = {"vehicle": ("argmax", "scalar"),
+                  "signal": ("argmax", "duration")}[env.agent]
+            if bank.get("head") not in ok:
+                return None
+            from .envs import intersection_fast as IF
+            return IF.params, IF.run
+        if kind == "HighwayBatch":
+            if bank.get("head") != "argmax":
+                return None
+            from .envs.highway_fast import params, rollout
+            return params, rollout
+        if kind == "NestWorld":
+            if bank.get("head", "vector") != "vector":
+                return None
+            from .envs.nest_fast import params, rollout_mem
+            return params, rollout_mem
+    except Exception:
+        return None
+    return None
+
+
+def fast_rollout(env, bank, s, T, trace=None, dev=None):
+    """Roll `bank` from the states `s` on the fused kernel. Returns G, or None.
+
+    `trace` and `dev` are the kernel's optional per-tick record and per-episode
+    deviation (see `tick.trace_array`, `explore.py`); None means neither.
+    """
+    k = kernel_for(env, bank)
+    if k is None:
+        return None
+    if type(env).__name__ == "IntersectionBatch":
+        # TWO TREES: the bank being scored is whichever agent the world says is
+        # under search; the other is held fixed on the world object.
+        from .envs import intersection_fast as IF
+        if env.agent == "signal":
+            return IF.run(env, env.vehicle_bank, bank, s, T, trace, dev)
+        return IF.run(env, bank, env.signal_bank, s, T, trace, dev)
+    from .tick import flatten, no_dev, no_trace, tick_args, world_args
+    params, rollout = k
+    f = flatten(bank, len(bank["names"]))
+    G = np.empty(len(s))
+    rollout(np.ascontiguousarray(s), params(env), *world_args(f), T, G,
+            no_trace() if trace is None else trace,
+            no_dev() if dev is None else dev, *tick_args(f))
+    return G
+
+
+def starts(env, n_ep, seed):
+    """The episode starts every scoring path uses, from one seed."""
+    rng = np.random.default_rng(seed)
+    return (env.sample_starts(n_ep, rng) if hasattr(env, "sample_starts")
+            else env.sample_states(n_ep, rng))
+
+
+def heldout(env, bank, seeds=(11, 12, 13), n_ep=1000, T=None):
+    """Return on seeds no stage of the search ever uses, through the kernel.
+
+    The kernel is held bit-exact to the Python path by the equivalence tests,
+    so scoring here is the same measurement `pipeline.evaluate_bank` makes,
+    minus the world-specific extras (pickups, survival) that not every world
+    has. Returns dict(G, ci) or None when the bank cannot run on a kernel.
+    """
+    T = T if T is not None else getattr(env, "duration", 400)
+    gs = []
+    for sd in seeds:
+        env.seed_kernels(sd)
+        g = fast_rollout(env, bank, starts(env, n_ep, sd), T)
+        if g is None:
+            return None
+        gs.append(g)
+    g = np.concatenate(gs)
+    return dict(G=float(g.mean()), ci=float(1.96 * g.std() / np.sqrt(len(g))))
 
 
 def _fast_score(env, bank, n_ep, T, seed):
     """Fused rollout, or None when this bank/world combination cannot use it."""
-    if type(env).__name__ == "HighwayBatch":
-        return _fast_score_highway(env, bank, n_ep, T, seed)
-    try:
-        from .envs.nest_fast import flatten_mem, params, rollout_mem, uses_vq
-    except Exception:
-        return None
-    if type(env).__name__ != "NestWorld" or not bank.get("laws_on_z"):
-        return None
-    # THE KERNEL NORMALISES; IT DOES NOT ARGMAX. Letting a discrete-head bank
-    # through here would return a unit heading where the caller expects an
-    # action index, and it would do it silently and 200x faster than the path
-    # that is correct -- the exact shape of the law/layout bug that cost three
-    # sites earlier in this project. Refuse until the kernel learns the head.
-    if bank.get("head", "vector") != "vector":
-        return None
-    n_obs = len(bank["names"])
-    # The kernel sets V_hat and leverage to zero, exactly as MemBank does when
-    # no critic is attached. So the only real incompatibility is a GUARD that
-    # compares against them -- a law's coefficients there multiply a zero.
-    from .memory import _guards_read_vq
-    if _guards_read_vq(bank, n_obs):
+    if kernel_for(env, bank) is None:
         return None
     env.seed_kernels(seed)
-    s = (env.sample_starts(n_ep, np.random.default_rng(seed))
-         if hasattr(env, "sample_starts")
-         else env.sample_states(n_ep, np.random.default_rng(seed)))
-    f = flatten_mem(bank, n_obs)
-    G = np.empty(len(s))
-    rollout_mem(np.ascontiguousarray(s), params(env), f["lit_col"], f["lit_thr"],
-                f["lit_neg"], f["cl_start"], f["cl_len"], f["b_col"], f["b_thr"],
-                f["b_neg"], f["b_start"], f["b_len"], f["sticky"],
-                f["mem_cols"], f["w_col"], f["w_thr"], f["w_neg"], f["laws"],
-                f["n_obs"], T, G)
-    return G
+    return fast_rollout(env, bank, starts(env, n_ep, seed), T)
 
 
 def _fast_score_highway(env, bank, n_ep, T, seed):
-    """The highway kernel, which carries the physics and the tree together.
-
-    Measured at 0.065 ms an episode against 3.45 ms for the numpy model and
-    140 ms for highway-env itself. The head must be `argmax` here: this world
-    has no vector head and running one would score a heading as an action index.
-    """
-    try:
-        from .envs.highway_fast import flatten, params, rollout, uses_vq
-    except Exception:
+    """Kept for callers that ask the highway kernel by name."""
+    if type(env).__name__ != "HighwayBatch":
         return None
-    if bank.get("head") != "argmax" or not bank.get("laws_on_z"):
-        return None
-    n_obs = len(bank["names"])
-    if uses_vq(bank, n_obs):
-        return None
-    s = env.sample_starts(n_ep, np.random.default_rng(seed))
-    f = flatten(bank, n_obs)
-    G = np.empty(len(s))
-    rollout(np.ascontiguousarray(s), params(env), f["lit_col"], f["lit_thr"],
-            f["lit_neg"], f["cl_start"], f["cl_len"], f["b_col"], f["b_thr"],
-            f["b_neg"], f["b_start"], f["b_len"], f["sticky"], f["mem_cols"],
-            f["w_col"], f["w_thr"], f["w_neg"], f["laws"], f["n_obs"], T, G)
-    return G
+    return _fast_score(env, bank, n_ep, T, seed)
 
 
 def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
@@ -284,6 +332,38 @@ def absorb_universal(env, bank, pol_fn, Z, cur_G=None, n_ep=600, T=400,
         if ok:
             return cand, g, True
     return bank, cur, False
+
+
+def collapse_bottom(env, bank, pol_fn, cur_G=None, n_ep=600, T=400, seed=777,
+                    z=2.0, margin=0.25, names=None, verbose=True):
+    """If the bottom arm's guard does nothing, its law IS the default.
+
+    `absorb_universal` catches a guard that matches everything. This catches
+    the commoner disguise: a guard matching MOST states whose accepted gain
+    came from the law it carries, not from the split. Measured on the
+    intersection signal search: `noise > -1.046`, a planted distractor
+    matching 85% of episodes, was bought for +4.4 -- the CEM-tuned law on that
+    arm was simply better than the default's, and the guard was a passenger.
+
+    The move is an equivalence test, so it is priced for NON-INFERIORITY: drop
+    the bottom arm, make its law the default's, and keep the simpler tree if
+    the paired test cannot show a loss beyond `margin`. Only the bottom arm,
+    because collapsing a higher arm hands its rows to the arms below and is
+    a different tree, not the same one written shorter.
+    """
+    C = len(bank["clauses"])
+    if not C:
+        return bank, cur_G, False
+    cur = (score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G)
+    c = C - 1
+    cand = dict(reindex(bank, list(range(c))), default=bank["laws"][c])
+    ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed, z,
+                      side="noninferior", margin=margin)
+    if verbose:
+        nm = (names[bank["clauses"][c][0][0]] if names else c)
+        print("    collapse: bottom arm %d (%s) as default -- %s (%+.2f)"
+              % (c, nm, "accepted" if ok else "kept", d), flush=True)
+    return (cand, g, True) if ok else (bank, cur, False)
 
 
 def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,

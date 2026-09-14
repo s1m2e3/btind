@@ -128,6 +128,7 @@ class HighwayBatch:
         self.gamma, self.density = gamma, density
         self.names = feature_names(n_obs_veh)
         self.n_act = len(ACTIONS)
+        self.head = "argmax"
         self._kseed = seed
 
     # -- bookkeeping the rest of the project expects -------------------------
