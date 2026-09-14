@@ -208,3 +208,58 @@ def simplify(env, bank, pol_fn, cur_G=None, n_ep=400, T=400, seed=777, z=2.0,
             if changed:
                 break
     return bank, cur, log
+
+
+def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,
+                      seed=777, z=2.0, min_gain=0.1, steps=(0.04, 0.1, 0.25, 0.6, 1.2),
+                      max_sweeps=4, names=None, verbose=True):
+    """Coordinate-wise line search on every threshold, decided by rollout.
+
+    A threshold arrives wherever the random draw that proposed it happened to
+    land, and nothing afterwards moves it: `drift` only re-proposes the MOST
+    RECENTLY accepted arm during growth, and the boundary term that used to do
+    this needs a critic, which on this world is at chance. So an arm can be the
+    right region carved in the wrong place -- measured, the grower's flee arm
+    lands at `t_capture<=12.06` where the hand-tuned equivalent is far tighter,
+    and on `d_threat` the difference between 0.09 and 0.20 is +5.87 against
+    -3.81.
+
+    Steps are scaled by each column's interquartile range, so one setting works
+    across columns whose units have nothing to do with each other -- a bearing
+    in [-1,1] beside a time-to-capture in steps.
+
+    `min_gain` is lower here than for structural moves: this is refinement of
+    something already bought, not the purchase of a new arm, so a tenth of a
+    return unit is worth keeping.
+    """
+    iqr = {j: float(np.subtract(*np.percentile(Z[:, j], [75, 25])) or 1.0)
+           for j in range(Z.shape[1])}
+    cur = (score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G)
+    log = []
+    for sweep in range(max_sweeps):
+        moved = False
+        for c in range(len(bank["clauses"])):
+            for k in range(len(bank["clauses"][c])):
+                j, thr, neg = bank["clauses"][c][k]
+                best, best_d = None, min_gain
+                for mult in steps:
+                    for sgn in (-1.0, 1.0):
+                        new = thr + sgn * mult * abs(iqr[j])
+                        cl = [[l[:] for l in x] for x in bank["clauses"]]
+                        cl[c][k][1] = float(new)
+                        cand = dict(bank, clauses=cl)
+                        ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed,
+                                          z)
+                        log.append(dict(arm=c, lit=k, thr=float(new), delta=d,
+                                        accepted=bool(ok and d > min_gain)))
+                        if ok and d > best_d:
+                            best, best_d, best_g, best_thr = cand, d, g, new
+                if best is not None:
+                    if verbose:
+                        nm = names[j] if names else j
+                        print("    threshold: arm %d %s %.3f -> %.3f (%+.2f)"
+                              % (c, nm, thr, best_thr, best_d), flush=True)
+                    bank, cur, moved = best, best_g, True
+        if not moved:
+            break
+    return bank, cur, log

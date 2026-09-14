@@ -28,11 +28,12 @@ import numpy as np
 
 from . import store as ST
 from .betasearch import search_beta
-from .grow_bt import grow
+from .grow_bt import failure_states, grow
 from .lawcem import cem_law, improve_laws
 from .memory import MemBank, emit, mem_names
 from .memsearch import discover as mem_discover, record
-from .structure import drop_arm, reorder, score, simplify
+from .structure import (drop_arm, polish_thresholds, reorder, score,
+                         simplify)
 
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
@@ -90,13 +91,26 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
     log = []
     for r in range(rounds):
         zn = mem_names(names, bank.get("mem"))
-        obs = env.observe(_cover(env, cfg["n_cover"], np.random.default_rng(r)))
+        cov = env.observe(_cover(env, cfg["n_cover"], np.random.default_rng(r)))
+        # ANCHOR ON FAILURES. The quantile alphabet built from coverage states
+        # cannot express the thresholds that matter: d_threat is uniform on
+        # [0.08, 0.80] there, so its 5% quantile is 0.11 while the region worth
+        # +5.87 is `d_threat <= 0.09`. Observations from the steps before a
+        # death put the candidate thresholds where the trouble is.
+        fail = failure_states(env, bank, pol_fn, n_ep=300, T=cfg["T"])
+        obs = np.vstack([cov, fail]) if len(fail) else cov
+        hot = np.arange(len(cov), len(obs))
         p = pol_fn(bank)
         p.reset(len(obs))
         Z = p.z(obs, update=False)
         cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], cfg["seed"])
         rec = dict(round=r, G_in=float(cur.mean()), moves=[])
 
+        import btind.grow_bt as _GB
+        _cp = _GB._clause_pool
+        _GB._clause_pool = (lambda rg, al, ZZ, _h, pl, ma, la, sd, _hot=hot:
+                            _cp(rg, al, ZZ, _hot if len(_hot) else None, pl, ma,
+                                la, sd))
         bank, glog = grow(env, bank, names, zn, pol_fn, obs, Z,
                           max_arms=cfg["grow_arms"], pool=cfg["grow_pool"],
                           max_arity=cfg["max_arity"], min_n=cfg["min_n"],
@@ -106,6 +120,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           n_confirm=10, T=cfg["T"], seed=cfg["seed"],
                           z=cfg["z"], rng=rng, use_library=False,
                           verbose=verbose)
+        _GB._clause_pool = _cp
         bank, cur, _ = simplify(env, bank, pol_fn, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=cfg["seed"], z=cfg["z"],
                                 names=zn, verbose=verbose)
@@ -117,6 +132,12 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                        sigma0=cfg["cem_sigma"], verbose=verbose)
         if any(l["accepted"] for l in llog):
             rec["moves"].append("cem-laws")
+        bank, cur, plog = polish_thresholds(env, bank, pol_fn, Z, cur_G=cur,
+                                            n_ep=cfg["n_ep"], T=cfg["T"],
+                                            seed=cfg["seed"], z=cfg["z"],
+                                            names=zn, verbose=verbose)
+        if any(x["accepted"] for x in plog):
+            rec["moves"].append("thresholds")
 
         if r == cfg["mem_at"]:
             env.seed_kernels(3)
