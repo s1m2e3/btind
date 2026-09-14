@@ -247,6 +247,29 @@ def widen(bank, old_zn, new_zn):
                 laws_on_z=True)
 
 
+def without_memory(bank, names):
+    """The same tree with the blackboard removed -- the no-memory control.
+
+    Dropping `mem` also drops columns, so every law has to be relaid out or it
+    is multiplied by a design matrix three columns narrower than it expects.
+    Arms whose guards read a memory column go too: they can no longer be
+    evaluated, and leaving them in would silently change which arm claims what.
+    """
+    zn_old = mem_names(names, bank.get("mem"))
+    zn_new = mem_names(names, None)
+    keep = [i for i, c in enumerate(bank["clauses"])
+            if not any(l[0] >= len(zn_new) for l in c)]
+    out = dict(bank, mem=None,
+               clauses=[[l[:] for l in bank["clauses"][i]] for i in keep],
+               laws=[relayout(bank["laws"][i], zn_old, zn_new) for i in keep],
+               default=relayout(bank["default"], zn_old, zn_new),
+               betas=([bank["betas"][i] for i in keep]
+                      if bank.get("betas") else None),
+               sticky=([bank["sticky"][i] for i in keep]
+                       if bank.get("sticky") else None))
+    return out
+
+
 # ------------------------------------------------------------------ checks
 def test_equivalence(env, bank, n_obs, n_ep=300, T=200, seed=11):
     """A MemBank with no stickiness and no blackboard must equal LandscapeBank.

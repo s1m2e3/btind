@@ -154,17 +154,11 @@ def candidates(names, OB, AL, n_thr=9, pair_adjacent=True, max_write=None):
     # all. Masked columns make this worse: `d_food` is pinned at its 1.5
     # sentinel for 63% of steps, so the upper half of any quantile grid is one
     # repeated value and the informative range lives entirely in the tail.
-    qs = np.linspace(0.05, 0.95, n_thr)
+    from .thresholds import literals
     writes = []
     for j in range(d):
-        col = O[:, j]
-        for thr in np.unique(np.quantile(col, qs)):
-            for neg in (False, True):
-                frac = float((col <= thr).mean() if neg else (col > thr).mean())
-                if 0.03 < frac < 0.97:
-                    writes.append(([[j, float(thr), bool(neg)]],
-                                   "%s%s%.3f" % (names[j], "<=" if neg else ">",
-                                                 thr)))
+        writes += literals(O[:, j], j, n_thr=n_thr, lo=0.03, hi=0.97,
+                           name=names[j])
     if max_write:
         writes = writes[:max_write]
     stores = [((j,), names[j]) for j in range(d)]
@@ -240,24 +234,42 @@ def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
     if verbose:
         print("    memory grid: %d joint candidates" % len(cands), flush=True)
 
-    def with_mem(mem):
+    def with_mem(mem, pos=None):
+        """Install the rule plus an arm that reads it, AT A CHOSEN POSITION.
+
+        Appending was the default and it is wrong: in a Fallback the last arm
+        sees only what nothing above it claimed, so on a six-arm tree the memory
+        arm got an arbitrary remainder and every one of 10752 candidates scored
+        at or below zero. Position is semantics here, not layout -- the same
+        mistake that made 27 add-arm proposals look identical to the incumbent.
+        """
         zn = mem_names(names, mem)
         b = widen(bank, zn0, zn)
         idx = {n: i for i, n in enumerate(zn)}
         prim = memory_primitives(zn, mem, names)
-        b = dict(b, mem=mem,
-                 clauses=[[l[:] for l in c] for c in bank["clauses"]]
-                         + [[[idx["have_mem"], 0.5, False]]],
-                 laws=list(b["laws"]) + [prim["to_mem"]])
-        return b, zn
+        cl = [[l[:] for l in c] for c in bank["clauses"]]
+        laws = list(b["laws"])
+        p = len(cl) if pos is None else max(0, min(pos, len(cl)))
+        cl.insert(p, [[idx["have_mem"], 0.5, False]])
+        laws.insert(p, prim["to_mem"])
+        return dict(b, mem=mem, clauses=cl, laws=laws), zn
 
     base_cheap = score(env, bank, pol_fn_for(zn0), screen_ep, T, seed)
+    # Screen at the TOP and at the BOTTOM: the top guarantees the arm actually
+    # fires so its rule can be judged, the bottom is where it belongs if the
+    # arms above already handle everything it would.
+    positions = (0, len(bank["clauses"]))
     t0, rows = time.time(), []
     for i, (cols, write, label) in enumerate(cands):
         mem = dict(cols=list(cols), write=write, clear=None)
-        b, zn = with_mem(mem)
-        g = score(env, b, pol_fn_for(zn), screen_ep, T, seed)
-        rows.append((float((g - base_cheap).mean()), mem, label))
+        best = None
+        for pos in positions:
+            b, zn = with_mem(mem, pos)
+            g = score(env, b, pol_fn_for(zn), screen_ep, T, seed)
+            d = float((g - base_cheap).mean())
+            if best is None or d > best[0]:
+                best = (d, pos)
+        rows.append((best[0], mem, "%s @%d" % (label, best[1])))
         if verbose and (i + 1) % 600 == 0:
             print("      screened %d/%d  best %+.2f  [%.0fs]"
                   % (i + 1, len(cands), max(r[0] for r in rows),
@@ -267,7 +279,8 @@ def discover(env, bank, names, pol_fn_for, n_obs, OB, AL, n_thr=7,
     base_full = score(env, bank, pol_fn_for(zn0), confirm_ep, T, seed)
     best, best_d, log = None, 0.0, []
     for d_screen, mem, label in rows[:n_confirm]:
-        b, zn = with_mem(mem)
+        pos = int(label.rsplit("@", 1)[1])
+        b, zn = with_mem(mem, pos)
         ok, dl, _ = accept(env, b, pol_fn_for(zn), base_full, confirm_ep, T,
                            seed, z)
         log.append(dict(label=label, screen=d_screen, delta=dl,

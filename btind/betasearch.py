@@ -94,17 +94,10 @@ def beta_candidates(Z, names, arm_clause, n_thr=6, cols=None):
     cols = list(range(Z.shape[1])) if cols is None else list(cols)
     order = own + [c for c in cols if c not in own]
     out = []
+    from .thresholds import literals
     for j in order:
-        col = Z[:, j]
-        qs = (np.linspace(0.05, 0.95, n_thr * 2) if j in own
-              else np.linspace(0.15, 0.85, n_thr))
-        for thr in np.unique(np.quantile(col, qs)):
-            for neg in (False, True):
-                frac = float((col <= thr).mean() if neg else (col > thr).mean())
-                if 0.02 < frac < 0.98:
-                    out.append(([[int(j), float(thr), bool(neg)]],
-                                "%s%s%.3f" % (names[j], "<=" if neg else ">",
-                                              thr)))
+        out += literals(Z[:, j], j, n_thr=(n_thr * 2 if j in own else n_thr),
+                        lo=0.02, hi=0.98, name=names[j])
     return out
 
 

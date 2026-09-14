@@ -53,9 +53,12 @@ class Alphabet:
         self.k = n_thresholds
 
     def fit(self, X, feats):
-        qs = np.linspace(0, 1, self.k + 2)[1:-1]
+        # SENTINEL-AWARE. A masked column sits at one value most of the time, so
+        # plain quantiles spend the grid on it -- see thresholds.py. The second
+        # pass over the non-modal rows is what reaches the range that matters.
+        from .thresholds import grid
         self.feats = list(feats)
-        self.thr = {j: np.unique(np.quantile(X[:, j], qs)) for j in feats}
+        self.thr = {j: grid(X[:, j], n_thr=self.k) for j in feats}
         self.lo = {j: float(X[:, j].min()) for j in feats}
         self.hi = {j: float(X[:, j].max()) for j in feats}
         return self
