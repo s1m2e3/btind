@@ -49,7 +49,11 @@ def _fast_score(env, bank, n_ep, T, seed):
     if type(env).__name__ != "NestWorld" or not bank.get("laws_on_z"):
         return None
     n_obs = len(bank["names"])
-    if uses_vq(bank, n_obs):
+    # The kernel sets V_hat and leverage to zero, exactly as MemBank does when
+    # no critic is attached. So the only real incompatibility is a GUARD that
+    # compares against them -- a law's coefficients there multiply a zero.
+    from .memory import _guards_read_vq
+    if _guards_read_vq(bank, n_obs):
         return None
     env.seed_kernels(seed)
     s = (env.sample_starts(n_ep, np.random.default_rng(seed))

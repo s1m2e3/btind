@@ -63,6 +63,27 @@ def mem_names(names, mem):
     return out
 
 
+def _guards_read_vq(bank, n_obs):
+    """Does any GUARD, termination or write rule COMPARE against V_hat/leverage?
+
+    Separate from whether a law has coefficients there: a comparison needs the
+    real value, while a coefficient only needs the column, which is zero
+    whenever no critic is attached. Conflating the two made a randomly
+    initialised law -- nonzero on every column, including these two -- look like
+    it required a critic, which silently pushed every rollout of a policy search
+    off the fused kernel and onto the Python path, 63x slower.
+    """
+    cols = {n_obs, n_obs + 1}
+    for c in list(bank.get("clauses") or []) + list(
+            filter(None, bank.get("betas") or [])):
+        if any(l[0] in cols for l in c):
+            return True
+    m = bank.get("mem")
+    if m and any(l[0] in cols for l in m["write"] + (m.get("clear") or [])):
+        return True
+    return False
+
+
 def _reads_vq(bank, n_obs):
     """Does any clause, termination, write rule or LAW mention V_hat/leverage?"""
     cols = {n_obs, n_obs + 1}
