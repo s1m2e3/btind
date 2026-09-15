@@ -85,7 +85,16 @@ to one car, for what that car did:
                               to cause, and in light traffic it rarely causes
                               one -- at R_RED, running reds out-earned waiting
                               for them with two cars an episode (e34)
-    - R_COLL                  per car involved in a collision (each car, once)
+    - R_COLL                  per car AT FAULT in a collision: in a rear-end the
+                              car that ran into the one ahead, in a crossing both.
+                              Charging the car that was hit as well made stopping
+                              at a red cost the stopper its own crash: measured at
+                              16-50 veh/h, a red stop lost -121 per episode and
+                              raised crashes 0.02 -> 0.52, so no red stop could be
+                              accepted until following existed, and following had
+                              nothing to follow until someone stopped. Fault puts
+                              the cost on the law that can remove it. The TEAM
+                              reward still counts every collision.
     - W_CAR_DELAY x (1 - v/V0) per car-second, blocked-at-entrance cars included
     - W_COMFORT x (dv/dt / B_MAX)^2   per car-second: a regulariser on steep
                               changes of speed, so a stop is a controlled one
@@ -282,7 +291,7 @@ class IntersectionBatch:
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
     OBS_VERSION = 5
-    REWARD_VERSION = 3          # part of the store key, like OBS_VERSION
+    REWARD_VERSION = 4          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -1068,7 +1077,9 @@ class IntersectionBatch:
         n_rear = rear.sum(1)
         n_cross = np.triu(both, 1).sum((1, 2))
         n_ev = n_rear + n_cross
-        r -= R_COLL * (hit.sum(1) if car else n_ev)
+        # the per-car reward charges the cars at fault: the striker of a
+        # rear-end, both parties of a crossing
+        r -= R_COLL * ((rear | cross).sum(1) if car else n_ev)
         t_red = R_RED * ran.sum(1)
         X[:, 6] += n_ev
         X[:, 8] += n_rear

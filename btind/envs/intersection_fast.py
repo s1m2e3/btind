@@ -770,9 +770,11 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 r -= W_QUEUE * qsq * dt
 
             hit = np.zeros(N, np.bool_)
+            fault = np.zeros(N, np.bool_)
             for q in range(N):
                 if status[q] == 1.0 and has_lead[q] and lead_gap[q] < 0.0:
                     hit[q] = True
+                    fault[q] = True                  # the striker, not the struck
                     hit[lead_j[q]] = True
                     n_rear += 1
             for q in range(N):
@@ -789,16 +791,19 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                             abs(s_cp[mr, m] - s[rr]) < HALF_CONF:
                         hit[q] = True
                         hit[rr] = True
+                        fault[q] = True
+                        fault[rr] = True
                         n_cross += 1
-            n_hit = 0
+            n_fault = 0
             for q in range(N):
                 if hit[q]:
                     status[q] = 2.0
                     v[q] = 0.0
-                    n_hit += 1
+                if fault[q]:
+                    n_fault += 1
                     if q == ts:
                         r_me -= R_COLL
-            r -= R_COLL * (n_hit if car_r else (n_rear + n_cross))
+            r -= R_COLL * (n_fault if car_r else (n_rear + n_cross))
 
             # ---- exits ------------------------------------------------------------
             n_out = 0

@@ -357,7 +357,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                              and e.get("src") == s),
                                          sum(1 for e in klog if e.get("op") == "add"
                                              and e.get("src") == s and e["accepted"])]
-                                     for s in ("dev", "critic", "critic-set", "anchor", "bound")}
+                                     for s in ("dev", "critic", "critic-set", "joint", "anchor", "bound")}
 
         # THE MEMORY STAGE IS NOT READY FOR A DISCRETE HEAD, and it says so
         # rather than producing a shaped-wrong law and a silent wrong answer.

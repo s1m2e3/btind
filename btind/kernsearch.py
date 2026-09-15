@@ -35,6 +35,14 @@ Screening and confirming on the same episodes was a winner's curse: the best of
 inflated and vanished on the next round's seed -- the accept-then-prune flip
 seen at rung 0. The tuner and the prune use the confirmation seed as well.
 
+A JOINT SET ACROSS LAWS (`joint`). The trees are SHARED: the car that stops at a
+red and the car that runs into it run the same policy, so a red stop and the
+following that makes it safe live in different laws of one tree and pay only
+together. Measured at 16-50 veh/h on a tree with neither: a red stop alone cost
+-7.9 with crashes 0.02 -> 0.52 an episode. So after the per-law passes, the best
+critic-set of each of the busiest laws is applied to the tree AT ONCE and that
+tree is screened and confirmed as one candidate.
+
 A KERNEL CAN TAKE ON A COLUMN LATER (`widen_kernel`). Its first point fixes its
 columns, and a first point is often a proxy: measured, a red-brake point on
 (speed, light) at rung 0 locked the default's kernel to those two, and the red
@@ -413,6 +421,7 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
     share = np.bincount(ex["law"].astype(int), minlength=len(laws)) / len(ex["law"])
     order = [int(i) for i in np.argsort(-share) if share[i] >= cfg["min_share"]]
     Zall = ex["z0"]
+    joint = {}                     # law -> its critic-sets, for the joint candidate
     Zanc = arms_anc = None
     if anchors is not None and len(anchors):
         pa = pol_fn(bank)
@@ -438,6 +447,9 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
                             t[3] if len(t) > 3 else "critic")
                            for t in critic(bank, c, k, kb, head)]
             cs = sorted(cs, key=lambda t: -t[3])
+            sets_ = [t for t in cs if t[4] == "critic-set"]
+            if sets_:
+                joint.setdefault((c, k), []).extend(sets_)
             return cs + anchor_candidates(Zanc, arms_anc, bank, c, k, kb, head,
                                           cfg["n_anchor"])
         if KL.n_points(kern):
@@ -495,8 +507,39 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
         n_pts = sum(KL.n_points(KL.kern_of(bank, c, k)) for c, k in flat_laws(bank))
         print("    kernels: %d inducing points in the tree [%.0fs]; %s"
               % (n_pts, time.time() - t0, source_summary(log)), flush=True)
+    if len(joint) >= 2:
+        bank, cur, jlog = joint_sets(env, bank, joint, pol_fn, cur, cfg, verbose)
+        log += jlog
     # back on the caller's seed, which the rest of the round compares against
     cur = score(env, bank, pol_fn, n_ep, T, seed)
+    return bank, cur, log
+
+
+def joint_sets(env, bank, joint, pol_fn, cur, cfg, verbose=False, top=2):
+    """The best critic-sets of several laws applied together, tested as one."""
+    from itertools import product
+    laws = sorted(joint)[:3]
+    per_law = [sorted(joint[L], key=lambda t: -t[3])[:top] for L in laws]
+    cur_cheap = score(env, bank, pol_fn, cfg["screen_ep"], cfg["T"], cfg["seed"])
+    rows = []
+    for combo in product(*per_law):
+        b = bank
+        for (c, k), (kb, X, Y, adv, src) in zip(laws, combo):
+            b = KL.with_kern(b, c, k, _add(kb, X, Y))
+        g = score(env, b, pol_fn, cfg["screen_ep"], cfg["T"], cfg["seed"])
+        rows.append((float((g - cur_cheap).mean()), b, combo))
+    rows.sort(key=lambda r: -r[0])
+    log = []
+    for d_screen, b, combo in rows[:cfg["n_confirm"] // 2 or 1]:
+        ok, d, g = accept(env, b, pol_fn, cur, cfg["n_ep"], cfg["T"], cfg["seed_c"], cfg["z"])
+        keep = bool(ok and d > cfg["min_gain"])
+        log.append(dict(op="add", arm=laws[0][0], step=0, screen=d_screen, delta=d,
+                        src="joint", accepted=keep))
+        if keep:
+            if verbose:
+                print("      + joint set on %s: %+.2f" % (" & ".join(_where(c, k) for c, k in laws), d),
+                      flush=True)
+            return b, g, log
     return bank, cur, log
 
 
@@ -505,7 +548,7 @@ def source_summary(log):
     the audit of which loop (deviations, critic, failure anchors, bound seeds)
     is producing the points the tree keeps."""
     out = []
-    for src in ("dev", "critic", "critic-set", "anchor", "bound"):
+    for src in ("dev", "critic", "critic-set", "joint", "anchor", "bound"):
         rows = [e for e in log if e.get("op") == "add" and e.get("src") == src]
         if rows:
             out.append("%s %d confirmed/%d kept" % (src, len(rows),
