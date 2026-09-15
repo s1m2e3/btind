@@ -276,6 +276,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                             _cp(rg, al, ZZ, _hot if len(_hot) else None, pl, ma,
                                 la, sd, *a, **kw))
         seeds = [c for c in seeds if all(l[0] < Z.shape[1] for l in c)]
+        n_arms_in = len(bank["clauses"])
         bank, glog = grow(env, bank, names, zn, pol_fn, obs, Z,
                           max_arms=cfg["grow_arms"], pool=cfg["grow_pool"],
                           max_arity=cfg["max_arity"], min_n=cfg["min_n"],
@@ -287,6 +288,10 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           weights=weights, verbose=verbose)
         weights.update_many(glog)
         _GB._clause_pool = _cp
+        # a round that grew an arm is not a stalled round: the stall detector
+        # (e35's curriculum) reads `moves`, and growth was never written there
+        if len(bank["clauses"]) > n_arms_in:
+            rec["moves"].append("grow")
         bank, cur, _ = simplify(env, bank, pol_fn, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=rseed, z=cfg["z"],
                                 names=zn, verbose=verbose)
