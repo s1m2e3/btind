@@ -145,7 +145,7 @@ def candidates(ex, bank, c, k, kern, head, n_prop, u_range=None):
             out.append((x, y, float(ex["adv"][i])))
         if len(out) >= n_prop:
             break
-    return [(kern, x[None], y[None], a) for x, y, a in out]
+    return [(kern, x[None], y[None], a, "dev") for x, y, a in out]
 
 
 def bound_seeds(ex, bank, c, k, kern, bounds, Zown):
@@ -167,12 +167,12 @@ def bound_seeds(ex, bank, c, k, kern, bounds, Zown):
             best[name] = (ex["z0"][i, kern["cols"]], float(ex["adv"][i]))
     if "lo" in best and "hi" in best:
         out.append((kern, np.vstack([best["lo"][0], best["hi"][0]]),
-                    np.array([[lo], [hi]]), best["lo"][1] + best["hi"][1]))
+                    np.array([[lo], [hi]]), best["lo"][1] + best["hi"][1], "bound"))
     if len(Zown):
         q10 = np.quantile(Zown[:, kern["cols"]], 0.1, axis=0)
         q90 = np.quantile(Zown[:, kern["cols"]], 0.9, axis=0)
         for a, b in ((lo, hi), (hi, lo)):
-            out.append((kern, np.vstack([q10, q90]), np.array([[a], [b]]), 0.0))
+            out.append((kern, np.vstack([q10, q90]), np.array([[a], [b]]), 0.0, "bound"))
     return out
 
 
@@ -204,11 +204,11 @@ def anchor_candidates(Zanc, arms, bank, c, k, kern, head, n_rows):
             for a in range(len(u0)):
                 y = u0.copy()
                 y[a] = u0.max() + 1.0 + 0.25 * (u0.max() - u0.min())
-                out.append((kern, x[None], y[None], 0.0))
+                out.append((kern, x[None], y[None], 0.0, "anchor"))
         else:
             lo, hi = bounds if bounds is not None else (u0[0] - 1.0, u0[0] + 1.0)
             for yv in (lo, 0.5 * lo, min(max(0.0, lo), hi), hi):
-                out.append((kern, x[None], np.array([[yv]]), 0.0))
+                out.append((kern, x[None], np.array([[yv]]), 0.0, "anchor"))
     return out
 
 
@@ -232,30 +232,31 @@ def add_points(env, bank, c, k, cands, kern, pol_fn, cur, cfg, verbose=False,
             break
         cur_cheap = score(env, bank, pol_fn, cfg["screen_ep"], cfg["T"], cfg["seed"])
         rows = []
-        for j, (kb, x, y, adv) in enumerate(cands):
+        for j, (kb, x, y, adv, src) in enumerate(cands):
             b = KL.with_kern(bank, c, k, _add(kb, x, y))
             g = score(env, b, pol_fn, cfg["screen_ep"], cfg["T"], cfg["seed"])
             rows.append(((g - cur_cheap).mean(), j))
         rows.sort(key=lambda r: -r[0])
         best = None
         for d_screen, j in rows[:cfg["n_confirm"]]:
-            kb, x, y, _ = cands[j]
+            kb, x, y, _, src = cands[j]
             kc = _add(kb, x, y)
             cand = KL.with_kern(bank, c, k, kc)
             ok, d, g = accept(env, cand, pol_fn, cur, cfg["n_ep"], cfg["T"],
                               cfg["seed"], cfg["z"])
-            log.append(dict(op="add", arm=c, step=k, screen=float(d_screen),
+            log.append(dict(op="add", arm=c, step=k, screen=float(d_screen), src=src,
                             delta=d, accepted=bool(ok and d > cfg["min_gain"])))
             if ok and d > cfg["min_gain"] and (best is None or d > best[0]):
                 best = (d, j, kc, cand, g)
         if best is None:
             break
         d, j, kern, bank, cur = best
+        src = cands[j][4]
         cands = (regen(kern) if regen is not None else
                  [cd for i, cd in enumerate(cands) if i != j])
         if verbose:
-            print("      + point %d on %s: %s  %+.2f"
-                  % (KL.n_points(kern), _where(c, k), _pt(kern, -1, cfg), d),
+            print("      + point %d on %s: %s  %+.2f  [%s]"
+                  % (KL.n_points(kern), _where(c, k), _pt(kern, -1, cfg), d, src),
                   flush=True)
     return bank, kern, cur, log
 
@@ -306,8 +307,16 @@ def prune_points(env, bank, c, k, kern, pol_fn, cur, cfg, verbose=False):
         kc = (KL.make(kern["cols"], kern["X"][keep], kern["Y"][keep], kern["ls"])
               if keep else None)
         cand = KL.with_kern(bank, c, k, kc)
-        ok, d, g = accept(env, cand, pol_fn, cur, cfg["n_ep"], cfg["T"], cfg["seed"],
-                          cfg["z"], side="noninferior", margin=cfg["prune_margin"])
+        # A POINT IS PRUNED ONLY WHEN THE TEST IS CONFIDENT IT IS WORTH LESS THAN
+        # THE MARGIN. The non-inferiority test used elsewhere prunes on
+        # inconclusive evidence, and with a per-episode spread of ~50 against a
+        # point worth +2 that flipped every round: measured, rung 0 accepted the
+        # same red-brake point at +2.12 and pruned it at +0.76 on the next seed.
+        g = score(env, cand, pol_fn, cfg["n_ep"], cfg["T"], cfg["seed"])
+        dd = g - cur
+        se = max(dd.std() / np.sqrt(len(dd)), 1e-12)
+        d = float(dd.mean())
+        ok = bool(d - cfg["z"] * se > -cfg["prune_margin"])
         log.append(dict(op="prune", arm=c, step=k, delta=d, accepted=ok))
         if ok:
             if verbose:
@@ -388,7 +397,7 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
         def propose(kb, n):
             cs = candidates(ex, bank, c, k, kb, head, n)
             if critic is not None:
-                cs = cs + [(kb, np.atleast_2d(t[0]), np.atleast_2d(t[1]), t[2])
+                cs = cs + [(kb, np.atleast_2d(t[0]), np.atleast_2d(t[1]), t[2], "critic")
                            for t in critic(bank, c, k, kb, head)]
             cs = sorted(cs, key=lambda t: -t[3])
             return cs + anchor_candidates(Zanc, arms_anc, bank, c, k, kb, head,
@@ -437,6 +446,19 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
             log += plog
     if verbose:
         n_pts = sum(KL.n_points(KL.kern_of(bank, c, k)) for c, k in flat_laws(bank))
-        print("    kernels: %d inducing points in the tree [%.0fs]"
-              % (n_pts, time.time() - t0), flush=True)
+        print("    kernels: %d inducing points in the tree [%.0fs]; %s"
+              % (n_pts, time.time() - t0, source_summary(log)), flush=True)
     return bank, cur, log
+
+
+def source_summary(log):
+    """Per proposal source: how many reached confirmation, how many were kept --
+    the audit of which loop (deviations, critic, failure anchors, bound seeds)
+    is producing the points the tree keeps."""
+    out = []
+    for src in ("dev", "critic", "anchor", "bound"):
+        rows = [e for e in log if e.get("op") == "add" and e.get("src") == src]
+        if rows:
+            out.append("%s %d confirmed/%d kept" % (src, len(rows),
+                                                    sum(1 for e in rows if e["accepted"])))
+    return "; ".join(out) if out else "no proposal reached confirmation"
