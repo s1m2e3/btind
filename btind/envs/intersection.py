@@ -143,6 +143,18 @@ ACTIONS = ["BRAKE_HARD", "BRAKE", "HOLD", "ACCEL", "ACCEL_MAX"]
 SIG_ACTIONS = ["EXTEND", "SWITCH"]
 FIXED_GREEN = np.array([30.0, 10.0, 30.0, 10.0])
 
+# OPERATING CONDITIONS, drawn per episode when a world is built with
+# `conditions=WIDE` (or any dict of the same keys): a controller trained on one
+# demand and one plan learns that demand and that plan -- measured, the e34 tree
+# carried `t_sig>28.9`, a rule about the fixed plan's 30 s green. Every episode
+# of a batch draws its own:
+#     approach_vph   total flow on EACH approach, independently   veh/h
+#     left, right    turning shares on each approach
+#     green_through  the fixed plan's green for phases 0 and 2     s
+#     green_left     the fixed plan's green for phases 1 and 3     s
+WIDE = dict(approach_vph=(100.0, 600.0), left=(0.1, 0.3), right=(0.1, 0.3),
+            green_through=(15.0, 45.0), green_left=(5.0, 20.0))
+
 # DISTRIBUTED CONTROL: a vehicle observes ITSELF -- its speed, where it is
 # relative to its stop line and its own first conflict point, what its front
 # sensor reports -- and what the INTERSECTION tells every approaching car: the
@@ -205,6 +217,7 @@ class IntersectionBatch:
         5N + 11   the planted clock's phase, uniform in [0, 1), NEVER observed
         [5N+12 : 6N+12)  told: the slot has received its message (event mode)
         [6N+12 : 7N+12)  paid: the slot has collected its red-stop bonus
+        [7N+12 : 7N+16)  this episode's fixed-plan green time per phase
 
     HEADS. Each agent's leaf may be discrete or continuous, per bank:
         vehicle  `argmax` over the five named accelerations, or `scalar`: an
@@ -244,8 +257,13 @@ class IntersectionBatch:
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
                  sig_mode="continuous", veh_head="argmax", sig_head="argmax",
-                 occlude=None, veh_reward="team", entry_v=None):
+                 occlude=None, veh_reward="team", entry_v=None, conditions=None):
         assert sig_mode in ("continuous", "event")
+        self.cond = dict(conditions) if conditions else None
+        # a string, so the condition distribution is part of the store key
+        self.conditions = (";".join("%s=%s" % (k, ",".join("%g" % x for x in v))
+                                    for k, v in sorted(self.cond.items()))
+                           if self.cond else "")
         assert veh_reward in ("team", "car")
         self.veh_reward = veh_reward
         # ENTRY SPEEDS. By default every car enters at V0, so a cold start never
@@ -286,7 +304,7 @@ class IntersectionBatch:
         # each movement, the arc-lengths of every point where a conflicting
         # movement crosses it, sorted
         self.cps = [np.sort(g["s_cp"][m][g["conf"][m]]) for m in range(self.M)]
-        self.k = 7 * self.N + self.N_MISC
+        self.k = 7 * self.N + self.N_MISC + N_PHASES
         self.obs_version = self.OBS_VERSION
         self.reward_version = self.REWARD_VERSION
         self.terms = None               # set to {} to collect per-term totals
@@ -388,7 +406,19 @@ class IntersectionBatch:
         s = np.zeros((n, self.k))
         rate = np.array([self.vph[{0: 2, 1: 0, 2: 1}[int(d)]] for d in
                          self.geom["dirs"]]) / 3600.0        # dirs: r=0,s=1,l=2
+        plans = np.tile(FIXED_GREEN, (n, 1))
+        cd = self.cond
         for i in range(n):
+            if cd:
+                # this episode's conditions, drawn before its arrivals
+                U = lambda key, size=None: rng.uniform(cd[key][0], cd[key][1], size)
+                q_app = U("approach_vph", 4)
+                sh_l, sh_r = U("left", 4), U("right", 4)
+                share = np.stack([sh_r, 1.0 - sh_l - sh_r, sh_l], 1)   # by dirs r, s, l
+                rate = np.array([q_app[a] * share[a, int(dd)] for a, dd in
+                                 zip(self.geom["appr"], self.geom["dirs"])]) / 3600.0
+                gt, gl = U("green_through", 2), U("green_left", 2)
+                plans[i] = [gt[0], gl[0], gt[1], gl[1]]
             ev = []
             for m in range(M):
                 t = 0.0
@@ -406,7 +436,9 @@ class IntersectionBatch:
             s[i, N:2 * N] = self.s_spawn[s[i, 0:N].astype(int)]
         b = 5 * N
         s[:, b + 0] = 0.0
-        s[:, b + 1] = rng.uniform(0.0, FIXED_GREEN[0], n)
+        s[:, b + 1] = (rng.uniform(0.0, FIXED_GREEN[0], n) if not cd
+                       else rng.uniform(0.0, 1.0, n) * plans[:, 0])
+        s[:, 7 * N + self.N_MISC:7 * N + self.N_MISC + N_PHASES] = plans
         s[:, b + 5] = rng.normal(0.0, 1.0, n)
         # THE PLANTED CLOCK'S PHASE IS DRAWN INDEPENDENTLY AND NEVER OBSERVED.
         # `t_norm` was the raw fraction of the episode elapsed, and on a
@@ -438,6 +470,20 @@ class IntersectionBatch:
         N = self.N
         return s[:, 6 * N + self.N_MISC:7 * N + self.N_MISC]
 
+    def plan(self, s):
+        """(n, 4): each episode's fixed-plan green times."""
+        b = 7 * self.N + self.N_MISC
+        return s[:, b:b + N_PHASES]
+
+    def condition_groups(self, s, n_groups=3):
+        """Episode labels by demand (cars scheduled), for per-condition
+        acceptance; None when the world has no condition distribution."""
+        if not self.cond:
+            return None
+        cars = np.isfinite(s[:, 4 * self.N:5 * self.N]).sum(1)
+        cuts = np.quantile(cars, np.linspace(0, 1, n_groups + 1)[1:-1])
+        return np.searchsorted(cuts, cars, side="right")
+
     _reward_override = None
 
     @property
@@ -462,7 +508,7 @@ class IntersectionBatch:
         sb = self.signal_bank if self.agent == "vehicle" else self._search_bank
         return _kind_of(sb)
 
-    def _t_window(self, X, m, kind):
+    def _t_window(self, X, m, kind, greens=None):
         """(earliest, latest) ticks until movement m's light is OBSERVED to change.
 
         A TRUTHFUL MESSAGE, NOT A PROMISE. The first version computed the time
@@ -493,14 +539,15 @@ class IntersectionBatch:
             return (np.maximum(0.0, k) + 1.0 if kind == "fixed"
                     else np.maximum(1.0, k))
         if kind == "fixed":
-            cur_min = cur_max = live(FIXED_GREEN[ph], tau)
-            fut_min = fut_max = live(FIXED_GREEN, 0.0)
+            P = np.tile(FIXED_GREEN, (n, 1)) if greens is None else greens
+            cur_min = cur_max = live(P[np.arange(n), ph], tau)
+            fut_min = fut_max = live(P, 0.0)                    # (n, 4)
         else:
             known = (plan > 0.0) if kind == "duration" else np.zeros(n, bool)
             cur_min = np.where(known, live(plan, tau), live(T_MIN, tau))
             cur_max = np.where(known, live(plan, tau), live(T_MAX, tau))
-            fut_min = np.full(N_PHASES, live(T_MIN, 0.0))
-            fut_max = np.full(N_PHASES, live(T_MAX, 0.0))
+            fut_min = np.full((n, N_PHASES), live(T_MIN, 0.0))
+            fut_max = np.full((n, N_PHASES), live(T_MAX, 0.0))
         ar_full = float(np.ceil(T_AR / dt - eps))
         ar_now = np.maximum(1.0, np.ceil((T_AR - ar_t) / dt - eps))
         gm = np.take_along_axis(g[ph], m, 1) & ~in_ar[:, None]
@@ -513,8 +560,10 @@ class IntersectionBatch:
             q = (ph + k) % N_PHASES
             green_q = np.take_along_axis(g[q], m, 1)
             add = pending & ~green_q
-            tmin = tmin + np.where(add, (fut_min[q] + ar_full)[:, None], 0.0)
-            tmax = tmax + np.where(add, (fut_max[q] + ar_full)[:, None], 0.0)
+            fq_min = np.take_along_axis(fut_min, q[:, None], 1)[:, 0]
+            fq_max = np.take_along_axis(fut_max, q[:, None], 1)[:, 0]
+            tmin = tmin + np.where(add, (fq_min + ar_full)[:, None], 0.0)
+            tmax = tmax + np.where(add, (fq_max + ar_full)[:, None], 0.0)
             pending = pending & ~green_q
         return tmin, tmax
 
@@ -599,7 +648,7 @@ class IntersectionBatch:
         # tick it enters the zone, and the message carries the time to change.
         if self.event:
             hear = near & (self._told(s) < 0.5)
-            t_min, t_max = self._t_window(X, m, self._sig_kind())
+            t_min, t_max = self._t_window(X, m, self._sig_kind(), self.plan(s))
         else:
             hear = near | (d_stop <= 0.0)
             t_min = np.broadcast_to(X[:, 1:2], d_stop.shape)
@@ -652,7 +701,8 @@ class IntersectionBatch:
     def fixed_signal_action(self, s):
         """The fixed-time plan, as SWITCH/EXTEND decisions."""
         X = s[:, 5 * self.N:]
-        return (X[:, 1] >= FIXED_GREEN[X[:, 0].astype(int)]).astype(int)
+        return (X[:, 1] >= self.plan(s)[np.arange(len(s)), X[:, 0].astype(int)]
+                ).astype(int)
 
     def _fixed_agent_actions(self, s):
         """Actions of the agent NOT under search, from its fixed bank.
@@ -665,6 +715,9 @@ class IntersectionBatch:
         from ..memory import MemBank
         n, N = len(s), self.N
         fresh_batch = bool((s[:, 5 * N + 4] == 0.0).all())
+        fixed = self.signal_bank if self.agent == "vehicle" else self.vehicle_bank
+        if isinstance(fixed, list):
+            return self._population_actions(s, fixed, fresh_batch)
         if self.agent == "vehicle":
             if self.signal_bank is None:
                 return None
@@ -687,11 +740,66 @@ class IntersectionBatch:
         pol._prev = active
         return pol.act(self.observe_vehicles(s))
 
+    def _population_actions(self, s, pop, fresh_batch):
+        """The fixed agent is a POPULATION: the episodes are split into the
+        same consecutive blocks `intersection_fast.run` uses, one partner each.
+        A fixed-plan partner (None) among signal trees writes NaN, which
+        `step_both` replaces by the plan's own decision. What the reference
+        cannot express it refuses: a green-time tree mixed with the plan, and
+        event mode, whose message depends on each block's controller."""
+        from ..memory import MemBank
+        n, N = len(s), self.N
+        edges = np.linspace(0, n, len(pop) + 1).round().astype(int)
+        if self.agent == "vehicle":
+            if self.event:
+                raise NotImplementedError("signal populations on the Python path "
+                                          "in event mode")
+            if any(b is not None and b.get("head") == "duration" for b in pop):
+                raise NotImplementedError("green-time signal trees in a population "
+                                          "on the Python path")
+            if fresh_batch or getattr(self, "_pop", None) is None or self._pop_n != n:
+                self._pop = [None if b is None else MemBank(b, len(self.sig_names))
+                             for b in pop]
+                for pb, a, b in zip(self._pop, edges[:-1], edges[1:]):
+                    if pb is not None:
+                        pb.reset(b - a)
+                self._pop_n = n
+            out = np.full(n, np.nan)
+            o = self.observe_signal(s)
+            for pb, a, b in zip(self._pop, edges[:-1], edges[1:]):
+                if pb is not None and b > a:
+                    out[a:b] = pb.act(o[a:b])
+            return out
+        vbs = [b or self.default_vehicle_bank() for b in pop]
+        if fresh_batch or getattr(self, "_pop", None) is None or self._pop_n != n:
+            self._pop = [MemBank(b, len(self.veh_names)) for b in vbs]
+            for pb, a, b in zip(self._pop, edges[:-1], edges[1:]):
+                pb.reset((b - a) * N)
+                pb._prev = np.zeros((b - a) * N, bool)
+            self._pop_n = n
+        o = self.observe_vehicles(s)
+        out = np.zeros(n * N)
+        for pb, a, b in zip(self._pop, edges[:-1], edges[1:]):
+            if b <= a:
+                continue
+            active = (s[a:b, 3 * N:4 * N] == 1.0).reshape(-1)
+            fresh = active & ~pb._prev
+            pb.latch[fresh], pb.step[fresh], pb.have[fresh] = -1, 0, False
+            pb.age[fresh] = 0
+            if pb.slots is not None and pb.slots.shape[1]:
+                pb.slots[fresh] = 0.0
+            pb._prev = active
+            out[a * N:b * N] = pb.act(o[a * N:b * N])
+        return out
+
     _veh_head_now = "argmax"
     _sig_head_now = "argmax"
 
     def _heads(self, vehicle_bank, signal_bank):
         """Record which head each agent's actions are in, for `step_both`."""
+        first = lambda b: (next((x for x in b if x is not None), None)
+                           if isinstance(b, list) else b)
+        vehicle_bank, signal_bank = first(vehicle_bank), first(signal_bank)
         vb = vehicle_bank if vehicle_bank is not None else (
             self.vehicle_bank if self.agent == "signal" else None)
         self._veh_head_now = (vb or {}).get("head", self.veh_head) if vb else self.veh_head
@@ -728,6 +836,9 @@ class IntersectionBatch:
         if a_sig is None:
             a_sig = self.fixed_signal_action(s)
         a_sig = np.asarray(a_sig, float).reshape(n)
+        if np.isnan(a_sig).any():
+            # episodes whose partner in a population is the fixed plan
+            a_sig = np.where(np.isnan(a_sig), self.fixed_signal_action(s), a_sig)
         r = np.zeros(n)
         t = X[:, 4] * dt
 

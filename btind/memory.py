@@ -153,6 +153,9 @@ class MemBank:
                  steps 1..K-1 -- a Sequence of actions inside the arm
         fails    list, one per clause; None or a clause that releases the arm
                  and hands this tick to the arms BELOW it (FAILURE status)
+        kerns    list, one per clause; None or a list of per-step kernels
+                 (`kernlaw.py`), each None or the anchors that refine that
+                 step's affine law; `kern_default` is the default's
         mem      None, or dict(cols=[j...], write=clause, clear=clause|None)
     """
 
@@ -176,6 +179,7 @@ class MemBank:
         self.step = None
         self.slots = None
         self._k = None            # the step each row acted with on the last tick
+        self._ainv = {}           # K^-1 per (arm, step), computed once per bank
 
     # -- state ---------------------------------------------------------------
     def reset(self, n):
@@ -329,12 +333,22 @@ class MemBank:
         Z = self.z(obs)
         a = self.arbitrate(Z)
         Xd = design_matrix(Z) if self.b.get("laws_on_z") else design_matrix(obs)
-        out = Xd @ self.b["default"]
+        out = self._law_out(-1, 0, Xd)
         for c in np.unique(a[a >= 0]):
             for k in np.unique(self._k[a == c]):
                 m = (a == c) & (self._k == k)
-                out[m] = Xd[m] @ self.law_of(int(c), int(k))
+                out[m] = self._law_out(int(c), int(k), Xd[m])
         return out
+
+    def _law_out(self, c, k, Xd):
+        """The law of arm `c` step `k` on design rows: affine, plus its kernel."""
+        from . import kernlaw as KL
+        kern = KL.kern_of(self.b, c, k)
+        if not KL.n_points(kern):
+            return Xd @ self.law_of(c, k)
+        if (c, k) not in self._ainv:
+            self._ainv[(c, k)] = KL.ainv(kern)
+        return KL.evaluate(self.law_of(c, k), kern, Xd, self._ainv[(c, k)])
 
     def preferences(self, obs, temp=1.0):
         """Softmax of the scores: the FUZZY reading of a discrete-head law.
@@ -402,8 +416,9 @@ def relayout(theta, old_zn, new_zn):
 # once after a beta was accepted and a later `simplify` dropped an arm. Before
 # terminations existed both lists were empty and nothing could go wrong; they
 # are the new thing, so every arm operator now goes through here.
-PER_ARM = ("betas", "sticky", "steps", "fails")
-_PER_ARM_FILL = {"betas": None, "sticky": False, "steps": None, "fails": None}
+PER_ARM = ("betas", "sticky", "steps", "fails", "kerns")
+_PER_ARM_FILL = {"betas": None, "sticky": False, "steps": None, "fails": None,
+                 "kerns": None}
 
 
 def reindex(bank, order):
@@ -418,7 +433,7 @@ def reindex(bank, order):
 
 
 def insert_arm(bank, clause, law, pos, beta=None, sticky=False, steps=None,
-               fails=None):
+               fails=None, kerns=None):
     """Add an arm at `pos`, extending every per-arm list in step.
 
     An arm with `steps` is made sticky whether or not the caller said so: a
@@ -431,7 +446,7 @@ def insert_arm(bank, clause, law, pos, beta=None, sticky=False, steps=None,
     laws.insert(pos, law)
     out = dict(bank, clauses=cl, laws=laws)
     sticky = bool(sticky or steps)
-    given = dict(betas=beta, sticky=sticky, steps=steps, fails=fails)
+    given = dict(betas=beta, sticky=sticky, steps=steps, fails=fails, kerns=kerns)
     for k in PER_ARM:
         if bank.get(k) is not None or given[k] not in (None, False):
             v = list(bank.get(k) or [])
@@ -594,11 +609,17 @@ def emit(bank, names):
                    % (", ".join(names[j] for j in m["cols"]), conj(m["write"]),
                       ("   cleared when " + conj(m["clear"]))
                       if m.get("clear") else ""))
+    from . import kernlaw as KL
+    klab = lambda c, k: KL.label(KL.kern_of(bank, c, k), zn, bank.get("head"),
+                                 bank.get("actions"), bank.get("u_range"))
+    def with_k(text, c, k):
+        lab = klab(c, k)
+        return text + (" + " + lab if lab else "")
     def arm_text(c, guard):
-        acts = [law_label(bank["laws"][c], bank)]
-        for adv, th in (steps[c] or []):
+        acts = [with_k(law_label(bank["laws"][c], bank), c, 0)]
+        for i, (adv, th) in enumerate(steps[c] or []):
             acts[-1] += " until " + conj(adv)
-            acts.append(law_label(th, bank))
+            acts.append(with_k(law_label(th, bank), c, i + 1))
         # an arm whose guard is entirely its subtree's is that subtree's default
         body = ("Sequence[ %s , %s ]" % (conj(guard), " , ".join(acts)) if guard
                 else " , ".join(acts) + "          # subtree default")
@@ -608,8 +629,8 @@ def emit(bank, names):
         if fails[c]:
             body += "   fail: " + conj(fails[c])
         return body
-    default_text = (law_label(bank["default"], bank)
-                    .replace("Action(u = K x + b)", "Action(default)"))
+    default_text = with_k(law_label(bank["default"], bank)
+                          .replace("Action(u = K x + b)", "Action(default)"), -1, 0)
     # NESTED WHEN THE BANK HAS SUBTREES: contiguous children sharing literals
     # are printed as a Sequence over a Fallback of their own (`subtree.py`).
     # The flat bank is what runs; this is an exact rewrite of it.

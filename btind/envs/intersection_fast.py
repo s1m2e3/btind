@@ -26,6 +26,7 @@ or the signal, would have gained by acting differently.
 import numpy as np
 from numba import njit, prange
 
+from ..kernlaw import kern_args, law_out
 from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_args
 from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_STOP, STOP_ZONE,
@@ -126,7 +127,26 @@ def geometry(env):
 
 def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None, reward=None):
     """Roll both trees from the states `s`. `signal_bank` None = fixed plan.
-    `reward` "team" or "car" overrides the return the world would score."""
+    `reward` "team" or "car" overrides the return the world would score.
+
+    POPULATIONS. Either bank may be a LIST -- the partners a controller is
+    trained against. The episodes are split into consecutive blocks, one per
+    (vehicle, signal) pair, deterministically, so a paired test over two
+    candidates still compares each episode against the same partner.
+    """
+    if isinstance(vehicle_bank, list) or isinstance(signal_bank, list):
+        vbs = vehicle_bank if isinstance(vehicle_bank, list) else [vehicle_bank]
+        sbs = signal_bank if isinstance(signal_bank, list) else [signal_bank]
+        pairs = [(v, g) for v in vbs for g in sbs]
+        G = np.empty(len(s))
+        edges = np.linspace(0, len(s), len(pairs) + 1).round().astype(int)
+        for (v, g), a, b in zip(pairs, edges[:-1], edges[1:]):
+            if b <= a:
+                continue
+            tr = None if trace is None or trace.shape[0] != len(s) else trace[a:b]
+            dv = None if dev is None or dev.shape[0] != len(s) else dev[a:b]
+            G[a:b] = run(env, v, g, s[a:b], T, tr, dv, reward)
+        return G
     if vehicle_bank is None:
         vehicle_bank = env.default_vehicle_bank()
     fv = flatten(vehicle_bank, len(env.veh_names))
@@ -143,8 +163,20 @@ def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None, reward=None)
             no_trace() if trace is None else trace,
             no_dev() if dev is None else dev,
             *world_args(fv), *world_args(fs), use_sig,
-            tick_args(fv), tick_args(fs))
+            tick_args(fv), tick_args(fs), kern_args(fv), kern_args(fs))
     return G
+
+
+@njit(cache=True, inline="always")
+def _argmax_out(u, nA):
+    """The first action with the highest preference, as `_argmax_law` picks."""
+    best_a = 0
+    best_s = -1e18
+    for k in range(nA):
+        if u[k] > best_s:
+            best_s = u[k]
+            best_a = k
+    return best_a
 
 
 @njit(cache=True, inline="always")
@@ -192,7 +224,8 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             dirs, lane_group, to_edge, green, fixed_green, cps, appr, T, G,
             trace, dev,
             vlaws, vmem_cols, vw_col, vw_thr, vw_neg, vn_obs,
-            slaws, smem_cols, sw_col, sw_thr, sw_neg, sn_obs, use_sig, vt, st):
+            slaws, smem_cols, sw_col, sw_thr, sw_neg, sn_obs, use_sig, vt, st,
+            vk, sk):
     n = states.shape[0]
     N = int(p[0])
     dt = p[2]
@@ -216,6 +249,15 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
     tracing = trace.shape[0] == n
     deviating = dev.shape[0] == n
     T_run = duration if T <= 0 else min(T, duration)
+    # the largest anchor count of any law, for the kernel scratch buffers
+    kmax_v = 1
+    for l in range(vk[0].shape[0] - 1):
+        if vk[0][l + 1] - vk[0][l] > kmax_v:
+            kmax_v = vk[0][l + 1] - vk[0][l]
+    kmax_s = 1
+    for l in range(sk[0].shape[0] - 1):
+        if sk[0][l + 1] - sk[0][l] > kmax_s:
+            kmax_s = sk[0][l + 1] - sk[0][l]
 
     for i in prange(n):
         mv = np.empty(N, np.int64)
@@ -236,6 +278,9 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             told[q] = states[i, b + 12 + q]
             paid[q] = states[i, b + 12 + N + q]
         plan = states[i, b + 10]
+        fg = np.empty(N_PHASES)                  # this episode's fixed plan
+        for p4 in range(N_PHASES):
+            fg[p4] = states[i, b + 12 + 2 * N + p4]
         phase = int(states[i, b + 0])
         t_phase = states[i, b + 1]
         in_ar = states[i, b + 2] > 0.5
@@ -255,6 +300,10 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         sage = 0
         zv = np.zeros(dv)
         zs = np.zeros(ds)
+        uv = np.zeros(nAv)
+        us = np.zeros(nAs)
+        kvv = np.zeros(kmax_v)
+        kvs = np.zeros(kmax_s)
         act_v = np.zeros(N, np.int64)
         acc_v = np.zeros(N)
         has_lead = np.zeros(N, np.bool_)
@@ -329,7 +378,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     if event:
                         w_min, w_max = _t_window(m, phase, t_phase, in_ar, ar_t,
                                                  plan, sig_kind, green,
-                                                 fixed_green, dt)
+                                                 fg, dt)
                         zv[4] = w_min
                         zv[5] = w_max
                     else:
@@ -357,10 +406,10 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 zv[dv - 1] = 1.0
                 law, latch[q], step[q] = _tick(zv, latch[q], step[q],
                                                vt[0], vt[1], vt[2], vt[3], vt[4], vt[5], vt[6], vt[7], vt[8], vt[9], vt[10], vt[11], vt[12], vt[13], vt[14], vt[15], vt[16], vt[17], vt[18], vt[19], vt[20], vt[21], vt[22])
+                law_out(zv, law, vlaws, vk[0], vk[1], vk[2], vk[3], vk[4], vk[5],
+                        vk[6], vk[7], uv, kvv)
                 if vscalar:
-                    u = 0.0
-                    for k in range(dv):
-                        u += zv[k] * vlaws[law, k, 0]
+                    u = uv[0]
                     if deviating and ts == q and dev[i, 1] > 0.0 and t >= dev[i, 0] \
                             and t < dev[i, 0] + dev[i, 1]:
                         u = dev[i, 2]
@@ -371,7 +420,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     acc_v[q] = u
                     a = 0
                 else:
-                    a = _argmax_law(zv, vlaws, law, nAv)
+                    a = _argmax_out(uv, nAv)
                     if deviating and ts == q and dev[i, 1] > 0.0 and t >= dev[i, 0] \
                             and t < dev[i, 0] + dev[i, 1]:
                         a = int(dev[i, 2])
@@ -423,15 +472,16 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 zs[ds - 1] = 1.0
                 s_law, s_latch, s_step = _tick(zs, s_latch, s_step,
                                                st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15], st[16], st[17], st[18], st[19], st[20], st[21], st[22])
+                law_out(zs, s_law, slaws, sk[0], sk[1], sk[2], sk[3], sk[4], sk[5],
+                        sk[6], sk[7], us, kvs)
                 if sduration:
-                    for k in range(ds):
-                        dur += zs[k] * slaws[s_law, k, 0]
+                    dur = us[0]
                     a_sig = 0
                 else:
-                    a_sig = _argmax_law(zs, slaws, s_law, nAs)
+                    a_sig = _argmax_out(us, nAs)
             else:
                 zs[ds - 1] = 1.0
-                a_sig = 1 if t_phase >= fixed_green[phase] else 0
+                a_sig = 1 if t_phase >= fg[phase] else 0
             if deviating and ts == -1 and dev[i, 1] > 0.0 and t >= dev[i, 0] \
                     and t < dev[i, 0] + dev[i, 1]:
                 if sduration and use_sig:
@@ -514,6 +564,9 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             # ---- kinematics, red running ----------------------------------------
             n_ran = 0
             green_sum = 0.0
+            # the traced car's OWN reward under the per-car reward, for the
+            # trace (a per-car value function needs it; G is unchanged)
+            r_me = 0.0
             for q in range(N):
                 if status[q] != 1.0 or fresh[q]:
                     continue                     # spawned this tick: not driven yet
@@ -530,8 +583,12 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 if before < s_stop[m] and s[q] >= s_stop[m]:
                     if gm:
                         green_sum += v[q] / V0
+                        if q == ts:
+                            r_me += R_GREEN * v[q] / V0
                     else:
                         n_ran += 1
+                        if q == ts:
+                            r_me -= R_RED_CAR
             r -= (R_RED_CAR if car_r else R_RED) * n_ran
             if car_r:
                 r += R_GREEN * green_sum
@@ -587,6 +644,8 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     sp_sum[a4] += vf
                     sp_cnt[a4] += 1.0
                     delay += 1.0 - vf
+                    if q == ts:
+                        r_me -= W_CAR_DELAY * (1.0 - vf) * dt
                     if v[q] < QUEUE_V:
                         d_q = s_stop[m] - s[q]
                         red_q = in_ar or (not green[phase, m])
@@ -595,17 +654,23 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                                                or red_ok)
                         if not legit:
                             n_stuck += 1
+                            if q == ts:
+                                r_me -= W_STUCK_CAR * dt
                         if d_q > 0.0:
                             q_wait[a4] += 1.0
                         if car_r and red_q and d_q > 0.0 and d_q <= STOP_ZONE \
                                 and paid[q] < 0.5:
                             paid[q] = 1.0
                             n_stop += 1
+                            if q == ts:
+                                r_me += R_STOP
                 elif status[q] == 0.0 and dep[q] <= time_now:
                     a4 = appr[mv[q]]
                     sp_cnt[a4] += 1.0
                     delay += 1.0
                     q_wait[a4] += 1.0
+                    if q == ts:
+                        r_me -= W_CAR_DELAY * dt
             ms = 0.0
             na = 0.0
             for a4 in range(4):
@@ -651,6 +716,8 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     status[q] = 2.0
                     v[q] = 0.0
                     n_hit += 1
+                    if q == ts:
+                        r_me -= R_COLL
             r -= R_COLL * (n_hit if car_r else (n_rear + n_cross))
 
             # ---- exits ------------------------------------------------------------
@@ -659,6 +726,8 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 if status[q] == 1.0 and s[q] >= s_exit[mv[q]]:
                     status[q] = 2.0
                     n_out += 1
+                    if q == ts:
+                        r_me += R_EXIT
             r += R_EXIT * n_out
 
             if t + 1 >= duration:
@@ -666,11 +735,15 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 for q in range(N):
                     if status[q] == 1.0 or (status[q] == 0.0 and dep[q] <= time_now):
                         n_left += 1
+                        if q == ts:
+                            r_me -= R_LEFT
                 r -= R_LEFT * n_left
 
             if tracing and t < trace.shape[1]:
-                # the tick's reward, in the slot the trace leaves free
-                trace[i, t, (dv if ts >= 0 else ds) + 2] = r
+                # the tick's reward, in the slot the trace leaves free: the
+                # traced car's own under the per-car reward, else the team's
+                trace[i, t, (dv if ts >= 0 else ds) + 2] = (r_me if (car_r and ts >= 0)
+                                                            else r)
             g += disc * r
             disc *= gamma
         G[i] = g

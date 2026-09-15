@@ -84,7 +84,20 @@ def bank_json(bank, names=None, bt=None):
         steps=_jsonable(bank.get("steps")), fails=_jsonable(bank.get("fails")),
         head=bank.get("head"), actions=bank.get("actions"),
         u_range=bank.get("u_range"),
+        kerns=_kerns_json(bank.get("kerns")),
+        kern_default=_kern_json(bank.get("kern_default")),
         names=list(names) if names is not None else None, bt=bt)
+
+
+def _kern_json(k):
+    from .kernlaw import to_json
+    return to_json(k)
+
+
+def _kerns_json(ks):
+    if ks is None:
+        return None
+    return [None if s is None else [_kern_json(k) for k in s] for s in ks]
 
 
 def bank_from_json(d):
@@ -102,6 +115,12 @@ def bank_from_json(d):
     for k in ("head", "actions", "u_range"):
         if d.get(k) is not None:
             out[k] = tuple(d[k]) if k == "u_range" else d[k]
+    from .kernlaw import from_json
+    if d.get("kerns") is not None:
+        out["kerns"] = [None if s is None else [from_json(k) for k in s]
+                        for s in d["kerns"]]
+    if d.get("kern_default") is not None:
+        out["kern_default"] = from_json(d["kern_default"])
     return out
 
 

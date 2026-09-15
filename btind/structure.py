@@ -105,6 +105,9 @@ def fast_rollout(env, bank, s, T, trace=None, dev=None):
     from .tick import flatten, no_dev, no_trace, tick_args, world_args
     params, rollout = k
     f = flatten(bank, len(bank["names"]))
+    # only the intersection kernel evaluates kernel laws; anywhere else a
+    # kernel would be silently ignored, so refuse
+    assert not f["has_kern"], "kernel laws run on the intersection kernel only"
     G = np.empty(len(s))
     rollout(np.ascontiguousarray(s), params(env), *world_args(f), T, G,
             no_trace() if trace is None else trace,
@@ -171,6 +174,18 @@ def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
     se = max(d.std() / np.sqrt(len(d)), 1e-12)
     ok = (d.mean() > z * se if side == "gain"
           else (d.mean() > -margin and d.mean() > -z * se))
+    # NO CONDITION MAY PAY FOR ANOTHER. On a world with a condition
+    # distribution an average gain can hide a significant loss in light or in
+    # heavy traffic; a move is rejected if any demand group loses by more than
+    # z standard errors of that group.
+    groups = (env.condition_groups(starts(env, n_ep, seed))
+              if ok and hasattr(env, "condition_groups") else None)
+    if groups is not None:
+        for gi in np.unique(groups):
+            dg = d[groups == gi]
+            if len(dg) > 5 and dg.mean() < -z * max(dg.std() / np.sqrt(len(dg)), 1e-12):
+                ok = False
+                break
     return bool(ok), float(d.mean()), g
 
 
@@ -294,6 +309,12 @@ def coverage(clause, Z):
     return float(_match_cols(clause, Z).mean())
 
 
+def _kern0(bank, c):
+    """Arm c's step-0 kernel, which goes with its law when it becomes the default."""
+    from .kernlaw import kern_of
+    return kern_of(bank, c, 0)
+
+
 def absorb_universal(env, bank, pol_fn, Z, cur_G=None, n_ep=600, T=400,
                      seed=777, z=2.0, max_cover=0.98, names=None, verbose=True):
     """An arm that matches everything IS the default. Say so, and reclaim the tail.
@@ -316,7 +337,8 @@ def absorb_universal(env, bank, pol_fn, Z, cur_G=None, n_ep=600, T=400,
     for c in range(len(bank["clauses"])):
         if coverage(bank["clauses"][c], Z) < max_cover:
             continue
-        cand = dict(reindex(bank, list(range(c))), default=bank["laws"][c])
+        cand = dict(reindex(bank, list(range(c))), default=bank["laws"][c],
+                    kern_default=_kern0(bank, c))
         # NON-INFERIORITY, because this is an equivalence move: the arm's law
         # becomes the default's law and only unreachable arms are removed, so
         # the honest expected delta is exactly 0.00 -- which a gain test rejects.
@@ -356,7 +378,8 @@ def collapse_bottom(env, bank, pol_fn, cur_G=None, n_ep=600, T=400, seed=777,
         return bank, cur_G, False
     cur = (score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G)
     c = C - 1
-    cand = dict(reindex(bank, list(range(c))), default=bank["laws"][c])
+    cand = dict(reindex(bank, list(range(c))), default=bank["laws"][c],
+                kern_default=_kern0(bank, c))
     ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed, z,
                       side="noninferior", margin=margin)
     if verbose:

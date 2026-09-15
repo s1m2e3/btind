@@ -292,10 +292,10 @@ def refine_guard(env, bank, arm, zn, pol_fn_for, Z, offered, n_thr=7, n_try=48,
         """This arm moved to `pos`, with `lit` conjoined onto its guard."""
         g = [l[:] for l in bank["clauses"][arm]] + ([list(lit)] if lit else [])
         per = {k: (bank.get(k) or [None] * n_arm)[arm]
-               for k in ("betas", "sticky", "steps", "fails")}
+               for k in ("betas", "sticky", "steps", "fails", "kerns")}
         return insert_arm(drop(), g, bank["laws"][arm], pos, beta=per["betas"],
                           sticky=bool(per["sticky"]), steps=per["steps"],
-                          fails=per["fails"])
+                          fails=per["fails"], kerns=per["kerns"])
 
     pol = pol_fn_for(zn)
     # THE REFERENCE IS THE TREE WITHOUT THE ARM, not the tree with its

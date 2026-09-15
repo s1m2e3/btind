@@ -1,0 +1,276 @@
+r"""A value function and a critic for the intersection, learned from the tree's own
+rollouts -- the intersection's counterpart of `vhat.py` and `critic.py`.
+
+TWO ESTIMATORS, each scored on held-out data before anything uses it:
+
+    V-hat(z)        the return-to-go of the agent under search -- for a vehicle
+                    its OWN per-car return (the trace carries it), for the signal
+                    the team return. Fitted value iteration on n-step
+                    bootstrapped targets over the policy's trajectories, exactly
+                    `vhat.fit_vhat_buffer`, on Monte-Carlo targets by default. Scored against the Monte-Carlo
+                    return-to-go of trajectories from episodes it never saw.
+
+    A-hat(z, a, k)  the advantage of taking action a (a level, for a continuous
+                    leaf) for k ticks from state z, then following the tree. The
+                    TARGETS ARE EXACT: `explore.deviations` pairs each episode
+                    with the same episode deviated, so every training row is a
+                    measured counterfactual, not a TD estimate. What the fit adds
+                    is GENERALISATION -- a few thousand deviations become a
+                    prediction at every state the tree visits. V-hat(z) is one of
+                    its inputs: how much an action matters depends on how much is
+                    at stake. Scored on held-out deviations by rank correlation
+                    and by how often it gets the sign of a large advantage right.
+
+WHAT THE CRITIC IS FOR, and what it is not. The forage world's action-quadratic
+critic reached cos ~0.2 against a reference gradient field, and its docstring
+records that it was at chance on NestWorld, so here the critic PROPOSES and the
+rollout DISPOSES: its proposals -- inducing points at states where it predicts
+an action beats what the leaf does, with that action as the target -- go through
+the same paired test as the deviations' own proposals (`kernsearch.py`). A bad
+critic costs screening time, never a wrong tree.
+
+ELAPSED TIME IS AN INPUT TO BOTH, AND TO NOTHING ELSE. Episodes are truncated,
+so a return-to-go depends on how much episode is left, which the trees are
+deliberately not shown (`t_norm` is de-phased). An estimator that cannot see it
+predicts a blend of early and late states: measured, the signal's V-hat scored
+R^2 -2.62 without it. The estimators are learning aids and never run in the
+tree, so giving them the clock leaks nothing into the controller.
+
+HOW THEY ARE SCORED. R^2, and the rank correlation, on held-out episodes. For a
+car the rank is the number to read: a car's return is heavy-tailed (a few
+percent of trajectories end in a -200 crash) and R^2 is dominated by those
+tails, while what a proposal needs is which states are better than which.
+
+WHY NOT A CRITIC IN THE COMPILED LOOP. Guards and laws run inside numba per car
+per tick; a boosted model cannot. V-hat is therefore not offered as a guard
+column here (it is on the Python-path worlds); it informs proposals instead.
+"""
+import time
+
+import numpy as np
+
+from . import explore as EX
+from .memory import mem_names
+from .tick import trace_array
+from .vhat import TrajBuffer, ValueHat, fit_vhat_buffer, mc_return_to_go
+
+
+def record(env, bank, n_ep=60, seed=3, max_slots=None):
+    """Trajectories of the agent under search from kernel traces:
+    OB (n, T, n_obs), RW (n, T) its own reward, AL (n, T), LAW (n, T) flat law."""
+    from .envs import intersection_fast as IF
+    rng = np.random.default_rng(seed)
+    s = env.sample_starts(n_ep, rng)
+    T = env.duration
+    vb = bank if env.agent == "vehicle" else (env.vehicle_bank or env.default_vehicle_bank())
+    sb = env.signal_bank if env.agent == "vehicle" else bank
+    d = len(mem_names(bank["names"], bank.get("mem"))) + 1
+    n_obs = len(env.names)
+    OB, RW, AL, LAW = [], [], [], []
+    if env.agent == "vehicle":
+        # only slots some episode actually fills: an unscheduled slot is a
+        # rollout that records nothing
+        dep = s[:, 4 * env.N:5 * env.N]
+        who = [q for q in range(env.N) if np.isfinite(dep[:, q]).mean() > 0.3]
+    else:
+        who = [-1]
+    if max_slots is not None and len(who) > max_slots:
+        who = sorted(rng.choice(who, max_slots, replace=False))
+    for q in who:
+        dev = np.zeros((n_ep, 4))
+        dev[:, 3] = q
+        tr = trace_array(n_ep, T, d)
+        IF.run(env, vb, sb, s, T, trace=tr, dev=dev)
+        alive = tr[:, :, d - 1] > 0.5
+        for i in np.flatnonzero(alive.any(1)):
+            OB.append(tr[i, :, :n_obs])
+            RW.append(tr[i, :, d + 2] * alive[i])
+            AL.append(alive[i])
+            LAW.append(tr[i, :, d].astype(int))
+    return (np.array(OB, np.float32), np.array(RW, np.float32), np.array(AL),
+            np.array(LAW))
+
+
+def with_time(OB, T):
+    """OB (n, T, d) -> (n, T, d + 1) with elapsed fraction t / T appended."""
+    tt = np.broadcast_to((np.arange(OB.shape[1]) / T).astype(OB.dtype), OB.shape[:2])
+    return np.concatenate([OB, tt[..., None]], 2)
+
+
+def _r2(y, p):
+    return float(1.0 - ((y - p) ** 2).sum() / max(((y - y.mean()) ** 2).sum(), 1e-12))
+
+
+def fit_value(env, bank, n_ep=150, seed=3, n_step=None, sweeps=1, max_slots=32,
+              verbose=True):
+    """V-hat by fitted value iteration; R^2 on held-out episodes. (vhat, report)
+
+    A ROBUST LOSS, because a car's return is heavy-tailed: 4.6% of trajectories
+    at medium demand end in a -200 crash, and with squared loss the trees
+    memorised those few trajectories' states -- held-out R^2 -1.69 against
+    +0.05 for the same trees with a Huber loss on the Monte-Carlo target.
+    """
+    from scipy.stats import spearmanr
+    t0 = time.time()
+    # MONTE-CARLO TARGETS BY DEFAULT (n_step = the episode). Episodes here are
+    # short and finite, and bootstrapping 20 ticks at a time compounded the
+    # estimator's own bias: the signal's V-hat ranked held-out returns at -0.09
+    # bootstrapped against 0.45 on the full return.
+    n_step = env.duration if n_step is None else n_step
+    OB, RW, AL, _ = record(env, bank, n_ep, seed, max_slots)
+    G0 = mc_return_to_go(RW, AL, env.gamma)[AL]
+    # the Huber knee at the spread of the returns, so a car (spread ~5) and the
+    # signal (spread ~100) are both fitted robustly; a fixed knee of 5 left the
+    # signal's fit a constant
+    slope = max(1.0, 1.5 * float(np.median(np.abs(G0 - np.median(G0)))))
+    vh = _fvi_huber(with_time(OB, env.duration), RW, AL, env.gamma, n_step, sweeps,
+                    seed, slope)
+    OBh, RWh, ALh, _ = record(env, bank, max(20, n_ep // 3), seed + 1000, max_slots)
+    G = mc_return_to_go(RWh, ALh, env.gamma)
+    Xh = with_time(OBh, env.duration)
+    X, y = Xh.reshape(-1, Xh.shape[2])[ALh.reshape(-1)], G.reshape(-1)[ALh.reshape(-1)]
+    p = vh.predict(X)
+    rep = dict(r2=_r2(y, p), spearman=float(spearmanr(p, y).correlation),
+               n_rows=int(AL.sum()), n_test=int(len(y)), secs=time.time() - t0)
+    if verbose:
+        print("    V-hat: R2 %.2f, rank corr %.2f on %d held-out states (%d training) [%.0fs]"
+              % (rep["r2"], rep["spearman"], rep["n_test"], rep["n_rows"], rep["secs"]),
+              flush=True)
+    return vh, rep
+
+
+def _fvi_huber(OB, RW, AL, gamma, n_step, sweeps, seed, slope=5.0, max_rows=200000):
+    from xgboost import XGBRegressor
+    from .vhat import _chunk_target
+    rng = np.random.default_rng(seed)
+    vh = None
+    for _ in range(sweeps):
+        X, y, live = _chunk_target(OB, RW, AL, gamma, n_step, vh)
+        X, y = X[live], y[live]
+        if len(X) > max_rows:
+            k = rng.choice(len(X), max_rows, replace=False)
+            X, y = X[k], y[k]
+        m = XGBRegressor(n_estimators=200, max_depth=4, learning_rate=0.08, verbosity=0,
+                         objective="reg:pseudohubererror", huber_slope=slope,
+                         base_score=float(np.median(y)))
+        m.fit(X, y)
+        vh = ValueHat(m)
+    return vh
+
+
+class AdvHat:
+    """A-hat(z, t, a, k): boosted trees on [obs, t/T, V-hat, action code, k]."""
+
+    def __init__(self, model, vh, n_obs, head, levels, T):
+        self.m, self.vh, self.n_obs, self.head, self.levels = model, vh, n_obs, head, levels
+        self.T = T
+
+    def _x(self, Z, t, a, k):
+        Z = np.asarray(Z, float)[:, :self.n_obs]
+        tt = np.broadcast_to(np.asarray(t, float) / self.T, (len(Z),)).reshape(-1, 1)
+        Z = np.hstack([Z, tt])
+        v = self.vh.predict(Z)[:, None] if self.vh is not None else np.zeros((len(Z), 1))
+        if self.head == "argmax":
+            code = np.zeros((len(Z), len(self.levels)))
+            code[np.arange(len(Z)), np.asarray(a, int)] = 1.0
+        else:
+            code = np.asarray(a, float).reshape(-1, 1)
+        kk = np.broadcast_to(np.asarray(k, float), (len(Z),)).reshape(-1, 1)
+        return np.hstack([Z, v, code, kk]).astype(np.float32)
+
+    def predict(self, Z, t, a, k):
+        return np.asarray(self.m.predict(self._x(Z, t, a, k)), float)
+
+    def table(self, Z, t, k):
+        """(n, n_levels): the predicted advantage of every action (or level)."""
+        return np.stack([self.predict(Z, t, np.full(len(Z), j if self.head == "argmax"
+                                                    else lv), k)
+                         for j, lv in enumerate(self.levels)], 1)
+
+
+def fit_advantage(env, bank, vh=None, n_dev=3000, seed=17, ks=(3, 8), verbose=True):
+    """A-hat on exact deviation advantages; scored on held-out deviations."""
+    from xgboost import XGBRegressor
+    t0 = time.time()
+    rng = np.random.default_rng(seed)
+    head = bank.get("head")
+    ex = EX.deviations(env, bank, n_ep=n_dev, T=env.duration, seed=seed, rng=rng, ks=ks)
+    n_obs = len(env.names)
+    if head == "argmax":
+        levels = list(range(len(bank.get("actions") or [])))
+        a = ex["a"][:, 0].astype(int)
+    else:
+        lo, hi = bank.get("u_range") or env.u_range
+        levels = list(np.linspace(lo, hi, 9))
+        a = ex["a"][:, 0]
+    ah = AdvHat(None, vh, n_obs, head, levels, env.duration)
+    X = ah._x(ex["z0"], ex["t0"], a, ex["k"])
+    y = ex["adv"]
+    idx = rng.permutation(len(y))
+    n_tr = int(0.8 * len(y))
+    tr, te = idx[:n_tr], idx[n_tr:]
+    m = XGBRegressor(n_estimators=300, max_depth=5, learning_rate=0.05, subsample=0.8,
+                     verbosity=0)
+    m.fit(X[tr], y[tr])
+    p = m.predict(X[te])
+    from scipy.stats import spearmanr
+    big = np.abs(y[te]) >= np.quantile(np.abs(y[te]), 0.75)
+    rep = dict(spearman=float(spearmanr(p, y[te]).correlation) if len(te) > 2 else 0.0,
+               sign_big=float((np.sign(p[big]) == np.sign(y[te][big])).mean())
+               if big.any() else 0.0,
+               n_train=int(n_tr), n_test=int(len(te)), secs=time.time() - t0)
+    m.fit(X, y)                                   # the deployed model sees every row
+    ah.m = m
+    if verbose:
+        print("    A-hat: rank corr %.2f, sign of large advantages %.0f%% on %d held-out "
+              "deviations (%d training) [%.0fs]"
+              % (rep["spearman"], 100 * rep["sign_big"], rep["n_test"], rep["n_train"],
+                 rep["secs"]), flush=True)
+    return ah, rep
+
+
+def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0.5,
+                verbose=True):
+    """Fit V-hat and A-hat on `bank`, and return the proposal function
+    `kernsearch.search_kernels(critic=...)` calls, with both reports."""
+    from . import kernlaw as KL
+    from .collect import design_matrix
+    from .kernsearch import _theta, flat_laws
+    vh, vrep = fit_value(env, bank, n_ep=n_ep, seed=seed, verbose=verbose)
+    ah, arep = fit_advantage(env, bank, vh, n_dev=n_dev, seed=seed + 1, verbose=verbose)
+    OB, _, AL, LAW = record(env, bank, n_ep=max(20, n_ep // 3), seed=seed + 2,
+                            max_slots=32)
+    Zon = OB.reshape(-1, OB.shape[2])[AL.reshape(-1)]
+    Ton = np.broadcast_to(np.arange(OB.shape[1]), AL.shape).reshape(-1)[AL.reshape(-1)]
+    Lon = LAW.reshape(-1)[AL.reshape(-1)]
+
+    def critic(b, c, kk, kern, head):
+        L = flat_laws(b).index((c, kk))
+        rows = np.flatnonzero(Lon == L)
+        if not len(rows):
+            return []
+        rows = rows[np.random.default_rng(seed).permutation(len(rows))[:4000]]
+        Z = Zon[rows]
+        tab = ah.table(Z, Ton[rows], k)              # (n, levels)
+        best = tab.max(1)
+        th = _theta(b, c, kk)
+        out = []
+        for i in np.argsort(-best):
+            if best[i] < min_adv or len(out) >= top:
+                break
+            x = Z[i, kern["cols"]]
+            if any((np.abs(o[0] - x) / kern["ls"]).sum() < 0.5 for o in out):
+                continue
+            zi = np.hstack([Z[i], np.zeros(len(th) - 1 - Z.shape[1])])[None]
+            u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(zi))[0]
+            j = int(np.argmax(tab[i]))
+            if head == "argmax":
+                y = u0.copy()
+                y[j] = u0.max() + 1.0 + 0.25 * (u0.max() - u0.min())
+                out.append((x, y, float(best[i])))
+            else:
+                for f in (1.0, 0.5):
+                    out.append((x, np.array([u0[0] + f * (ah.levels[j] - u0[0])]),
+                                float(best[i])))
+        return out
+    return critic, dict(value=vrep, advantage=arep)

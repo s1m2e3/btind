@@ -46,6 +46,8 @@ DEFAULTS = dict(
     mem_at=1, mem_thr=7, mem_refine=3, beta_at=2, steps_at=2, n_cover=6000,
     subtree_at=(1, 2), subtree_arms=2, subtree_pool=30,
     explore_ep=300, explore_ks=(1, 3, 8), explore_frac=0.25,
+    # kernel-interpolation leaves (`kernsearch.py`): rounds, and its settings
+    kern_at=(), kern_cfg=None, critic=False,
     stall_before_kick=2, kick_size=1, hop_budget=2,
     seed_stride=1009, val_seed=90210, val_ep=1200,
 )
@@ -63,7 +65,7 @@ def _cover(env, n, rng):
 
 
 def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
-        tag="rlfit", run_seed=None, branch=None, transfer_from=None):
+        tag="rlfit", run_seed=None, branch=None, transfer_from=None, init_bank=None):
     """One run. `run_seed` varies the PROPOSALS, never the evaluation.
 
     The rollout seed stays fixed so every candidate in a run is compared on
@@ -94,7 +96,12 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
     # population to start; None means occasionally take a lower-ranked bank.
     if branch is None:
         branch = int(rng.integers(0, 3)) if rng.random() < 0.35 else 0
-    bank, meta = (ST.best(env, rank=branch) if warm else (None, None))
+    # AN EXPLICIT START WINS: a stage cycle resumes each agent from the bank it
+    # left, not from the best stored score -- scores stored in earlier cycles
+    # were measured against partners that no longer exist
+    bank, meta = ((init_bank, dict(G=float("nan"), tag="init_bank"))
+                  if init_bank is not None else
+                  (ST.best(env, rank=branch) if warm else (None, None)))
     if bank is None and transfer_from is not None:
         bank, meta = ST.transfer(transfer_from, env)
         if bank is not None and verbose:
@@ -316,6 +323,34 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                             names=zn, verbose=verbose)
         if any(x["accepted"] for x in plog):
             rec["moves"].append("thresholds")
+
+        # --- kernel-interpolation leaves: inducing points on the busiest laws --
+        # Anchored where deviations paid, columns chosen by rollout, tuned by
+        # CEM and pruned (`kernsearch.py`). After the affine laws and thresholds
+        # have settled, because a point refines the law it sits on.
+        if r in cfg["kern_at"]:
+            from .kernsearch import search_kernels
+            from . import kernlaw as KL
+            zn = mem_names(names, bank.get("mem"))
+            n_before = sum(KL.n_points(k) for k in [bank.get("kern_default")] + [
+                x for s_ in (bank.get("kerns") or []) for x in (s_ or [])])
+            # THE CRITIC IS REFITTED ON THE BANK IT ADVISES: V-hat and A-hat
+            # of this round's tree (`intersection_critic.py`), reported on
+            # held-out data, proposing points beside the deviations
+            critic = None
+            if cfg.get("critic") and hasattr(env, "coverage_rows"):
+                from .intersection_critic import make_critic
+                critic, crep = make_critic(env, bank, seed=rseed, verbose=verbose)
+                rec["critic"] = crep
+            bank, cur, klog = search_kernels(
+                env, bank, names, zn, pol_fn, cur, cfg["T"], rseed, z=cfg["z"],
+                min_gain=cfg["min_gain"], n_ep=cfg["n_ep"], rng=rng,
+                verbose=verbose, critic=critic,
+                **(cfg["kern_cfg"] or {}))
+            n_after = sum(KL.n_points(k) for k in [bank.get("kern_default")] + [
+                x for s_ in (bank.get("kerns") or []) for x in (s_ or [])])
+            if any(e.get("accepted") and e["op"] != "add" for e in klog) or n_after != n_before:
+                rec["moves"].append("kernels")
 
         # THE MEMORY STAGE IS NOT READY FOR A DISCRETE HEAD, and it says so
         # rather than producing a shaped-wrong law and a silent wrong answer.

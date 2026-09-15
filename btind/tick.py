@@ -76,7 +76,7 @@ def _drop_stale_kernel_caches():
     """
     here = os.path.dirname(os.path.abspath(__file__))
     envs = os.path.join(here, "envs")
-    watched = [__file__] + [os.path.join(envs, n) for n in
+    watched = [__file__, os.path.join(here, "kernlaw.py")] + [os.path.join(envs, n) for n in
                             ("highway_batch.py", "nest_kernels.py",
                              "intersection.py")]
     newest = max(os.path.getmtime(p) for p in watched if os.path.exists(p))
@@ -138,24 +138,31 @@ def flatten(bank, n_obs):
     b_col, b_thr, b_neg, b_start, b_len = _lits(betas)
     f_col, f_thr, f_neg, f_start, f_len = _lits(fails)
 
-    laws, adv, law_start, n_steps = [], [], [], []
+    from . import kernlaw as KL
+    laws, adv, law_start, n_steps, kerns = [], [], [], [], []
     for c in range(C):
         law_start.append(len(laws))
         laws.append(np.asarray(bank["laws"][c], float))
+        kerns.append(KL.kern_of(bank, c, 0))
         adv.append(None)
-        for cl, th in (steps[c] or []):
+        for k, (cl, th) in enumerate(steps[c] or []):
             adv.append(cl)
             laws.append(np.asarray(th, float))
+            kerns.append(KL.kern_of(bank, c, k + 1))
         n_steps.append(1 + len(steps[c] or []))
     law_start.append(len(laws))
     laws.append(np.asarray(bank["default"], float))
+    kerns.append(KL.kern_of(bank, -1, 0))
     if not adv:
         adv = [None]
     a_col, a_thr, a_neg, a_start, a_len = _lits(adv)
 
     m = bank.get("mem")
     w_col, w_thr, w_neg, _, _ = _lits([(m or {}).get("write") or []])
+    kp = KL.pack(kerns, laws[0].shape[1])
+    kp["has_kern"] = any(KL.n_points(k) for k in kerns)
     return dict(
+        **kp,
         lit_col=lit_col, lit_thr=lit_thr, lit_neg=lit_neg, cl_start=cl_start,
         cl_len=cl_len,
         b_col=b_col, b_thr=b_thr, b_neg=b_neg, b_start=b_start, b_len=b_len,
