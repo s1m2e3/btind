@@ -161,19 +161,34 @@ def lopsided_starts(n, seed):
     return np.array(out)
 
 
+_HAND = {}                      # the follower's row, which never changes
+
+
 def behaviour(vb, n_ep=60, seed=321):
     """What the vehicle tree does on the target distribution, against the
-    hand-written follower: crashes, red runs, stuck time, comfort, exits."""
+    hand-written follower: crashes, red runs, stuck time, comfort, exits.
+
+    THE COMPARISON ROW IS COMPUTED ONCE. This is the only measurement left on
+    the Python rollout -- the kernel does not fill `env.terms`, which is the
+    whole point of the table -- and it costs about 50 s a call, so rolling the
+    follower again every round to reprint the same five numbers was half the
+    diagnostic's cost for no information.
+    """
     env = world(WIDE, "vehicle")
     s = env.sample_starts(n_ep, np.random.default_rng(seed))
     out = {}
-    for name, b in (("discovered", vb), ("hand-written", env.default_vehicle_bank())):
+    key = (n_ep, seed)
+    todo = [("discovered", vb)]
+    if key not in _HAND:
+        todo.append(("hand-written", env.default_vehicle_bank()))
+    for name, b in todo:
         env.terms = {}
         env.python_rollout(b, None, s)
         t = {k: float(np.mean(v)) for k, v in env.terms.items()}
         out[name] = dict(crashes=t["crash"] / -200.0, red_runs=t["red"] / -50.0,
                          stuck_s=-t["stuck"] / 3.0, comfort=-t.get("comfort", 0.0),
                          exits=t["exit"])
+    out["hand-written"] = _HAND.setdefault(key, out.get("hand-written"))
     print("\n   per episode (%d, target distribution, fixed plan):" % n_ep)
     print("   %-14s %8s %9s %9s %9s %7s" % ("", "crashes", "red runs", "stuck s", "comfort", "exits"))
     for name, r in out.items():
@@ -190,12 +205,17 @@ def evaluate(vb, sb, n_ep=400, seed=999):
             .sample_starts(n_ep, np.random.default_rng(seed)),
             "lopsided": lopsided_starts(n_ep, seed)}
     rows = {}
+    act = actuated(tgt)
     for name, s in sets.items():
-        G = lambda v, g: IF.run(tgt, v, g, s, tgt.duration, reward="team").mean()
-        rows[name] = dict(discovered=G(vb, sb), discovered_veh_fixed=G(vb, None),
-                          hand_fixed=G(hand, None), hand_actuated=G(hand, actuated(tgt)))
-    g_tr = IF.run(tgt, vb, sb, sets["train"], tgt.duration, reward="team")
-    rows["train"]["se"] = float(g_tr.std() / np.sqrt(len(g_tr)))
+        R = lambda v, g: IF.run(tgt, v, g, s, tgt.duration, reward="team")
+        # the discovered pair's episodes are KEPT, not re-rolled for their
+        # spread: the rollout is deterministic in `s`, so the second identical
+        # call this used to make was a thirteenth of the evaluation for nothing
+        g = R(vb, sb)
+        rows[name] = dict(discovered=g.mean(), discovered_veh_fixed=R(vb, None).mean(),
+                          hand_fixed=R(hand, None).mean(), hand_actuated=R(hand, act).mean())
+        if name == "train":
+            rows[name]["se"] = float(g.std() / np.sqrt(len(g)))
     print("\n%-10s %12s %14s %12s %14s" % ("episodes", "discovered", "disc. veh +", "hand +",
                                             "hand +"))
     print("%-10s %12s %14s %12s %14s" % ("", "pair", "fixed plan", "fixed plan", "actuated"))

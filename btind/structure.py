@@ -99,6 +99,10 @@ def fast_rollout(env, bank, s, T, trace=None, dev=None):
         # TWO TREES: the bank being scored is whichever agent the world says is
         # under search; the other is held fixed on the world object.
         from .envs import intersection_fast as IF
+        # The objective is NOT named here: `reward=None` lets the kernel read
+        # `env.reward_mode`, which is where `reward_as` puts the objective a
+        # joint round accepts on. Naming it here too would be a second place
+        # for the two paths to disagree.
         if env.agent == "signal":
             return IF.run(env, env.vehicle_bank, bank, s, T, trace, dev)
         return IF.run(env, bank, env.signal_bank, s, T, trace, dev)

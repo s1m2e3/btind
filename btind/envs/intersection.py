@@ -524,15 +524,46 @@ class IntersectionBatch:
         return np.searchsorted(cuts, cars, side="right")
 
     _reward_override = None
+    # THE OBJECTIVE A CANDIDATE IS PRICED ON, when it differs from the one the
+    # agent's own proposals are generated from: joint training accepts every
+    # move -- a car's and the signal's -- on the TEAM return, so the two agents'
+    # gains are the same quantity, while the vehicle's deviations and critic
+    # keep the per-car return, where credit assignment lives.
+    score_reward = None
+
+    def reward_as(self, mode):
+        """Context manager: price rollouts on `mode` ("car"/"team"/None) here."""
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            was = self.score_reward
+            self.score_reward = mode
+            try:
+                yield self
+            finally:
+                self.score_reward = was
+        return _cm()
 
     @property
-    def reward_mode(self):
-        """The return the agent under search is scored on: the per-car reward
-        for the vehicle tree when `veh_reward` is "car", the team score
+    def own_reward(self):
+        """The return the agent under search is RESPONSIBLE for: the per-car
+        reward for the vehicle tree when `veh_reward` is "car", the team score
         otherwise. A reference run can name either (`reward=`)."""
         if self._reward_override is not None:
             return self._reward_override
         return "car" if (self.agent == "vehicle" and self.veh_reward == "car") else "team"
+
+    @property
+    def reward_mode(self):
+        """The return a rollout is PRICED on here. Its own, unless a round has
+        named another with `reward_as` -- joint training accepts both agents'
+        moves on the team return. One property, so the kernel (which reads it
+        when no explicit `reward=` is given) and the Python fallback in
+        `structure.score` cannot disagree about which objective is in force."""
+        if self._reward_override is not None:
+            return self._reward_override
+        return self.score_reward or self.own_reward
 
     _sig_kind_override = None
 

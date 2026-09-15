@@ -80,6 +80,13 @@ from .structure import accept, score
 from .tick import n_steps_of
 
 
+def _own_reward(env):
+    """Measure inside this block on the agent's own reward, not the objective
+    the round is accepting on."""
+    from contextlib import nullcontext
+    return env.reward_as(None) if hasattr(env, "reward_as") else nullcontext()
+
+
 def flat_laws(bank):
     """(arm, step) per flat law index, in `tick.flatten` order; default last."""
     out = []
@@ -413,8 +420,12 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
     rng = rng or np.random.default_rng(seed)
     head = bank.get("head")
     t0 = time.time()
-    ex = EX.deviations(env, bank, n_ep=cfg["dev_ep"], T=T, seed=seed + 5, rng=rng,
-                       ks=cfg["ks"])
+    # THE PROPOSALS COME FROM THE AGENT'S OWN RETURN even when acceptance is on
+    # another: an exact counterfactual is only informative if it is measured in
+    # the units the agent is responsible for
+    with _own_reward(env):
+        ex = EX.deviations(env, bank, n_ep=cfg["dev_ep"], T=T, seed=seed + 5, rng=rng,
+                           ks=cfg["ks"])
     if ex is None or not len(ex["adv"]):
         return bank, cur, []
     laws = flat_laws(bank)

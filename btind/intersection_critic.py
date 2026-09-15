@@ -118,6 +118,13 @@ def context(env, s):
     return np.stack([cars, who], 1)
 
 
+def _own(env):
+    """Both estimators are fitted on the agent's OWN return, whatever objective
+    the round is accepting on (`score_reward`)."""
+    from contextlib import nullcontext
+    return env.reward_as(None) if hasattr(env, "reward_as") else nullcontext()
+
+
 def record(env, bank, n_ep=60, seed=3, max_slots=None):
     """Trajectories of the agent under search from kernel traces:
     OB (n, T, n_obs + 2), RW (n, T) its own reward, AL, LAW (n, T).
@@ -146,7 +153,10 @@ def record(env, bank, n_ep=60, seed=3, max_slots=None):
         dev = np.zeros((n_ep, 4))
         dev[:, 3] = q
         tr = trace_array(n_ep, T, d)
-        IF.run(env, vb, sb, s, T, trace=tr, dev=dev)
+        # ON ITS OWN RETURN, whatever the round is accepting on: an estimator
+        # of the agent's value has to be fitted in the units it is answerable
+        # for (`own_reward`), not in the shared units a move is priced in.
+        IF.run(env, vb, sb, s, T, trace=tr, dev=dev, reward=env.own_reward)
         alive = tr[:, :, d - 1] > 0.5
         for i in np.flatnonzero(alive.any(1)):
             OB.append(np.hstack([tr[i, :, :n_obs],
@@ -264,7 +274,8 @@ def fit_advantage(env, bank, vh=None, n_dev=3000, seed=17, ks=(3, 8), verbose=Tr
     t0 = time.time()
     rng = np.random.default_rng(seed)
     head = bank.get("head")
-    ex = EX.deviations(env, bank, n_ep=n_dev, T=env.duration, seed=seed, rng=rng, ks=ks)
+    with _own(env):
+        ex = EX.deviations(env, bank, n_ep=n_dev, T=env.duration, seed=seed, rng=rng, ks=ks)
     n_obs = len(env.names) + 2                 # the observation plus the context
     ctx = context(env, starts(env, n_dev, seed))
     if head == "argmax":
