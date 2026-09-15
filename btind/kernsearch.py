@@ -28,6 +28,13 @@ acceleration -- or, on a discrete leaf, each action in turn. Measured why: in
 4-16 veh/h traffic only 10 of 154 deviations paid in a round, none of them near a
 red light, so the point that pays there (+12.3, z 3.5) was never proposed.
 
+CONFIRMATION IS ON FRESH EPISODES. Proposals are screened on one seed and the
+best few confirmed on ANOTHER (`seed_c`), with the incumbent rescored there.
+Screening and confirming on the same episodes was a winner's curse: the best of
+300 candidates on those episodes carries their luck, so accepted gains were
+inflated and vanished on the next round's seed -- the accept-then-prune flip
+seen at rung 0. The tuner and the prune use the confirmation seed as well.
+
 A KERNEL CAN TAKE ON A COLUMN LATER (`widen_kernel`). Its first point fixes its
 columns, and a first point is often a proxy: measured, a red-brake point on
 (speed, light) at rung 0 locked the default's kernel to those two, and the red
@@ -270,7 +277,7 @@ def add_points(env, bank, c, k, cands, kern, pol_fn, cur, cfg, verbose=False,
             kc = _add(kb, x, y)
             cand = KL.with_kern(bank, c, k, kc)
             ok, d, g = accept(env, cand, pol_fn, cur, cfg["n_ep"], cfg["T"],
-                              cfg["seed"], cfg["z"])
+                              cfg["seed_c"], cfg["z"])
             log.append(dict(op="add", arm=c, step=k, screen=float(d_screen), src=src,
                             delta=d, accepted=bool(ok and d > cfg["min_gain"])))
             if ok and d > cfg["min_gain"] and (best is None or d > best[0]):
@@ -316,7 +323,7 @@ def cem_kernel(env, bank, c, k, kern, pol_fn, cur, cfg, rng, scale, y_sigma,
         sig = np.maximum(P[el].std(0), 0.03)
     kc = unpack(mu)
     cand = KL.with_kern(bank, c, k, kc)
-    ok, d, g = accept(env, cand, pol_fn, cur, cfg["n_ep"], cfg["T"], cfg["seed"], cfg["z"])
+    ok, d, g = accept(env, cand, pol_fn, cur, cfg["n_ep"], cfg["T"], cfg["seed_c"], cfg["z"])
     keep = bool(ok and d > cfg["min_gain"])
     if verbose:
         print("      tune %d points on %s: %+.2f %s"
@@ -339,7 +346,7 @@ def prune_points(env, bank, c, k, kern, pol_fn, cur, cfg, verbose=False):
         # inconclusive evidence, and with a per-episode spread of ~50 against a
         # point worth +2 that flipped every round: measured, rung 0 accepted the
         # same red-brake point at +2.12 and pruned it at +0.76 on the next seed.
-        g = score(env, cand, pol_fn, cfg["n_ep"], cfg["T"], cfg["seed"])
+        g = score(env, cand, pol_fn, cfg["n_ep"], cfg["T"], cfg["seed_c"])
         dd = g - cur
         se = max(dd.std() / np.sqrt(len(dd)), 1e-12)
         d = float(dd.mean())
@@ -393,6 +400,8 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
                actions=bank.get("actions"))
     if cfg["screen_ep"] is None:
         cfg["screen_ep"] = n_ep
+    cfg["seed_c"] = seed + 7919
+    cur = score(env, bank, pol_fn, n_ep, T, cfg["seed_c"])     # the incumbent, fresh episodes
     rng = rng or np.random.default_rng(seed)
     head = bank.get("head")
     t0 = time.time()
@@ -425,7 +434,8 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
         def propose(kb, n):
             cs = candidates(ex, bank, c, k, kb, head, n)
             if critic is not None:
-                cs = cs + [(kb, np.atleast_2d(t[0]), np.atleast_2d(t[1]), t[2], "critic")
+                cs = cs + [(kb, np.atleast_2d(t[0]), np.atleast_2d(t[1]), t[2],
+                            t[3] if len(t) > 3 else "critic")
                            for t in critic(bank, c, k, kb, head)]
             cs = sorted(cs, key=lambda t: -t[3])
             return cs + anchor_candidates(Zanc, arms_anc, bank, c, k, kb, head,
@@ -485,6 +495,8 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
         n_pts = sum(KL.n_points(KL.kern_of(bank, c, k)) for c, k in flat_laws(bank))
         print("    kernels: %d inducing points in the tree [%.0fs]; %s"
               % (n_pts, time.time() - t0, source_summary(log)), flush=True)
+    # back on the caller's seed, which the rest of the round compares against
+    cur = score(env, bank, pol_fn, n_ep, T, seed)
     return bank, cur, log
 
 
@@ -493,7 +505,7 @@ def source_summary(log):
     the audit of which loop (deviations, critic, failure anchors, bound seeds)
     is producing the points the tree keeps."""
     out = []
-    for src in ("dev", "critic", "anchor", "bound"):
+    for src in ("dev", "critic", "critic-set", "anchor", "bound"):
         rows = [e for e in log if e.get("op") == "add" and e.get("src") == src]
         if rows:
             out.append("%s %d confirmed/%d kept" % (src, len(rows),

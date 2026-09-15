@@ -51,3 +51,29 @@ if __name__ == "__main__":
     test_traced_per_car_rewards_sum_to_the_return()
     test_value_and_advantage_carry_signal_out_of_sample()
     print("ok")
+
+
+def test_critic_proposes_whole_point_sets():
+    from btind import kernlaw as KL
+    from btind.intersection_critic import make_critic
+    from btind.memory import check_arms
+    env = IntersectionBatch(vph=(60.0, 20.0, 20.0), veh_reward="car", entry_v=(5.5, 11.0),
+                            veh_head="scalar")
+    env.set_agent("vehicle")
+    N = env.names
+    d = len(mem_names(N, None)) + 1
+    th = np.zeros((d, 1))
+    th[-1, 0] = 1.0
+    bank = check_arms(dict(names=list(N), laws_on_z=True, head="scalar", u_range=env.u_range,
+                           prior="const", clauses=[], laws=[], default=th), "b")
+    critic, rep = make_critic(env, bank, n_ep=30, n_dev=800, verbose=False)
+    ix = N.index
+    kern = KL.make([ix("d_stop"), ix("green")], np.zeros((0, 2)), np.zeros((0, 1)), [20.0, 0.25])
+    props = critic(bank, -1, 0, kern, "scalar")
+    sets = [t for t in props if len(t) > 3 and t[3] == "critic-set"]
+    assert sets, "no point-set proposed"
+    for X, Y, adv, _ in sets:
+        assert X.ndim == 2 and X.shape[1] == 2 and Y.shape == (X.shape[0], 1)
+        assert (Y >= env.u_range[0]).all() and (Y <= env.u_range[1]).all()
+    singles = [t for t in props if len(t) == 3]
+    assert singles

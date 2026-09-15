@@ -41,6 +41,17 @@ car the rank is the number to read: a car's return is heavy-tailed (a few
 percent of trajectories end in a -200 crash) and R^2 is dominated by those
 tails, while what a proposal needs is which states are better than which.
 
+FITTING A LAW TO THE CRITIC (`point_sets`). One point at a time, each having to
+pay on its own, meets the same deceptive landscape that blocked arm growth: a
+red stop needs its brake AND its go-on-green, following needs "brake when
+closing" AND "go when the gap opens", and either half alone is neutral or worse.
+So the critic also proposes SETS: over the states a law owns where A-hat says
+some command beats the leaf's, cluster in the kernel's own columns (k = 2, 3),
+take each cluster's medoid as a point and A-hat's best command there as its
+target, and offer the set as ONE candidate. That is the policy-improvement step
+of actor-critic -- fit the actor to the critic's argmax -- with the paired
+rollout, not the critic, deciding whether the fitted law is kept.
+
 WHY NOT A CRITIC IN THE COMPILED LOOP. Guards and laws run inside numba per car
 per tick; a boosted model cannot. V-hat is therefore not offered as a guard
 column here (it is on the Python-path worlds); it informs proposals instead.
@@ -229,6 +240,41 @@ def fit_advantage(env, bank, vh=None, n_dev=3000, seed=17, ks=(3, 8), verbose=Tr
     return ah, rep
 
 
+def _kmeans(Xs, kk, rng, n_iter=10):
+    """Lloyd's k-means with farthest-point seeding; returns (labels, centres)."""
+    cen = Xs[rng.choice(len(Xs), 1)]
+    for _ in range(kk - 1):
+        d = ((Xs[:, None, :] - cen[None]) ** 2).sum(2).min(1)
+        cen = np.vstack([cen, Xs[np.argmax(d)]])
+    lab = np.zeros(len(Xs), int)
+    for _ in range(n_iter):
+        lab = ((Xs[:, None, :] - cen[None]) ** 2).sum(2).argmin(1)
+        cen = np.array([Xs[lab == j].mean(0) if (lab == j).any() else cen[j]
+                        for j in range(kk)])
+    return lab, cen
+
+
+def point_sets(Z, tab, kern, levels, head, target_fn, rng, ks=(2, 3), min_adv=0.5):
+    """Whole point-sets fitted to the critic: (X (M, D), Y (M, n_out), adv sum)."""
+    best = tab.max(1)
+    sel = np.flatnonzero(best >= min_adv)
+    if len(sel) < 4:
+        return []
+    Xs = Z[sel][:, kern["cols"]] / kern["ls"]
+    out = []
+    for kk in ks:
+        if len(sel) < 2 * kk:
+            continue
+        lab, cen = _kmeans(Xs, kk, rng)
+        rows = [int(sel[np.argmin(((Xs - cen[j]) ** 2).sum(1))]) for j in range(kk)]
+        if len({tuple(Z[i, kern["cols"]]) for i in rows}) < kk:
+            continue
+        X = Z[rows][:, kern["cols"]]
+        Y = np.vstack([target_fn(i, int(np.argmax(tab[i])), 1.0) for i in rows])
+        out.append((X, Y, float(best[rows].sum()), "critic-set"))
+    return out
+
+
 def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0.5,
                 verbose=True):
     """Fit V-hat and A-hat on `bank`, and return the proposal function
@@ -254,6 +300,19 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
         tab = ah.table(Z, Ton[rows], k)              # (n, levels)
         best = tab.max(1)
         th = _theta(b, c, kk)
+
+        def target(i, j, f):
+            """The target a point at row i gets for the critic's best level j:
+            a discrete leaf lifts action j above the leaf's preferences; a
+            continuous one moves the fraction f from the leaf's command to it."""
+            zi = np.hstack([Z[i], np.zeros(len(th) - 1 - Z.shape[1])])[None]
+            u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(zi),
+                             bounds=KL.bounds_of(b))[0]
+            if head == "argmax":
+                y = u0.copy()
+                y[j] = u0.max() + 1.0 + 0.25 * (u0.max() - u0.min())
+                return y
+            return np.array([u0[0] + f * (ah.levels[j] - u0[0])])
         out = []
         for i in np.argsort(-best):
             if best[i] < min_adv or len(out) >= top:
@@ -261,17 +320,13 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
             x = Z[i, kern["cols"]]
             if any((np.abs(o[0] - x) / kern["ls"]).sum() < 0.5 for o in out):
                 continue
-            zi = np.hstack([Z[i], np.zeros(len(th) - 1 - Z.shape[1])])[None]
-            u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(zi),
-                             bounds=KL.bounds_of(b))[0]
             j = int(np.argmax(tab[i]))
             if head == "argmax":
-                y = u0.copy()
-                y[j] = u0.max() + 1.0 + 0.25 * (u0.max() - u0.min())
-                out.append((x, y, float(best[i])))
+                out.append((x, target(i, j, 1.0), float(best[i])))
             else:
                 for f in (1.0, 0.5):
-                    out.append((x, np.array([u0[0] + f * (ah.levels[j] - u0[0])]),
-                                float(best[i])))
+                    out.append((x, target(i, j, f), float(best[i])))
+        out += point_sets(Z, tab, kern, ah.levels, head, target,
+                          np.random.default_rng(seed + 3), min_adv=min_adv)
         return out
     return critic, dict(value=vrep, advantage=arep)

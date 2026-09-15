@@ -343,7 +343,10 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
     last, log, t0 = None, [], time.time()
     for k in range(max_arms):
         cur_cheap = score(env, bank, pol_fn, screen_ep, T, seed)
-        cur_full = score(env, bank, pol_fn, confirm_ep, T, seed)
+        # CONFIRM ON FRESH EPISODES: the best of the screen carries the luck of
+        # the screening episodes, so it is priced on a different seed
+        seed_c = seed + 7919
+        cur_full = score(env, bank, pol_fn, confirm_ep, T, seed_c)
         hot = _hot_rows(bank, obs, Z, qhat)
         if hot is not None:
             hot = hot[~claimed[hot]]
@@ -414,7 +417,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
             for pos in positions:
                 cand = _insert(bank, cl, th, pos)
                 ok, dl, _ = accept(env, cand, pol_fn, cur_full, confirm_ep, T,
-                                   seed, z)
+                                   seed_c, z)
                 log.append(dict(arm=k, law=lname, pos=pos, screen=d, delta=dl,
                                 rows=nrow, clause=[l[:] for l in cl],
                                 accepted=bool(ok and dl > min_gain)))

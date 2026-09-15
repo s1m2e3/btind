@@ -114,8 +114,13 @@ def with_kern(bank, c, k, kern):
     return dict(bank, kerns=ks)
 
 
+COND_MAX = 1e8        # the diagonal is raised until K is at least this well conditioned
+
+
 def ainv(kern):
-    """K^-1 over the anchors, with jitter on the diagonal."""
+    """K^-1 over the anchors. Jitter on the diagonal, raised tenfold at a time
+    while K is ill-conditioned (two anchors nearly on top of each other): the
+    law then interpolates them jointly instead of amplifying their difference."""
     X, ls = kern["X"], kern["ls"]
     M = len(X)
     K = np.empty((M, M))
@@ -125,8 +130,12 @@ def ainv(kern):
             for d in range(X.shape[1]):
                 s += abs(X[i, d] - X[j, d]) / ls[d]
             K[i, j] = np.exp(-s)
-        K[i, i] += JITTER
-    return np.linalg.inv(K)
+    jit = JITTER
+    while True:
+        Kj = K + jit * np.eye(M)
+        if np.linalg.cond(Kj) < COND_MAX or jit > 1.0:
+            return np.linalg.inv(Kj)
+        jit *= 10.0
 
 
 def evaluate(theta, kern, Xd, A=None, bounds=None):
