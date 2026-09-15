@@ -122,7 +122,7 @@ def deviations(env, bank, n_ep=400, T=400, seed=11, rng=None, ks=(1, 3, 8),
     keep = length > 0
     z0 = tr[np.arange(len(s)), np.minimum(t0, T - 1), :d - 1]
     G1 = np.where(keep, G1, G0)
-    return dict(z0=z0[keep], a=dev[keep, 2:4], k=k[keep], t0=t0[keep],
+    return dict(z0=z0[keep], a=dev[keep, 2:4], k=k[keep], t0=t0[keep], keep=keep,
                 adv=(G1 - G0)[keep], G0=G0[keep], G1=G1[keep],
                 law=tr[np.arange(len(s)), np.minimum(t0, T - 1), d][keep])
 

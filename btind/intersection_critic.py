@@ -29,6 +29,43 @@ an action beats what the leaf does, with that action as the target -- go through
 the same paired test as the deviations' own proposals (`kernsearch.py`). A bad
 critic costs screening time, never a wrong tree.
 
+CENTRALISED TRAINING, DECENTRALISED EXECUTION. The trees read their own
+observation and nothing else -- that is the whole point of a distributed
+controller. Their ESTIMATORS are allowed more, and need it: an independent
+critic that sees only one agent's observation cannot know how heavy the episode
+is or which partner is driving the other agent, and both decide what an action
+is worth. Measured without them, on this run's own logs: the signal's V-hat
+scored R^2 -3.78 and its A-hat got the sign of a large advantage right 10% of
+the time -- worse than chance -- while the vehicle's reached 78-95%. Both
+estimators now also see, per episode:
+
+    demand     the number of cars the episode schedules -- its draw from the
+               condition distribution, which the trees are deliberately not told
+    partner    which partner ran the episode (its block index when a population
+               is in force), so a critic fitted across partners can tell them
+               apart instead of averaging them
+
+This is the centralised critic of MADDPG/COMA, in the weak form this world
+needs; nothing here reaches the controller.
+
+A CRITIC THAT IS NOT USEFUL DOES NOT PROPOSE, and it takes three measures
+agreeing to say so, because they disagree often. Held out, on this world:
+
+    agent, demand        rank corr   top-decile lift   sign of large
+    vehicle 16-50 veh/h     0.33          0.4x             84%
+    vehicle 100-600         0.21          2.1x             64%
+    signal  16-50           0.08          0.9x              9%
+    signal  100-600         0.16          0.7x             10%
+
+The vehicle critic at 16-50 ranks DEVIATIONS badly (lift 0.4x) while its
+PROPOSALS were the highest-yield source in the run (45% of its point-sets were
+kept): ranking a random action's value is not the same task as finding a state
+where some command beats the leaf's. So a critic is gated out only when the
+rank correlation, the top-decile lift and the sign of large advantages ALL say
+noise, which is the signal's case at every demand measured. Then `make_critic`
+returns None, the round falls back to deviations and failure anchors, and the
+log says so.
+
 ELAPSED TIME IS AN INPUT TO BOTH, AND TO NOTHING ELSE. Episodes are truncated,
 so a return-to-go depends on how much episode is left, which the trees are
 deliberately not shown (`t_norm` is de-phased). An estimator that cannot see it
@@ -62,13 +99,30 @@ import numpy as np
 
 from . import explore as EX
 from .memory import mem_names
+from .structure import starts
 from .tick import trace_array
 from .vhat import TrajBuffer, ValueHat, fit_vhat_buffer, mc_return_to_go
 
 
+def context(env, s):
+    """Per-episode context the CRITICS see and the trees never do:
+    (cars scheduled, partner block index)."""
+    n = len(s)
+    cars = np.isfinite(s[:, 4 * env.N:5 * env.N]).sum(1).astype(np.float32)
+    other = env.signal_bank if env.agent == "vehicle" else env.vehicle_bank
+    k = len(other) if isinstance(other, list) else 1
+    edges = np.linspace(0, n, k + 1).round().astype(int)
+    who = np.zeros(n, np.float32)
+    for j, (a, b) in enumerate(zip(edges[:-1], edges[1:])):
+        who[a:b] = j
+    return np.stack([cars, who], 1)
+
+
 def record(env, bank, n_ep=60, seed=3, max_slots=None):
     """Trajectories of the agent under search from kernel traces:
-    OB (n, T, n_obs), RW (n, T) its own reward, AL (n, T), LAW (n, T) flat law."""
+    OB (n, T, n_obs + 2), RW (n, T) its own reward, AL, LAW (n, T).
+
+    The two extra columns are this episode's context (see `context`)."""
     from .envs import intersection_fast as IF
     rng = np.random.default_rng(seed)
     s = env.sample_starts(n_ep, rng)
@@ -77,6 +131,7 @@ def record(env, bank, n_ep=60, seed=3, max_slots=None):
     sb = env.signal_bank if env.agent == "vehicle" else bank
     d = len(mem_names(bank["names"], bank.get("mem"))) + 1
     n_obs = len(env.names)
+    ctx = context(env, s)
     OB, RW, AL, LAW = [], [], [], []
     if env.agent == "vehicle":
         # only slots some episode actually fills: an unscheduled slot is a
@@ -94,7 +149,8 @@ def record(env, bank, n_ep=60, seed=3, max_slots=None):
         IF.run(env, vb, sb, s, T, trace=tr, dev=dev)
         alive = tr[:, :, d - 1] > 0.5
         for i in np.flatnonzero(alive.any(1)):
-            OB.append(tr[i, :, :n_obs])
+            OB.append(np.hstack([tr[i, :, :n_obs],
+                                 np.tile(ctx[i], (T, 1))]))
             RW.append(tr[i, :, d + 2] * alive[i])
             AL.append(alive[i])
             LAW.append(tr[i, :, d].astype(int))
@@ -200,13 +256,17 @@ class AdvHat:
 
 
 def fit_advantage(env, bank, vh=None, n_dev=3000, seed=17, ks=(3, 8), verbose=True):
-    """A-hat on exact deviation advantages; scored on held-out deviations."""
+    """A-hat on exact deviation advantages; scored on held-out deviations.
+
+    `explore.deviations` uses `structure.starts(env, n_ep, seed)`, so the same
+    call reproduces the episodes the rows came from and their context."""
     from xgboost import XGBRegressor
     t0 = time.time()
     rng = np.random.default_rng(seed)
     head = bank.get("head")
     ex = EX.deviations(env, bank, n_ep=n_dev, T=env.duration, seed=seed, rng=rng, ks=ks)
-    n_obs = len(env.names)
+    n_obs = len(env.names) + 2                 # the observation plus the context
+    ctx = context(env, starts(env, n_dev, seed))
     if head == "argmax":
         levels = list(range(len(bank.get("actions") or [])))
         a = ex["a"][:, 0].astype(int)
@@ -215,7 +275,8 @@ def fit_advantage(env, bank, vh=None, n_dev=3000, seed=17, ks=(3, 8), verbose=Tr
         levels = list(np.linspace(lo, hi, 9))
         a = ex["a"][:, 0]
     ah = AdvHat(None, vh, n_obs, head, levels, env.duration)
-    X = ah._x(ex["z0"], ex["t0"], a, ex["k"])
+    # the deviations keep every episode, in order, so the context lines up
+    X = ah._x(np.hstack([ex["z0"][:, :n_obs - 2], ctx[ex["keep"]]]), ex["t0"], a, ex["k"])
     y = ex["adv"]
     idx = rng.permutation(len(y))
     n_tr = int(0.8 * len(y))
@@ -226,16 +287,23 @@ def fit_advantage(env, bank, vh=None, n_dev=3000, seed=17, ks=(3, 8), verbose=Tr
     p = m.predict(X[te])
     from scipy.stats import spearmanr
     big = np.abs(y[te]) >= np.quantile(np.abs(y[te]), 0.75)
+    # PRECISION AT THE TOP, and its lift over the base rate: of the rows this
+    # critic ranks highest, how many actually paid
+    top = np.argsort(-p)[:max(10, len(te) // 10)]
+    base = float((y[te] > 0).mean())
+    prec = float((y[te][top] > 0).mean())
     rep = dict(spearman=float(spearmanr(p, y[te]).correlation) if len(te) > 2 else 0.0,
                sign_big=float((np.sign(p[big]) == np.sign(y[te][big])).mean())
                if big.any() else 0.0,
+               prec_top=prec, base_rate=base, lift=prec / max(base, 1e-9),
                n_train=int(n_tr), n_test=int(len(te)), secs=time.time() - t0)
     m.fit(X, y)                                   # the deployed model sees every row
     ah.m = m
     if verbose:
-        print("    A-hat: rank corr %.2f, sign of large advantages %.0f%% on %d held-out "
-              "deviations (%d training) [%.0fs]"
-              % (rep["spearman"], 100 * rep["sign_big"], rep["n_test"], rep["n_train"],
+        print("    A-hat: rank corr %.2f, top-decile precision %.0f%% vs %.0f%% base "
+              "(lift %.1fx), sign of large %.0f%%, %d held-out (%d training) [%.0fs]"
+              % (rep["spearman"], 100 * rep["prec_top"], 100 * rep["base_rate"],
+                 rep["lift"], 100 * rep["sign_big"], rep["n_test"], rep["n_train"],
                  rep["secs"]), flush=True)
     return ah, rep
 
@@ -276,19 +344,33 @@ def point_sets(Z, tab, kern, levels, head, target_fn, rng, ks=(2, 3), min_adv=0.
 
 
 def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0.5,
-                verbose=True):
+                min_lift=1.0, min_rank=0.2, min_sign=0.3, verbose=True):
     """Fit V-hat and A-hat on `bank`, and return the proposal function
-    `kernsearch.search_kernels(critic=...)` calls, with both reports."""
+    `kernsearch.search_kernels(critic=...)` calls, with both reports.
+
+    Returns (None, reports) when the critic is not measurably better than
+    chance at the sign of a large advantage: its proposals would only cost
+    screening time."""
     from . import kernlaw as KL
     from .collect import design_matrix
     from .kernsearch import _theta, flat_laws
     vh, vrep = fit_value(env, bank, n_ep=n_ep, seed=seed, verbose=verbose)
     ah, arep = fit_advantage(env, bank, vh, n_dev=n_dev, seed=seed + 1, verbose=verbose)
+    if (arep["lift"] < min_lift and arep["spearman"] < min_rank
+            and arep["sign_big"] < min_sign):
+        if verbose:
+            print("    critic not used this round: rank %.2f, lift %.1fx, sign %.0f%% "
+                  "-- all below their gates; proposals fall back to deviations and "
+                  "failure anchors" % (arep["spearman"], arep["lift"],
+                                       100 * arep["sign_big"]), flush=True)
+        return None, dict(value=vrep, advantage=arep, used=False)
     OB, _, AL, LAW = record(env, bank, n_ep=max(20, n_ep // 3), seed=seed + 2,
                             max_slots=32)
     Zon = OB.reshape(-1, OB.shape[2])[AL.reshape(-1)]
     Ton = np.broadcast_to(np.arange(OB.shape[1]), AL.shape).reshape(-1)[AL.reshape(-1)]
     Lon = LAW.reshape(-1)[AL.reshape(-1)]
+
+    n_obs_t = len(env.names)
 
     def critic(b, c, kk, kern, head):
         L = flat_laws(b).index((c, kk))
@@ -305,7 +387,7 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
             """The target a point at row i gets for the critic's best level j:
             a discrete leaf lifts action j above the leaf's preferences; a
             continuous one moves the fraction f from the leaf's command to it."""
-            zi = np.hstack([Z[i], np.zeros(len(th) - 1 - Z.shape[1])])[None]
+            zi = np.hstack([Z[i, :n_obs_t], np.zeros(len(th) - 1 - n_obs_t)])[None]
             u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(zi),
                              bounds=KL.bounds_of(b))[0]
             if head == "argmax":
@@ -329,4 +411,4 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
         out += point_sets(Z, tab, kern, ah.levels, head, target,
                           np.random.default_rng(seed + 3), min_adv=min_adv)
         return out
-    return critic, dict(value=vrep, advantage=arep)
+    return critic, dict(value=vrep, advantage=arep, used=True)

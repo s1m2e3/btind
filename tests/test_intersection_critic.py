@@ -77,3 +77,24 @@ def test_critic_proposes_whole_point_sets():
         assert (Y >= env.u_range[0]).all() and (Y <= env.u_range[1]).all()
     singles = [t for t in props if len(t) == 3]
     assert singles
+
+
+def test_context_columns_and_the_gate():
+    import btind.intersection_critic as IC
+    from btind.envs.intersection import WIDE
+    env = IntersectionBatch(n_max=48, T_end=60.0, conditions=WIDE, veh_reward="car",
+                            veh_head="scalar", sig_head="duration")
+    env.set_agent("vehicle")
+    env.signal_bank = [None, None, None]
+    s = env.sample_starts(9, np.random.default_rng(0))
+    ctx = IC.context(env, s)
+    assert ctx.shape == (9, 2)
+    assert list(ctx[:, 1].astype(int)) == [0, 0, 0, 1, 1, 1, 2, 2, 2]   # partner blocks
+    assert ctx[:, 0].std() > 0                                          # demand varies
+    OB, RW, AL, LAW = IC.record(env, env.default_vehicle_bank(), n_ep=6, seed=1, max_slots=4)
+    assert OB.shape[2] == len(env.names) + 2
+    # the gate needs all three measures to agree before it silences a critic
+    good = dict(lift=0.4, spearman=0.33, sign_big=0.84)
+    noise = dict(lift=0.9, spearman=0.08, sign_big=0.09)
+    gate = lambda r: (r["lift"] < 1.0 and r["spearman"] < 0.2 and r["sign_big"] < 0.3)
+    assert not gate(good) and gate(noise)
