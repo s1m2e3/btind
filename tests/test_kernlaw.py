@@ -106,3 +106,26 @@ if __name__ == "__main__":
     test_kernel_intersection_kernel_matches_reference_both_heads()
     test_kernels_ride_with_their_arms_and_survive_json()
     print("ok")
+
+
+def test_widened_kernel_acts_as_before_until_its_new_column_is_used():
+    from btind.kernsearch import widen_kernel
+    rng = np.random.default_rng(3)
+    d, nA = 9, 1
+    th = np.zeros((d, nA))
+    th[-1, 0] = 0.5
+    kern = KL.make([2], [[1.0], [4.0]], [[-3.0], [2.0]], [0.8])
+    Z = rng.normal(size=(300, d - 1)) * 2
+    Z[:, 5] = rng.integers(-1, 2, 300)                 # a light-like column
+    w = widen_kernel(kern, 5, Z)
+    assert w["cols"] == [2, 5] and w["X"].shape == (6, 2)
+    Xd = design_matrix(Z)
+    before = KL.evaluate(th, kern, Xd, bounds=(-4.5, 2.6))
+    after = KL.evaluate(th, w, Xd, bounds=(-4.5, 2.6))
+    assert np.abs(before - after).max() < 0.15, np.abs(before - after).max()
+    w2 = widen_kernel(kern, 6, Z)                      # a continuous column
+    assert w2["X"].shape == (6, 2)
+    after2 = KL.evaluate(th, w2, Xd, bounds=(-4.5, 2.6))
+    # three quantile replicas only approximate a continuous column; the
+    # widened law is never scored on its own, only with a point added
+    assert np.abs(before - after2).mean() < 1.0, np.abs(before - after2).mean()

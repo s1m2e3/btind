@@ -28,6 +28,18 @@ acceleration -- or, on a discrete leaf, each action in turn. Measured why: in
 4-16 veh/h traffic only 10 of 154 deviations paid in a round, none of them near a
 red light, so the point that pays there (+12.3, z 3.5) was never proposed.
 
+A KERNEL CAN TAKE ON A COLUMN LATER (`widen_kernel`). Its first point fixes its
+columns, and a first point is often a proxy: measured, a red-brake point on
+(speed, light) at rung 0 locked the default's kernel to those two, and the red
+stop the next rung needed -- on distance to the line -- could not be proposed.
+A law with points is therefore also offered proposals on its columns plus one
+more from the pool, up to `max_cols`. The lengthscale is shared by every point
+of a column, so the existing points cannot simply ignore the new one: each is
+REPLICATED at the new column's few values (a light: -1, 0, 1) or at three of
+its quantiles, which reproduces the old law almost exactly, and the new point
+can then sit at one value of it. Prune trims the replicas the tree does not
+need.
+
 WHICH COLUMNS A KERNEL READS. The arm's own guard columns first -- the region is
 already defined on them -- then the columns that best separate the deviations
 that paid from the ones that did not, on the rows this law owns. A hint can be
@@ -86,6 +98,21 @@ def init_ls(Zown, cols, few=5):
         else:
             out.append(max(0.5 * float(Zown[:, j].std()), 1e-3))
     return np.array(out)
+
+
+def widen_kernel(kern, col, Zown, few=5):
+    """The same kernel reading one more column, its points replicated across
+    that column's values so the law is (nearly) unchanged until a point is
+    added at one of them."""
+    vals = np.unique(Zown[:, col]) if len(Zown) else np.zeros(1)
+    if len(vals) > few:
+        vals = np.quantile(Zown[:, col], (0.1, 0.5, 0.9))
+    ls_new = init_ls(Zown, [col])[0] if len(Zown) else 1.0
+    M = len(kern["X"])
+    X = np.vstack([np.hstack([kern["X"], np.full((M, 1), v)]) for v in vals])
+    Y = np.vstack([kern["Y"]] * len(vals))
+    return KL.make(list(kern["cols"]) + [int(col)], X, Y,
+                   np.concatenate([kern["ls"], [ls_new]]))
 
 
 def choose_cols(Z, paid, n_cols, prefer=(), hint=(), n_obs=None):
@@ -348,7 +375,8 @@ def _pt(kern, i, cfg):
 # +10 against a per-episode spread of ~50 is noise at 120 episodes, and among
 # 300 proposals the top four screened were never the good one: measured, the
 # rung-0 search accepted nothing at 120 and found its red slowdown at 500.
-KDEFAULTS = dict(n_laws=2, max_points=3, n_cols=2, col_pool=5, n_prop=24, n_confirm=8,
+KDEFAULTS = dict(n_laws=2, max_points=3, n_cols=2, max_cols=3, col_pool=5, n_prop=24,
+                 n_confirm=8,
                  dev_ep=3000, ks=(1, 3, 8), screen_ep=None, cem_iter=3, cem_K=24,
                  prune_margin=0.25, min_share=0.05, hint_cols=(), n_anchor=6)
 
@@ -405,6 +433,15 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
         if KL.n_points(kern):
             cands = propose(kern, cfg["n_prop"])
             sets = [kern["cols"]]
+            if len(kern["cols"]) < cfg["max_cols"]:
+                pool = choose_cols(Zall[own], paid, cfg["col_pool"], _guard_cols(bank, c),
+                                   cfg["hint_cols"], n_obs=len(names))
+                for col in pool:
+                    if col in kern["cols"]:
+                        continue
+                    kw_ = widen_kernel(kern, col, Zall[own])
+                    sets.append(kw_["cols"])
+                    cands += propose(kw_, max(4, cfg["n_prop"] // 3))
         else:
             # WHICH COLUMNS: every set of `n_cols` from a short pool -- hints,
             # the arm's guard columns, then the columns that best separate the
