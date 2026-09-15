@@ -594,19 +594,25 @@ def emit(bank, names):
                    % (", ".join(names[j] for j in m["cols"]), conj(m["write"]),
                       ("   cleared when " + conj(m["clear"]))
                       if m.get("clear") else ""))
-    out.append("Fallback")
-    for c, cl in enumerate(bank["clauses"]):
+    def arm_text(c, guard):
         acts = [law_label(bank["laws"][c], bank)]
         for adv, th in (steps[c] or []):
             acts[-1] += " until " + conj(adv)
             acts.append(law_label(th, bank))
-        body = "Sequence[ %s , %s ]" % (conj(cl), " , ".join(acts))
+        # an arm whose guard is entirely its subtree's is that subtree's default
+        body = ("Sequence[ %s , %s ]" % (conj(guard), " , ".join(acts)) if guard
+                else " , ".join(acts) + "          # subtree default")
         if sticky[c]:
             b = conj(betas[c]) if betas[c] else "never"
             body = "KeepRunningUntilFailure( %s )   beta: %s" % (body, b)
         if fails[c]:
             body += "   fail: " + conj(fails[c])
-        out.append("|-- " + body)
-    out.append("\\-- %s          # totality guard" % law_label(bank["default"], bank)
-               .replace("Action(u = K x + b)", "Action(default)"))
+        return body
+    default_text = (law_label(bank["default"], bank)
+                    .replace("Action(u = K x + b)", "Action(default)"))
+    # NESTED WHEN THE BANK HAS SUBTREES: contiguous children sharing literals
+    # are printed as a Sequence over a Fallback of their own (`subtree.py`).
+    # The flat bank is what runs; this is an exact rewrite of it.
+    from .subtree import emit_tree
+    out += emit_tree(bank, names, arm_text, conj, default_text)
     return "\n".join(out)

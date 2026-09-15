@@ -44,6 +44,7 @@ DEFAULTS = dict(
     grow_pool=60, grow_arms=4, max_arity=3, min_n=400,
     cem_iter=12, cem_K=96, cem_sigma=0.35,
     mem_at=1, mem_thr=7, mem_refine=3, beta_at=2, steps_at=2, n_cover=6000,
+    subtree_at=(1, 2), subtree_arms=2, subtree_pool=30,
     explore_ep=300, explore_ks=(1, 3, 8), explore_frac=0.25,
     stall_before_kick=2, kick_size=1, hop_budget=2,
     seed_stride=1009, val_seed=90210, val_ep=1200,
@@ -119,7 +120,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             # the null command for a continuous leaf: the middle of the range
             th0 = np.zeros((len(zn0) + 1, 1))
             lo, hi = env.u_range
-            th0[-1, 0] = 0.5 * (lo + hi)
+            th0[-1, 0] = getattr(env, "u_null", 0.5 * (lo + hi))
         else:
             th0 = rng.normal(0, .3, (len(zn0) + 1, 2))
         seed_bank = dict(clauses=[], laws=[], default=th0, names=list(names),
@@ -323,7 +324,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         # over named manoeuvres. The discrete analogue -- score each action by
         # the gap between a remembered value and the current one -- is the next
         # increment, not a thing to improvise mid-run.
-        if r == cfg["mem_at"] and head == "argmax" and not bank.get("mem"):
+        if r == cfg["mem_at"] and head != "vector" and not bank.get("mem"):
             # THE DISCRETE-HEAD MEMORY STAGE: a message-shaped blackboard --
             # a transient column, its arrival as the event, with or without a
             # countdown -- and the arms that read it, grown on the widened
@@ -341,11 +342,12 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                 screen_ep=min(cfg["n_ep"], 120), confirm_ep=cfg["n_ep"],
                 T=cfg["T"], seed=rseed, z=cfg["z"],
                 min_gain=max(cfg["min_gain"], 0.5), rng=rng, weights=weights,
-                verbose=verbose)
+                verbose=verbose, pool=cfg.get("mem_pool", 40),
+                max_arms=cfg.get("mem_arms", 2))
             if bank.get("mem"):
                 rec["moves"].append("memory")
             cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
-        elif r == cfg["mem_at"] and head == "argmax":
+        elif r == cfg["mem_at"] and head != "vector":
             pass                                  # a blackboard already exists
         elif r == cfg["mem_at"]:
             env.seed_kernels(3)
@@ -401,6 +403,28 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                 rec["moves"].append("fail")
                 cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
             weights.update_many(slog + flog)
+
+        # --- nested subtrees: grow children INSIDE an existing child ---------
+        # On that child's own rows, with an alphabet fitted there and its law
+        # as the starting point (`subtree.py`). After steps and terminations,
+        # because a latched or multi-step child is not offered as a parent.
+        if r in cfg["subtree_at"]:
+            from .subtree import search_subtrees
+            zn = mem_names(names, bank.get("mem"))
+            p = pol_fn(bank)
+            p.reset(len(obs))
+            Zt = p.z(obs, update=False)
+            bank, tlog = search_subtrees(
+                env, bank, names, zn, pol_fn, obs, Zt, verbose=verbose,
+                max_arms=cfg["subtree_arms"], pool=cfg["subtree_pool"],
+                min_gain=cfg["min_gain"], screen_ep=min(cfg["n_ep"], 120),
+                confirm_ep=cfg["n_ep"], T=cfg["T"], seed=rseed, z=cfg["z"],
+                rng=rng, weights=weights, cem_iter=max(2, cfg["cem_iter"] // 3),
+                cem_K=max(12, cfg["cem_K"] // 4))
+            if any(e.get("accepted") for e in tlog):
+                rec["moves"].append("subtree")
+                cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
+            weights.update_many(tlog)
 
         bank, cur, _ = drop_arm(env, bank, pol_fn, cur, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=rseed, z=cfg["z"])

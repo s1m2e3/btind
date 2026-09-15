@@ -27,39 +27,77 @@ import numpy as np
 from numba import njit, prange
 
 from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_args
-from .intersection import (A_MAX, ACCELS, B_MAX, DELAY_W, FAR, FIXED_GREEN, HALF_CONF,
+from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
+                           QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_STOP, STOP_ZONE,
+                           W_CAR_DELAY, W_DELAY, W_QUEUE, W_STUCK_CAR,
+                           W_SPEED, W_STUCK,
                            L_VEH, N_PHASES, NEAR_INT, QUEUE_D, QUEUE_V, R_COLL,
-                           R_EXIT, R_RED, SIG_HIDDEN, SPAWN_GAP, T_AR, T_MAX, T_MIN,
+                           R_EXIT, R_RED, SIG_EMPTY, SIG_HIDDEN, SPAWN_GAP, T_AR,
+                           T_MAX, T_MIN,
                            V0)
 
 
-def params(env, vehicle_bank=None, signal_bank=None):
+def params(env, vehicle_bank=None, signal_bank=None, reward=None):
     vh = (vehicle_bank or {}).get("head", env.veh_head)
     sh = (signal_bank or {}).get("head", env.sig_head)
+    reward = reward or env.reward_mode
+    assert reward in ("team", "car")
     return np.array([env.N, env.M, env.dt, env.duration, env.gamma,
                      1.0 if env.event else 0.0,
                      1.0 if vh == "scalar" else 0.0,
                      1.0 if sh == "duration" else 0.0,
-                     env.occlude_lo, env.occlude_hi], np.float64)
+                     env.occlude_lo, env.occlude_hi,
+                     1.0 if reward == "car" else 0.0], np.float64)
 
 
 @njit(cache=True, inline="always")
-def _t_change(m, phase, t_phase, in_ar, ar_t, green, fixed_green, dt):
-    """Ticks until movement m's light changes under the fixed plan (see the
-    numpy model's `_t_change`)."""
-    if (not in_ar) and green[phase, m]:
-        t = fixed_green[phase] - t_phase
+def _live(kind, bound, t0, dt):
+    """Ticks a live phase lasts from elapsed t0 (see the model's `_t_window`)."""
+    k = np.ceil((bound - t0) / dt - 1e-9)
+    if kind == 0:
+        return (k if k > 0.0 else 0.0) + 1.0
+    return k if k > 1.0 else 1.0
+
+
+@njit(cache=True, inline="always")
+def _t_window(m, phase, t_phase, in_ar, ar_t, plan, kind, green, fixed_green, dt):
+    """(earliest, latest) ticks until movement m's light is observed to change,
+    under controller `kind` (0 fixed, 1 duration, 2 argmax). Mirrors the numpy
+    model's `_t_window` exactly."""
+    if kind == 0:
+        cur_min = _live(0, fixed_green[phase], t_phase, dt)
+        cur_max = cur_min
+    elif kind == 1 and plan > 0.0:
+        cur_min = _live(1, plan, t_phase, dt)
+        cur_max = cur_min
     else:
-        t = (0.0 if in_ar else fixed_green[phase] - t_phase)
-        t += (T_AR - ar_t) if in_ar else T_AR
-        q = (phase + 1) % N_PHASES
-        for _ in range(N_PHASES):
-            if green[q, m]:
-                break
-            t += fixed_green[q] + T_AR
-            q = (q + 1) % N_PHASES
-    t = np.round(t / dt)
-    return t if t > 0.0 else 0.0
+        cur_min = _live(2, T_MIN, t_phase, dt)
+        cur_max = _live(2, T_MAX, t_phase, dt)
+    ar_full = np.ceil(T_AR / dt - 1e-9)
+    if (not in_ar) and green[phase, m]:
+        return cur_min, cur_max
+    if in_ar:
+        ar_now = np.ceil((T_AR - ar_t) / dt - 1e-9)
+        if ar_now < 1.0:
+            ar_now = 1.0
+        tmin = ar_now
+        tmax = ar_now
+    else:
+        tmin = cur_min + ar_full
+        tmax = cur_max + ar_full
+    q = (phase + 1) % N_PHASES
+    for _ in range(N_PHASES):
+        if green[q, m]:
+            break
+        if kind == 0:
+            f = _live(0, fixed_green[q], 0.0, dt)
+            tmin += f + ar_full
+            tmax += f + ar_full
+        else:
+            tmin += _live(2, T_MIN, 0.0, dt) + ar_full
+            tmax += _live(2, T_MAX, 0.0, dt) + ar_full
+        q = (q + 1) % N_PHASES
+    return tmin, tmax
 
 
 def geometry(env):
@@ -82,11 +120,13 @@ def geometry(env):
             np.ascontiguousarray(g["to_edge"], np.int64),
             np.ascontiguousarray(g["green"], np.bool_),
             np.ascontiguousarray(FIXED_GREEN, np.float64),
-            np.ascontiguousarray(cps, np.float64))
+            np.ascontiguousarray(cps, np.float64),
+            np.ascontiguousarray(g["appr"], np.int64))
 
 
-def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None):
-    """Roll both trees from the states `s`. `signal_bank` None = fixed plan."""
+def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None, reward=None):
+    """Roll both trees from the states `s`. `signal_bank` None = fixed plan.
+    `reward` "team" or "car" overrides the return the world would score."""
     if vehicle_bank is None:
         vehicle_bank = env.default_vehicle_bank()
     fv = flatten(vehicle_bank, len(env.veh_names))
@@ -98,7 +138,7 @@ def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None):
         fs = flatten(signal_bank, len(env.sig_names))
         use_sig = True
     G = np.empty(len(s))
-    rollout(np.ascontiguousarray(s), params(env, vehicle_bank, signal_bank),
+    rollout(np.ascontiguousarray(s), params(env, vehicle_bank, signal_bank, reward),
             *geometry(env), T, G,
             no_trace() if trace is None else trace,
             no_dev() if dev is None else dev,
@@ -149,7 +189,8 @@ def _write_mem(z, n_obs_flagged, slots, have, age, mem_cols, w_col, w_thr, w_neg
 
 @njit(cache=True, parallel=True)
 def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
-            dirs, lane_group, to_edge, green, fixed_green, cps, T, G, trace, dev,
+            dirs, lane_group, to_edge, green, fixed_green, cps, appr, T, G,
+            trace, dev,
             vlaws, vmem_cols, vw_col, vw_thr, vw_neg, vn_obs,
             slaws, smem_cols, sw_col, sw_thr, sw_neg, sn_obs, use_sig, vt, st):
     n = states.shape[0]
@@ -162,6 +203,10 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
     sduration = p[7] > 0.5
     occ_lo = p[8]
     occ_hi = p[9]
+    car_r = p[10] > 0.5
+    # the controller the V2I message describes: 0 fixed plan, 1 green-time
+    # tree, 2 per-tick switcher
+    sig_kind = 0 if not use_sig else (1 if sduration else 2)
     dv = vlaws.shape[1]
     ds = slaws.shape[1]
     nAv = vlaws.shape[2]
@@ -186,14 +231,17 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             dep[q] = states[i, 4 * N + q]
         b = 5 * N
         told = np.empty(N)
+        paid = np.empty(N)
         for q in range(N):
-            told[q] = states[i, b + 11 + q]
+            told[q] = states[i, b + 12 + q]
+            paid[q] = states[i, b + 12 + N + q]
         plan = states[i, b + 10]
         phase = int(states[i, b + 0])
         t_phase = states[i, b + 1]
         in_ar = states[i, b + 2] > 0.5
         ar_t = states[i, b + 3]
         noise = states[i, b + 5]
+        clock_phase = states[i, b + 11]         # hidden: see sample_starts
 
         latch = np.full(N, -1, np.int64)
         step = np.zeros(N, np.int64)
@@ -214,6 +262,9 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         lead_j = np.zeros(N, np.int64)
         spawned_grp = np.zeros(2 * 4 + 2, np.bool_)
         fresh = np.zeros(N, np.bool_)
+        sp_sum = np.zeros(4)
+        sp_cnt = np.zeros(4)
+        q_wait = np.zeros(4)
         ts = int(dev[i, 3]) if deviating else -1
         g = 0.0
         disc = 1.0
@@ -275,23 +326,31 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     hear = near or d_stop <= 0.0
                 if hear:
                     zv[3] = 1.0 if (green_now and green[phase, m]) else 0.0
-                    zv[4] = (_t_change(m, phase, t_phase, in_ar, ar_t, green,
-                                       fixed_green, dt) if event else t_phase)
-                    zv[5] = 1.0 if in_ar else 0.0
+                    if event:
+                        w_min, w_max = _t_window(m, phase, t_phase, in_ar, ar_t,
+                                                 plan, sig_kind, green,
+                                                 fixed_green, dt)
+                        zv[4] = w_min
+                        zv[5] = w_max
+                    else:
+                        zv[4] = t_phase
+                        zv[5] = SIG_HIDDEN
+                    zv[6] = 1.0 if in_ar else 0.0
                 else:
                     zv[3] = SIG_HIDDEN
                     zv[4] = SIG_HIDDEN
                     zv[5] = SIG_HIDDEN
+                    zv[6] = SIG_HIDDEN
                 if event and near:
                     told[q] = 1.0              # heard, at observation time
-                zv[6] = gap
-                zv[7] = (v[q] - v[bj]) if has else 0.0
-                zv[8] = 1.0 if has else 0.0
-                zv[9] = d_conf
-                zv[10] = 1.0 if dirs[m] == 2 else 0.0
-                zv[11] = 1.0 if dirs[m] == 0 else 0.0
-                zv[12] = (t / duration + (abs(noise) * 7.31) % 1.0) % 1.0
-                zv[13] = noise
+                zv[7] = gap
+                zv[8] = (v[q] - v[bj]) if has else 0.0
+                zv[9] = 1.0 if has else 0.0
+                zv[10] = d_conf
+                zv[11] = 1.0 if dirs[m] == 2 else 0.0
+                zv[12] = 1.0 if dirs[m] == 0 else 0.0
+                zv[13] = (t / duration + clock_phase) % 1.0
+                zv[14] = noise
                 vhave[q], vage[q] = _write_mem(zv, vn_obs, vslots[q], vhave[q],
                                                vage[q], vmem_cols, vw_col,
                                                vw_thr, vw_neg)
@@ -330,6 +389,8 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             # ---- observe + act: signal ---------------------------------------
             for k in range(ds):
                 zs[k] = 0.0
+            for k in range(N_PHASES):
+                zs[3 * N_PHASES + k] = FAR
             for q in range(N):
                 if status[q] != 1.0:
                     continue
@@ -339,13 +400,21 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     for k in range(N_PHASES):
                         if green[k, m]:
                             zs[N_PHASES + k] += 1.0
+                            zs[2 * N_PHASES + k] += v[q]
+                            if d_stop < zs[3 * N_PHASES + k]:
+                                zs[3 * N_PHASES + k] = d_stop
                             if v[q] < QUEUE_V:
                                 zs[k] += 1.0
-            zs[2 * N_PHASES + phase] = 1.0
-            zs[3 * N_PHASES] = t_phase
-            zs[3 * N_PHASES + 1] = 1.0 if in_ar else 0.0
-            zs[3 * N_PHASES + 2] = (t / duration + (abs(noise) * 7.31) % 1.0) % 1.0
-            zs[3 * N_PHASES + 3] = noise
+            for k in range(N_PHASES):
+                if zs[N_PHASES + k] > 0.0:
+                    zs[2 * N_PHASES + k] = zs[2 * N_PHASES + k] / zs[N_PHASES + k]
+                else:
+                    zs[2 * N_PHASES + k] = SIG_EMPTY
+            zs[4 * N_PHASES + phase] = 1.0
+            zs[5 * N_PHASES] = t_phase
+            zs[5 * N_PHASES + 1] = 1.0 if in_ar else 0.0
+            zs[5 * N_PHASES + 2] = (t / duration + clock_phase) % 1.0
+            zs[5 * N_PHASES + 3] = noise
             s_law = -1
             dur = 0.0
             if use_sig:
@@ -432,7 +501,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 if ok:
                     status[q] = 1.0
                     s[q] = s_spawn[m]
-                    v[q] = V0
+                    # v[q] already holds the slot's entry speed
                     latch[q] = -1
                     step[q] = 0
                     for k in range(vslots.shape[1]):
@@ -442,9 +511,9 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     fresh[q] = True
                     spawned_grp[grp] = True
 
-            # ---- kinematics, red running, delay --------------------------------
+            # ---- kinematics, red running ----------------------------------------
             n_ran = 0
-            delay = 0.0
+            green_sum = 0.0
             for q in range(N):
                 if status[q] != 1.0 or fresh[q]:
                     continue                     # spawned this tick: not driven yet
@@ -458,14 +527,14 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 s[q] = s[q] + vn * dt
                 v[q] = vn
                 gm = (not in_ar) and green[phase, m]
-                if before < s_stop[m] and s[q] >= s_stop[m] and not gm:
-                    n_ran += 1
-                delay += (V0 - v[q]) * dt
-            for q in range(N):
-                if status[q] == 0.0 and dep[q] <= time_now:
-                    delay += V0 * dt             # due, blocked at the entrance
-            r -= R_RED * n_ran
-            r -= DELAY_W * delay
+                if before < s_stop[m] and s[q] >= s_stop[m]:
+                    if gm:
+                        green_sum += v[q] / V0
+                    else:
+                        n_ran += 1
+            r -= (R_RED_CAR if car_r else R_RED) * n_ran
+            if car_r:
+                r += R_GREEN * green_sum
 
             # ---- collisions -----------------------------------------------------
             n_rear = 0
@@ -502,6 +571,59 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     has_lead[q] = True
                     lead_gap[q] = best - L_VEH
                     lead_j[q] = bj
+            # ---- traffic performance, before collided cars are removed ----------
+            for a4 in range(4):
+                sp_sum[a4] = 0.0
+                sp_cnt[a4] = 0.0
+                q_wait[a4] = 0.0
+            delay = 0.0
+            n_stuck = 0
+            n_stop = 0
+            for q in range(N):
+                if status[q] == 1.0:
+                    m = mv[q]
+                    a4 = appr[m]
+                    vf = v[q] / V0
+                    sp_sum[a4] += vf
+                    sp_cnt[a4] += 1.0
+                    delay += 1.0 - vf
+                    if v[q] < QUEUE_V:
+                        d_q = s_stop[m] - s[q]
+                        red_q = in_ar or (not green[phase, m])
+                        red_ok = red_q and (d_q <= NEAR_INT or not car_r)
+                        legit = d_q > 0.0 and ((has_lead[q] and lead_gap[q] < QUEUE_GAP)
+                                               or red_ok)
+                        if not legit:
+                            n_stuck += 1
+                        if d_q > 0.0:
+                            q_wait[a4] += 1.0
+                        if car_r and red_q and d_q > 0.0 and d_q <= STOP_ZONE \
+                                and paid[q] < 0.5:
+                            paid[q] = 1.0
+                            n_stop += 1
+                elif status[q] == 0.0 and dep[q] <= time_now:
+                    a4 = appr[mv[q]]
+                    sp_cnt[a4] += 1.0
+                    delay += 1.0
+                    q_wait[a4] += 1.0
+            ms = 0.0
+            na = 0.0
+            for a4 in range(4):
+                if sp_cnt[a4] > 0.0:
+                    ms += sp_sum[a4] / sp_cnt[a4]
+                    na += 1.0
+            if na > 0.0 and not car_r:
+                r += W_SPEED * (ms / na) * dt
+            r -= (W_CAR_DELAY if car_r else W_DELAY) * delay * dt
+            r -= (W_STUCK_CAR if car_r else W_STUCK) * n_stuck * dt
+            if car_r:
+                r += R_STOP * n_stop
+            else:
+                qsq = 0.0
+                for a4 in range(4):
+                    qsq += q_wait[a4] * q_wait[a4]
+                r -= W_QUEUE * qsq * dt
+
             hit = np.zeros(N, np.bool_)
             for q in range(N):
                 if status[q] == 1.0 and has_lead[q] and lead_gap[q] < 0.0:
@@ -523,11 +645,13 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                         hit[q] = True
                         hit[rr] = True
                         n_cross += 1
+            n_hit = 0
             for q in range(N):
                 if hit[q]:
                     status[q] = 2.0
                     v[q] = 0.0
-            r -= R_COLL * (n_rear + n_cross)
+                    n_hit += 1
+            r -= R_COLL * (n_hit if car_r else (n_rear + n_cross))
 
             # ---- exits ------------------------------------------------------------
             n_out = 0
@@ -536,6 +660,13 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     status[q] = 2.0
                     n_out += 1
             r += R_EXIT * n_out
+
+            if t + 1 >= duration:
+                n_left = 0
+                for q in range(N):
+                    if status[q] == 1.0 or (status[q] == 0.0 and dep[q] <= time_now):
+                        n_left += 1
+                r -= R_LEFT * n_left
 
             if tracing and t < trace.shape[1]:
                 # the tick's reward, in the slot the trace leaves free

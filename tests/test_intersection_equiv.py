@@ -163,3 +163,41 @@ if __name__ == "__main__":
         if k.startswith("test_"):
             v()
             print("ok  %s" % k)
+
+
+def test_signal_sees_speed_and_distance_and_kernel_agrees():
+    """Per phase: mean speed of approaching cars and the nearest one's distance
+    to the line. Checked for sanity on the model, then a signal tree that
+    guards on them must give identical returns on kernel and model."""
+    from btind.envs.intersection import FAR, QUEUE_D, SIG_EMPTY, V0
+    s = _starts(40, 21)
+    ss = s.copy()
+    vb = veh_bank()
+    seen_v = seen_d = 0
+    for t in range(ENV.duration):
+        o = ENV.observe_signal(ss)
+        for k in range(4):
+            n_k = o[:, SN.index("n%d" % k)]
+            v_k = o[:, SN.index("v%d" % k)]
+            d_k = o[:, SN.index("d%d" % k)]
+            assert np.all((n_k > 0) | (v_k == SIG_EMPTY))
+            assert np.all((n_k == 0) | ((v_k >= 0) & (v_k <= V0)))
+            assert np.all((n_k > 0) | (d_k == FAR))
+            assert np.all((n_k == 0) | ((d_k > 0) & (d_k < QUEUE_D)))
+            seen_v += int((n_k > 0).sum())
+            seen_d += int(((d_k < 20) & (n_k > 0)).sum())
+        ss, _, _ = ENV.step_both(ss, np.full(len(ss) * ENV.N, 2), None)
+    assert seen_v > 100 and seen_d > 10
+    d = len(mem_names(SN, None)) + 1
+    P = lambda k: _pref(k, d, 2)
+    sb = check_arms(dict(names=list(SN), laws_on_z=True, head="argmax",
+                         actions=list(SIG_ACTIONS),
+                         clauses=[[[SN.index("ph0"), 0.5, False],
+                                   [SN.index("d0"), 30.0, False],
+                                   [SN.index("t_phase"), 6.0, False]],
+                                  [[SN.index("v2"), 0.0, False],
+                                   [SN.index("v2"), 3.0, True]]],
+                         laws=[P(1), P(1)], default=P(0)), "sig-v-d")
+    gp, gk = _both(vb, sb, s)
+    assert np.abs(gp - gk).max() < 1e-9, np.abs(gp - gk).max()
+    assert np.abs(gk - IF.run(ENV, vb, sig_bank(), s, ENV.duration)).max() > 0

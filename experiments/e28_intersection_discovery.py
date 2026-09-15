@@ -46,9 +46,56 @@ elapsed-time column -- the vehicle tree's Sequence advances on it, the signal
 tree's top arm reads it. On this world it was not a distractor: the episode
 is truncated at 100 s, so elapsed time predicts whether a car can still exit
 and how long delay keeps being charged, and the search exploited a real
-horizon cue. The column is now de-phased by a per-episode offset drawn from
-`noise` (both paths, exact), which makes it carry nothing; the clean rerun
-under that world is deferred and its result belongs here when it runs.
+horizon cue.
+
+THE FIRST FIX DID NOT FIX IT. De-phasing the clock by an offset computed from
+`noise` left elapsed time decodable, because `noise` is itself observed:
+measured on held-out episodes (tests/test_tnorm_distractor.py), a regressor
+recovers the tick from (t_norm, noise) at R^2 0.86, against 1.00 for the raw
+fraction. The phase is now drawn independently into unobserved state, where
+the same regressor scores below zero; `OBS_VERSION` in the world signature
+keeps the leaky run's checkpoints from ever being resumed.
+
+HOW MUCH OF THE RESULT ABOVE WAS THE CUE: the stage-3 trees from that run
+score -22.0 on the fixed world, against -3.08 on the leaky one. Removing the
+vehicle tree's `t_norm` arm there is worth +2.2, and the CEM-tuned laws carried
+coefficients on the column as well. The -3.08 was substantially a horizon
+exploit and is superseded by the rerun below.
+
+THE RERUN, hidden-phase clock (obs v2), argmax leaves, continuous light, rounds
+2/1/1, stage 1 checkpointed and resumed in a frozen snapshot:
+
+                                           held-out G
+    hand-written follower, fixed plan          -0.50
+    stage 1  vehicles, fixed plan              -0.83    2 children
+    stage 2  + discovered signal               -0.01    1 child
+    stage 3  vehicles refit                    -0.01    nothing accepted
+
+    vehicle: near_int>0 -> accelerate if green, else brake hard  (exact:
+             the law's only coefficient is +1 on accelerate for the light,
+             and the argmax breaks the tie on red toward brake hard);
+             has_lead>0 -> a dense tuned preference, mostly brake hard;
+             default accelerate
+    signal:  n1>1 -> extend; default extend, switching early in a phase
+             when phase 2 has a queue
+
+The collapse move removed a `t_norm` passenger in round 0; no planted column is
+in either tree. Terminations and steps were searched and refused ("nothing beat
+staying reactive", "no step cleared +0.30"), as e27 predicts for this variant.
+
+TWO FINDINGS, NOT YET FIXED. The signal tree holds phase 0 to the 60 s maximum
+and never serves phase 3 (north-south left) within a 100 s episode, which the
+fixed plan serves in every episode: the same horizon exploit as `t_norm`, one
+level up, since queued cars that are never served cost only delay until the
+episode ends. And the car-ahead leaf needs ten terms, two of them on the
+planted columns, to reproduce 95% of its choices: the audit covers guards,
+not law coefficients, and CEM leaves laws dense.
+
+EVENT MODE WITH CONTINUOUS LEAVES (obs v3, truthful SPaT window): stage 1 stuck
+at -20.4. CEM tuned the cold-start acceleration to stop every car before the
+zone -- -20 beats cruising at -37 because stopped cars never run a red or
+collide -- and from there no car hears a message, so the memory stage found
+nothing to store. A local optimum of the reward, reported as measured.
 """
 import os
 import sys
@@ -70,14 +117,16 @@ DISTRACT = ("t_norm", "noise")
 def report(env, bank, label):
     zn = mem_names(env.names, bank.get("mem"))
     used = [zn[l[0]] for c in bank["clauses"] for l in c]
-    bad = [u for u in used if u in DISTRACT]
+    if bank.get("mem"):
+        used += ["store:" + env.names[j] for j in bank["mem"]["cols"]]
+    bad = [u for u in used if any(dn in u for dn in DISTRACT)]
     print("\n%s\n%s\n   guards: %s\n   planted among them: %s"
           % (label, emit(bank, env.names), ", ".join(used) or "-",
              ", ".join(bad) if bad else "none"), flush=True)
 
 
 def main(rounds=(2, 1, 1), seed=0, n_ep=300, warm=True, veh_head="argmax",
-         sig_head="argmax", sig_mode="continuous"):
+         sig_head="argmax", sig_mode="continuous", tag=""):
     rl = RunLog("e28-intersection")
     env = IntersectionBatch(veh_head=veh_head, sig_head=sig_head, sig_mode=sig_mode)
     print("world: vehicle leaf %s, signal leaf %s, signal %s" % (veh_head, sig_head, sig_mode))
@@ -88,7 +137,16 @@ def main(rounds=(2, 1, 1), seed=0, n_ep=300, warm=True, veh_head="argmax",
     # every round, so a run cut short resumes rather than restarts.
     cfg = dict(n_ep=n_ep, T=env.duration, seed=11, val_ep=800, mem_at=99,
                beta_at=1, steps_at=1, grow_arms=2, min_n=200, n_cover=6000,
-               explore_ep=200, cover_ep=120, cem_iter=6, cem_K=48, grow_pool=40)
+               explore_ep=200, cover_ep=120, cem_iter=6, cem_K=48, grow_pool=40,
+               mem_pool=20, mem_arms=2,
+               # returns on the traffic reward are in the hundreds (e33); a
+               # floor of 0.3 would admit gains the size of the noise
+               min_gain=1.0)
+    # MEMORY WHERE THE WORLD CAN REWARD IT. In event mode the light is heard
+    # once, so the vehicle stage runs the blackboard search at the end of its
+    # first round; the signal observes its queues every tick and gets none.
+    veh_cfg = dict(cfg, mem_at=0 if sig_mode == "event" else 99)
+    sig_cfg = dict(cfg, mem_at=99)
 
     def ref_line(vb, sb, label):
         m = heldout(env, vb if env.agent == "vehicle" else sb, n_ep=1000)
@@ -102,7 +160,7 @@ def main(rounds=(2, 1, 1), seed=0, n_ep=300, warm=True, veh_head="argmax",
     print("   reference: hand-written follower", flush=True)
     g_ref_v = ref_line(env.default_vehicle_bank(), None, "hand-written red-stop follower")
     vb, log1, m1 = fit(env, list(env.names), rounds=rounds[0], warm=warm,
-                       run_seed=seed, tag="e28-veh", cfg=cfg, branch=0)
+                       run_seed=seed, tag="e28-veh" + tag, cfg=veh_cfg, branch=0)
     report(env, vb, "discovered vehicle tree (stage 1): %.2f vs hand-written %.2f"
            % (m1["G"], g_ref_v))
 
@@ -111,7 +169,7 @@ def main(rounds=(2, 1, 1), seed=0, n_ep=300, warm=True, veh_head="argmax",
     env.vehicle_bank, env.signal_bank = vb, None
     print("\nstage 2 -- the signal tree, discovered vehicles", flush=True)
     sb, log2, m2 = fit(env, list(env.names), rounds=rounds[1], warm=warm,
-                       run_seed=seed, tag="e28-sig", cfg=cfg, branch=0)
+                       run_seed=seed, tag="e28-sig" + tag, cfg=sig_cfg, branch=0)
     report(env, sb, "discovered signal tree (stage 2): %.2f (fixed plan gave %.2f)"
            % (m2["G"], m1["G"]))
 
@@ -121,9 +179,14 @@ def main(rounds=(2, 1, 1), seed=0, n_ep=300, warm=True, veh_head="argmax",
     print("\nstage 3 -- the vehicle tree again, under the discovered signal",
           flush=True)
     vb2, log3, m3 = fit(env, list(env.names), rounds=rounds[2], warm=True,
-                        run_seed=seed + 1, tag="e28-veh", cfg=cfg, branch=0)
+                        run_seed=seed + 1, tag="e28-veh" + tag, cfg=veh_cfg, branch=0)
     report(env, vb2, "vehicle tree (stage 3): %.2f" % m3["G"])
 
+    from experiments.e33_traffic_reward import served_phases
+    s_chk = env.sample_starts(300, np.random.default_rng(77))
+    print("\nphases served (share of episodes): fixed plan %s | discovered signal %s"
+          % (" ".join("%.2f" % x for x in served_phases(env, vb2, None, s_chk)),
+             " ".join("%.2f" % x for x in served_phases(env, vb2, sb, s_chk))))
     print("\n%-40s %8s" % ("", "held-out G"))
     print("%-40s %8.2f" % ("cruise, fixed plan (e27)", -37.2))
     print("%-40s %8.2f" % ("hand-written follower, fixed plan", g_ref_v))

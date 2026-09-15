@@ -189,7 +189,7 @@ def _clause_pool(rng, alpha, Z, hot, pool, max_arity, last, seeds,
 
 def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
               etas=(0.05, 0.2), n_perturb=8, sigma=0.4, rng=None,
-              structural=True):
+              structural=True, n_sample=60):
     """Every law worth trying on one candidate region, from every source.
 
     THE FITTED LAW IS THE PRIMARY SOURCE, as it has been since e18: solve the
@@ -216,7 +216,7 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
             # only the action set the environment defines.
             from .lawsearch import discrete_primitives
             out += list(discrete_primitives(zn, n_out, d_law, rng=rng,
-                                            n_sample=60).items())
+                                            n_sample=n_sample).items())
     Xd = design_matrix(Z if bank.get("laws_on_z") else obs)
     if labels is not None:
         U, M = labels
@@ -250,6 +250,29 @@ def _insert(bank, clause, law, pos):
     return insert_arm(bank, clause, law, pos)
 
 
+def _with_prefix(prefix, cands):
+    """Every candidate guard conjoined with the parent's literals, verbatim.
+
+    Verbatim matters: the nested tree is recovered by factoring literals the
+    children share EXACTLY, so a prefix literal that got merged into a tighter
+    one would silently detach the child from its parent. A candidate literal
+    identical to a prefix literal is dropped; a candidate that reduces to the
+    prefix alone is dropped too, since it would be the parent over again.
+    """
+    keys = {(int(j), float(t), bool(n)) for j, t, n in prefix}
+    out, seen = [], set()
+    for cl in cands:
+        extra = [l for l in cl if (int(l[0]), float(l[1]), bool(l[2])) not in keys]
+        if not extra:
+            continue
+        full = [list(l) for l in prefix] + [list(l) for l in extra]
+        sig = tuple(sorted((int(j), float(t), bool(n)) for j, t, n in full))
+        if sig not in seen:
+            seen.add(sig)
+            out.append(full)
+    return out
+
+
 def best_default(env, bank, names, zn, pol_fn, n_ep, T, seed, verbose=True):
     """The law the tree falls back on, chosen by rollout before any arm exists."""
     best, best_g, label = bank["default"], None, "incumbent"
@@ -268,8 +291,21 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
          w=None, seed_clauses=None, screen_ep=120, confirm_ep=600,
          n_confirm=12, T=400, seed=777, z=2.0, rng=None, verbose=True,
          use_library=False, cem_region=True, cem_top=10, cem_iter=3,
-         cem_K=24, cem_sigma=0.4, cols=None, structural=True, weights=None):
-    """Add arms while a rollout says they pay by more than `min_gain`."""
+         cem_K=24, cem_sigma=0.4, cols=None, structural=True, weights=None,
+         prefix=None, parent_law=None, where=None, law_sample=60,
+         n_perturb=8):
+    """Add arms while a rollout says they pay by more than `min_gain`.
+
+    REGION HOOKS, for growing INSIDE an existing child (`subtree.py`):
+        prefix      literals conjoined onto every candidate guard -- the parent
+                    child's own guard, kept verbatim so the new arm factors
+                    into a nested subtree under it
+        parent_law  the law new arms start from, instead of the root default
+        where       callable(bank) -> (screen_pos, confirm_positions), so
+                    candidates are screened and placed inside the parent's
+                    block rather than at the top of the root Fallback
+    With all three None the grower is exactly what it was.
+    """
     rng = rng or np.random.default_rng(0)
     alpha = Alphabet(n_thresholds=9).fit(
         Z, list(range(Z.shape[1])) if cols is None else list(cols))
@@ -301,6 +337,10 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
             hot = hot[~claimed[hot]]
         cands = _clause_pool(rng, alpha, Z, hot, pool, max_arity, last,
                              seed_clauses if k == 0 else None, weights, cols)
+        if prefix:
+            cands = _with_prefix(prefix, cands)
+        screen_pos, positions = (where(bank) if where is not None else
+                                 (0, list(range(len(bank["clauses"]) + 1))))
 
         rows = []
         for cl in cands:
@@ -308,12 +348,14 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
             region = np.flatnonzero(m)
             if len(region) < min_n:
                 continue
-            parent = bank["default"]
+            parent = bank["default"] if parent_law is None else parent_law
             for lname, th in _laws_for(bank, region, names, zn, obs, Z, labels,
                                        qhat, w, lib, parent, rng=rng,
-                                       structural=structural):
-                g = score(env, _insert(bank, cl, th, 0), pol_fn, screen_ep, T,
-                          seed)
+                                       structural=structural,
+                                       n_sample=law_sample,
+                                       n_perturb=n_perturb):
+                g = score(env, _insert(bank, cl, th, screen_pos), pol_fn,
+                          screen_ep, T, seed)
                 rows.append((float((g - cur_cheap).mean()), cl, th, lname,
                              len(region)))
         if not rows:
@@ -345,19 +387,19 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
             from .lawcem import cem_law
             tuned = []
             for d, cl, th, lname, nrow in rows[:cem_top]:
-                probe = _insert(bank, cl, th, 0)
-                th2, _ = cem_law(env, probe, 0, pol_fn, n_iter=cem_iter,
+                probe = _insert(bank, cl, th, screen_pos)
+                th2, _ = cem_law(env, probe, screen_pos, pol_fn, n_iter=cem_iter,
                                  K=cem_K, sigma0=cem_sigma, n_ep=screen_ep,
                                  T=T, seed=seed, rng=rng)
-                g = score(env, _insert(bank, cl, th2, 0), pol_fn, screen_ep, T,
-                          seed)
+                g = score(env, _insert(bank, cl, th2, screen_pos), pol_fn,
+                          screen_ep, T, seed)
                 tuned.append((float((g - cur_cheap).mean()), cl, th2,
                               lname + "+cem", nrow))
             rows = sorted(tuned + rows, key=lambda r: -r[0])
 
         best, best_d, desc = None, min_gain, None
         for d, cl, th, lname, nrow in rows[:n_confirm]:
-            for pos in range(len(bank["clauses"]) + 1):
+            for pos in positions:
                 cand = _insert(bank, cl, th, pos)
                 ok, dl, _ = accept(env, cand, pol_fn, cur_full, confirm_ep, T,
                                    seed, z)

@@ -27,16 +27,79 @@ stage scores one bank at a time against a shared episode return. When no signal
 bank is given a fixed-time plan runs; when no vehicle bank is given a
 hand-written follower does, so either agent can be studied alone.
 
-WHAT IS REWARDED. A vehicle leaving the network pays +R_EXIT; a collision costs
-R_COLL and removes both vehicles; crossing the stop line on red costs R_RED;
-and every tick charges DELAY_W * (V0 - v) * dt for each active vehicle AND
-the full standstill delay for each vehicle that is due but blocked at its
-entrance, so throughput, safety, compliance and delay are all in one number.
-The blocked term is not decoration: without it the first search on this world
-parked one car per lane at the spawn point, nothing behind it ever entered,
-and the controller scored -6.8 against -37 for cruising with zero exits.
-Collisions do NOT end the episode -- with forty vehicles one early crash would
-erase the rest of the measurement -- they remove the two vehicles involved.
+WHAT IS REWARDED: TRAFFIC PERFORMANCE, NOT ONLY SAFETY. Every tick, over the
+cars in the network and the cars due but blocked at their entrance:
+
+    + W_SPEED  x  mean over approaches of that approach's mean speed / V0
+    - W_DELAY  x  sum of (1 - speed / V0)                     per car-second
+    - W_QUEUE  x  sum over approaches of (stopped cars there)^2
+    - W_STUCK  x  cars stuck                                  per car-second
+
+and on events: + R_EXIT per car leaving, - R_RED per red-light run, - R_COLL
+per collision; at the end of the episode, - R_LEFT per car still in the
+network or still waiting to enter.
+
+WHY EACH TERM, since each answers a failure measured on an earlier reward:
+
+    speed, per approach   averaged across approaches before across cars, so a
+                          busy moving approach cannot hide a starved one
+    queue, squared        four cars waiting on each of two approaches cost 32;
+                          eight on one approach cost 64 -- serving one phase
+                          until the episode ends is no longer cheap
+    stuck                 a car below QUEUE_V that is NOT waiting legitimately
+                          -- legitimate is before its stop line AND either
+                          queued within QUEUE_GAP behind a car or facing a red.
+                          Stopped in the box or past it, or stopped on a green
+                          with nobody close ahead, is stuck. The first search on
+                          the continuous-leaf world stopped every car before the
+                          intersection because stopped cars never crash or run
+                          a red; now the first car of each such line pays. A
+                          first version also called a car stopped on red more
+                          than STOP_ZONE short of the line stuck, which charged
+                          cautious stopping 70 per episode (e33) -- too much for
+                          what is not "stuck in the middle of the road"
+    R_LEFT at the end     the signal tree held one phase to the 60 s maximum
+                          and never served the north-south left turn inside a
+                          100 s episode: cars never served cost only delay
+                          until the episode stopped counting. Every car left
+                          waiting now pays, and episodes are 150 s with a
+                          discount of 0.999, so the end is not discounted away
+    R_COLL = 200          at 50, cruising through every red with three crashes
+                          an episode still outscored a signal that starves one
+                          phase (e33). At 200 any crash-prone controller ranks
+                          below every stable one, and no per-tick term buys a
+                          crash back
+
+THE VEHICLE TREE IS SEARCHED ON A PER-CAR REWARD (`veh_reward="car"`). The
+return above is a team score over up to 64 cars and 300 ticks, and one car
+stopping correctly at one red is a small part of it: stage 1 of e28 on it found
+a right-turn arm and not the red stop. Every term of the per-car reward belongs
+to one car, for what that car did:
+
+    + R_STOP                  once per car: it came to a stop (below QUEUE_V)
+                              within STOP_ZONE of its line while its light was red
+    + R_GREEN x v / V0        crossing its stop line on green, at its speed
+    - R_RED_CAR               crossing its stop line on red. Higher than the
+                              team's R_RED: a red run is priced for the risk
+                              it takes, not only for the crashes it happens
+                              to cause, and in light traffic it rarely causes
+                              one -- at R_RED, running reds out-earned waiting
+                              for them with two cars an episode (e34)
+    - R_COLL                  per car involved in a collision (each car, once)
+    - W_CAR_DELAY x (1 - v/V0) per car-second, blocked-at-entrance cars included
+    - W_STUCK_CAR             per car-second stuck, as above, except that a
+                              red excuses a stop only within NEAR_INT of the
+                              line, where the light can be seen: stopped on
+                              red further back with nobody close ahead is
+                              stuck. Without it, braking every car to a halt
+                              where it spawns scored -703 per car against
+                              -1161 for cruising (e34)
+    + R_EXIT, - R_LEFT        as above
+
+The signal tree is always searched on the team score: serving phases is a
+property of all the cars, not of one. The team score stays the yardstick a
+vehicle tree is reported on, so a per-car bonus that is farmed at the traffic's
+expense shows up as a drop there (e34).
 
 COLLISIONS are decided on the arc-lengths. Rear-end: two vehicles on the same
 approach lane (left turns have their own lane; through and right share one),
@@ -68,7 +131,12 @@ TAU_MAX = 8.0
 QUEUE_D, QUEUE_V = 120.0, 2.0
 
 # -- rewards ---------------------------------------------------------------------
-R_EXIT, R_COLL, R_RED, DELAY_W = 1.0, 10.0, 3.0, 0.002
+R_EXIT, R_COLL, R_RED, R_LEFT = 1.0, 200.0, 10.0, 5.0
+W_SPEED, W_DELAY, W_QUEUE, W_STUCK = 1.0, 0.05, 0.02, 1.0
+QUEUE_GAP, STOP_ZONE = 12.0, 15.0
+LONG_QUEUE = 6           # a phase queue this long anchors the signal's proposals
+# the per-car reward (veh_reward="car"): see the module docstring
+R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 50.0, 3.0
 
 ACCELS = np.array([-B_MAX, -1.5, 0.0, 1.0, A_MAX])
 ACTIONS = ["BRAKE_HARD", "BRAKE", "HOLD", "ACCEL", "ACCEL_MAX"]
@@ -84,20 +152,34 @@ FIXED_GREEN = np.array([30.0, 10.0, 30.0, 10.0])
 # the same subtree runs in every car on that car's own information.
 NEAR_INT = 60.0
 SIG_HIDDEN = -1.0     # what the signal columns read when the car is not near
-# `t_sig`: how long the phase has run (continuous mode), or the message's
-# time until MY light changes, in ticks (event mode)
-VEH_NAMES = ["v", "d_stop", "near_int", "green", "t_sig", "all_red",
+# `t_sig`, `t_sig_max`: in continuous mode how long the phase has run (and the
+# sentinel). In event mode the message's WINDOW: the earliest and the latest
+# tick, counted from the message, at which MY light can change -- what a SAE
+# J2735 SPaT broadcast carries as minEndTime / maxEndTime.
+VEH_NAMES = ["v", "d_stop", "near_int", "green", "t_sig", "t_sig_max", "all_red",
              "lead_gap", "lead_dv", "has_lead", "d_conf", "is_left", "is_right",
              "t_norm", "noise"]
+# Per phase k, over the vehicles whose movement phase k serves and that are
+# approaching (0 < distance to the stop line < QUEUE_D):
+#   q<k>  how many are queued (speed below QUEUE_V)
+#   n<k>  how many are approaching
+#   v<k>  their mean speed, or SIG_EMPTY when there are none
+#   d<k>  the distance of the nearest one to its stop line, FAR when none
+# -- what loop detectors and a V2I receiver give an actuated controller.
+SIG_EMPTY = -1.0
 SIG_NAMES = (["q%d" % k for k in range(N_PHASES)]
              + ["n%d" % k for k in range(N_PHASES)]
+             + ["v%d" % k for k in range(N_PHASES)]
+             + ["d%d" % k for k in range(N_PHASES)]
              + ["ph%d" % k for k in range(N_PHASES)]
              + ["t_phase", "all_red", "t_norm", "noise"])
 
 
-def _phase(noise):
-    """A per-episode phase in [0, 1) derived from the episode's `noise` draw."""
-    return np.mod(np.abs(noise) * 7.31, 1.0)
+def _kind_of(signal_bank):
+    """The signal controller a bank describes: no bank means the fixed plan."""
+    if signal_bank is None:
+        return "fixed"
+    return "duration" if signal_bank.get("head") == "duration" else "argmax"
 
 
 def load_geometry(path=GEOM_PATH):
@@ -114,13 +196,15 @@ class IntersectionBatch:
     STATE LAYOUT per episode, flat:
         [0:N)     movement index of each slot
         [N:2N)    arc-length s
-        [2N:3N)   speed v
+        [2N:3N)   speed v; for a pending slot, the speed it will enter at
         [3N:4N)   status: 0 pending, 1 active, 2 done
         [4N:5N)   scheduled depart time
         5N + 0..9 phase, t_phase, in_ar, ar_t, tick, noise, n_coll, n_red,
                   n_rear, n_cross
         5N + 10   the signal's planned green time (duration head), 0 = none yet
-        [5N+11 : 6N+11)  told: the slot has received its message (event mode)
+        5N + 11   the planted clock's phase, uniform in [0, 1), NEVER observed
+        [5N+12 : 6N+12)  told: the slot has received its message (event mode)
+        [6N+12 : 7N+12)  paid: the slot has collected its red-stop bonus
 
     HEADS. Each agent's leaf may be discrete or continuous, per bank:
         vehicle  `argmax` over the five named accelerations, or `scalar`: an
@@ -148,13 +232,29 @@ class IntersectionBatch:
     saw before entering it, which is the third thing this world can ask a
     blackboard for. None by default.
     """
-    N_MISC = 11
+    N_MISC = 12
+    # Bumped whenever an observation column changes meaning. It is part of the
+    # world signature, so the store and the proposal weights of an older
+    # observation are never resumed on this one -- a checkpoint that learned
+    # to read elapsed time off `t_norm` must not warm-start a world where
+    # `t_norm` carries nothing.
+    OBS_VERSION = 4
+    REWARD_VERSION = 2          # part of the store key, like OBS_VERSION
 
-    def __init__(self, n_max=40, T_end=100.0, dt=0.5, vph=(200.0, 60.0, 60.0),
-                 gamma=0.995, spawn_back=90.0, exit_after=40.0, seed=0,
+    def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
+                 gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
                  sig_mode="continuous", veh_head="argmax", sig_head="argmax",
-                 occlude=None):
+                 occlude=None, veh_reward="team", entry_v=None):
         assert sig_mode in ("continuous", "event")
+        assert veh_reward in ("team", "car")
+        self.veh_reward = veh_reward
+        # ENTRY SPEEDS. By default every car enters at V0, so a cold start never
+        # sees a slow car and cannot tell HOLD (keep this speed) from ACCEL:
+        # measured, CEM picked HOLD on one seed in three, and a tree that brakes
+        # for a red then never moves again. `entry_v=(lo, hi)` draws each car's
+        # entry speed, a trajectory-level diversity of starts, in the key.
+        self.entry_lo, self.entry_hi = ((float(entry_v[0]), float(entry_v[1]))
+                                        if entry_v else (V0, V0))
         self.occlude_lo, self.occlude_hi = ((float(occlude[0]), float(occlude[1]))
                                             if occlude else (-1.0, -1.0))
         self.occluded = occlude is not None
@@ -165,6 +265,8 @@ class IntersectionBatch:
         self.N, self.dt, self.gamma = int(n_max), float(dt), float(gamma)
         self.T_end, self.duration = float(T_end), int(round(T_end / dt))
         self.vph = tuple(float(x) for x in vph)                 # (s, l, r)
+        # a string, so the demand is in the store key (tuples are not)
+        self.demand = "%g/%g/%g" % self.vph
         self.spawn_back, self.exit_after = float(spawn_back), float(exit_after)
         self.geom = load_geometry()
         self.M = len(self.geom["path_len"])
@@ -184,7 +286,10 @@ class IntersectionBatch:
         # each movement, the arc-lengths of every point where a conflicting
         # movement crosses it, sorted
         self.cps = [np.sort(g["s_cp"][m][g["conf"][m]]) for m in range(self.M)]
-        self.k = 6 * self.N + self.N_MISC
+        self.k = 7 * self.N + self.N_MISC
+        self.obs_version = self.OBS_VERSION
+        self.reward_version = self.REWARD_VERSION
+        self.terms = None               # set to {} to collect per-term totals
 
     def seed_kernels(self, seed):
         self._kseed = int(seed)
@@ -225,6 +330,18 @@ class IntersectionBatch:
         """The continuous leaf's range: acceleration for a car, green time for
         the signal. The world clips every continuous command to it."""
         return (-B_MAX, A_MAX) if self.agent == "vehicle" else (T_MIN, T_MAX)
+
+    @property
+    def u_null(self):
+        """The continuous command that expresses no opinion, for a cold start.
+
+        NOT the middle of the range. For acceleration the middle is -0.95 m/s^2,
+        and a tree starting there brakes every car to a halt before it reaches
+        the zone where the light is heard -- measured, the memory stage then
+        found no message to store at all. Zero acceleration holds the entry
+        speed; for green time the middle of the range is a plain split.
+        """
+        return 0.0 if self.agent == "vehicle" else 0.5 * (T_MIN + T_MAX)
 
     def row_alive(self, s):
         """Which observation rows are live units this tick: active slots for
@@ -291,6 +408,20 @@ class IntersectionBatch:
         s[:, b + 0] = 0.0
         s[:, b + 1] = rng.uniform(0.0, FIXED_GREEN[0], n)
         s[:, b + 5] = rng.normal(0.0, 1.0, n)
+        # THE PLANTED CLOCK'S PHASE IS DRAWN INDEPENDENTLY AND NEVER OBSERVED.
+        # `t_norm` was the raw fraction of the episode elapsed, and on a
+        # truncated episode that is a real horizon cue: it predicts whether a
+        # car can still exit and how much delay is left to charge, and both
+        # trees bought it. A first fix offset it by a phase computed from
+        # `noise` -- but `noise` is observed, so a conjunction of the two could
+        # still decode elapsed time. A phase from its own draw, held in state
+        # and never shown, makes `t_norm` uniform and independent of the tick,
+        # of `noise`, and of everything else a tree can read.
+        s[:, b + 11] = rng.uniform(0.0, 1.0, n)
+        s[:, 2 * N:3 * N] = V0
+        if self.entry_lo < V0 or self.entry_hi < V0:
+            # drawn last, so the default world's stream is unchanged
+            s[:, 2 * N:3 * N] = rng.uniform(self.entry_lo, self.entry_hi, (n, N))
         return s
 
     def _unpack(self, s):
@@ -303,31 +434,89 @@ class IntersectionBatch:
         N = self.N
         return s[:, 5 * N + self.N_MISC:6 * N + self.N_MISC]
 
-    def _t_change(self, X, m):
-        """Ticks until movement m's light changes, under the fixed-time plan.
+    def _paid(self, s):
+        N = self.N
+        return s[:, 6 * N + self.N_MISC:7 * N + self.N_MISC]
 
-        Green now: the rest of this phase. Red now: the rest of this phase,
-        the all-red, then every phase up to my next green, each with its
-        all-red. Zero on the tick the change happens.
+    _reward_override = None
+
+    @property
+    def reward_mode(self):
+        """The return the agent under search is scored on: the per-car reward
+        for the vehicle tree when `veh_reward` is "car", the team score
+        otherwise. A reference run can name either (`reward=`)."""
+        if self._reward_override is not None:
+            return self._reward_override
+        return "car" if (self.agent == "vehicle" and self.veh_reward == "car") else "team"
+
+    _sig_kind_override = None
+
+    def _sig_kind(self):
+        """Which controller the light is under: 'fixed', 'duration' or 'argmax'.
+
+        The message has to describe THAT controller. `python_rollout` names it
+        explicitly; the generic interface reads it off the banks in force.
         """
+        if self._sig_kind_override is not None:
+            return self._sig_kind_override
+        sb = self.signal_bank if self.agent == "vehicle" else self._search_bank
+        return _kind_of(sb)
+
+    def _t_window(self, X, m, kind):
+        """(earliest, latest) ticks until movement m's light is OBSERVED to change.
+
+        A TRUTHFUL MESSAGE, NOT A PROMISE. The first version computed the time
+        from the fixed-time plan whatever controller was running, so once a
+        signal tree set its own green times the cars stored a number that was
+        false. A real broadcast (SAE J2735 SPaT) sends a window instead, because
+        an actuated controller has not decided its future yet:
+
+            fixed      exact: every future phase is known
+            duration   the running phase is exact once its green time is
+                       committed; phases not yet started lie in [T_MIN, T_MAX]
+            argmax     a per-tick switcher only guarantees [T_MIN, T_MAX]
+
+        Counted in ticks from the dynamics' own switching rules, not from
+        seconds: the fixed plan decides before elapsed time is incremented and
+        the tree controllers after, and an all-red lasts ceil(T_AR / dt) ticks.
+        `tests/test_intersection_spat.py` checks that the change always lands
+        inside the window, exactly, for all three controllers.
+        """
+        dt, eps = self.dt, 1e-9
         g = self.geom["green"]
+        n = len(X)
         ph = X[:, 0].astype(int)
-        in_ar = X[:, 2] > 0.5
-        rest = np.where(in_ar, 0.0, FIXED_GREEN[ph] - X[:, 1])
-        ar_left = np.where(in_ar, T_AR - X[:, 3], T_AR)
-        gm = np.take_along_axis(g[ph], m, 1) & ~in_ar[:, None]     # green now
-        t = np.where(gm, rest[:, None], (rest + ar_left)[:, None])
-        # red: walk the phases until mine is green
-        acc = np.zeros_like(t)
+        tau, in_ar, ar_t, plan = X[:, 1], X[:, 2] > 0.5, X[:, 3], X[:, 10]
+
+        def live(bound, t0):
+            k = np.ceil((bound - t0) / dt - eps)
+            return (np.maximum(0.0, k) + 1.0 if kind == "fixed"
+                    else np.maximum(1.0, k))
+        if kind == "fixed":
+            cur_min = cur_max = live(FIXED_GREEN[ph], tau)
+            fut_min = fut_max = live(FIXED_GREEN, 0.0)
+        else:
+            known = (plan > 0.0) if kind == "duration" else np.zeros(n, bool)
+            cur_min = np.where(known, live(plan, tau), live(T_MIN, tau))
+            cur_max = np.where(known, live(plan, tau), live(T_MAX, tau))
+            fut_min = np.full(N_PHASES, live(T_MIN, 0.0))
+            fut_max = np.full(N_PHASES, live(T_MAX, 0.0))
+        ar_full = float(np.ceil(T_AR / dt - eps))
+        ar_now = np.maximum(1.0, np.ceil((T_AR - ar_t) / dt - eps))
+        gm = np.take_along_axis(g[ph], m, 1) & ~in_ar[:, None]
+        nxt_min = np.where(in_ar, ar_now, cur_min + ar_full)
+        nxt_max = np.where(in_ar, ar_now, cur_max + ar_full)
+        tmin = np.where(gm, cur_min[:, None], nxt_min[:, None])
+        tmax = np.where(gm, cur_max[:, None], nxt_max[:, None])
         pending = ~gm
         for k in range(1, N_PHASES + 1):
             q = (ph + k) % N_PHASES
             green_q = np.take_along_axis(g[q], m, 1)
             add = pending & ~green_q
-            acc = acc + np.where(add, (FIXED_GREEN[q] + T_AR)[:, None], 0.0)
+            tmin = tmin + np.where(add, (fut_min[q] + ar_full)[:, None], 0.0)
+            tmax = tmax + np.where(add, (fut_max[q] + ar_full)[:, None], 0.0)
             pending = pending & ~green_q
-        t = t + acc
-        return np.maximum(np.round(t / self.dt), 0.0)
+        return tmin, tmax
 
     # -- observation ---------------------------------------------------------
     def _green_now(self, X):
@@ -410,26 +599,26 @@ class IntersectionBatch:
         # tick it enters the zone, and the message carries the time to change.
         if self.event:
             hear = near & (self._told(s) < 0.5)
-            t_col = self._t_change(X, m)
+            t_min, t_max = self._t_window(X, m, self._sig_kind())
         else:
             hear = near | (d_stop <= 0.0)
-            t_col = np.broadcast_to(X[:, 1:2], d_stop.shape)
+            t_min = np.broadcast_to(X[:, 1:2], d_stop.shape)
+            t_max = np.full(d_stop.shape, SIG_HIDDEN)
         o[:, :, 3] = np.where(hear, gm, SIG_HIDDEN)
-        o[:, :, 4] = np.where(hear, t_col, SIG_HIDDEN)
-        o[:, :, 5] = np.where(hear, X[:, 2:3], SIG_HIDDEN)
-        o[:, :, 6] = gap
-        o[:, :, 7] = np.where(has, V - v_lead, 0.0)
-        o[:, :, 8] = has
-        o[:, :, 9] = d_conf
-        o[:, :, 10] = g["dirs"][m] == 2
-        o[:, :, 11] = g["dirs"][m] == 0
-        # `t_norm` IS A PLANTED DISTRACTOR AND HAS TO STAY ONE. Elapsed time
-        # in a truncated episode predicts whether a car can still exit before
-        # the end, so the raw fraction was bought by both trees as a horizon
-        # cue. Offset by a per-episode phase drawn from `noise` and wrapped,
-        # it is a clock that carries nothing about the remaining time.
-        o[:, :, 12] = np.mod(X[:, 4:5] / self.duration + _phase(X[:, 5:6]), 1.0)
-        o[:, :, 13] = X[:, 5:6]
+        o[:, :, 4] = np.where(hear, t_min, SIG_HIDDEN)
+        o[:, :, 5] = np.where(hear, t_max, SIG_HIDDEN)
+        o[:, :, 6] = np.where(hear, X[:, 2:3], SIG_HIDDEN)
+        o[:, :, 7] = gap
+        o[:, :, 8] = np.where(has, V - v_lead, 0.0)
+        o[:, :, 9] = has
+        o[:, :, 10] = d_conf
+        o[:, :, 11] = g["dirs"][m] == 2
+        o[:, :, 12] = g["dirs"][m] == 0
+        # `t_norm` IS A PLANTED DISTRACTOR AND HAS TO STAY ONE: a clock whose
+        # phase is a hidden per-episode draw (see `sample_starts`), so no
+        # observed column can recover elapsed time from it.
+        o[:, :, 13] = np.mod(X[:, 4:5] / self.duration + X[:, 11:12], 1.0)
+        o[:, :, 14] = X[:, 5:6]
         o[~act] = 0.0
         return o.reshape(n * N, -1)
 
@@ -443,14 +632,19 @@ class IntersectionBatch:
         queued = appr & (V < QUEUE_V)
         o = np.zeros((n, len(SIG_NAMES)))
         for k in range(N_PHASES):
-            in_k = g["green"][k][m]
-            o[:, k] = (queued & in_k).sum(1)
-            o[:, N_PHASES + k] = (appr & in_k).sum(1)
-        o[np.arange(n), 2 * N_PHASES + X[:, 0].astype(int)] = 1.0
-        b = 3 * N_PHASES
+            in_k = appr & g["green"][k][m]
+            cnt = in_k.sum(1)
+            o[:, k] = (queued & g["green"][k][m]).sum(1)
+            o[:, N_PHASES + k] = cnt
+            vsum = np.where(in_k, V, 0.0).sum(1)
+            o[:, 2 * N_PHASES + k] = np.where(cnt > 0, vsum / np.maximum(cnt, 1),
+                                              SIG_EMPTY)
+            o[:, 3 * N_PHASES + k] = np.where(in_k, d_stop, FAR).min(1)
+        o[np.arange(n), 4 * N_PHASES + X[:, 0].astype(int)] = 1.0
+        b = 5 * N_PHASES
         o[:, b] = X[:, 1]
         o[:, b + 1] = X[:, 2]
-        o[:, b + 2] = np.mod(X[:, 4] / self.duration + _phase(X[:, 5]), 1.0)
+        o[:, b + 2] = np.mod(X[:, 4] / self.duration + X[:, 11], 1.0)
         o[:, b + 3] = X[:, 5]
         return o
 
@@ -587,7 +781,7 @@ class IntersectionBatch:
                 if ok:
                     st[i, q] = 1.0
                     S[i, q] = self.s_spawn[m[i, q]]
-                    V[i, q] = V0
+                    # V already holds the slot's entry speed (sample_starts)
                     act[i, q] = True
                     spawned.add(grp)
 
@@ -601,20 +795,55 @@ class IntersectionBatch:
         s_stop = g["s_stop"][m]
         ran = was & (before < s_stop) & (S >= s_stop) & ~gm
         X[:, 7] += ran.sum(1)
-        r -= R_RED * ran.sum(1)
-
-        # -- delay ------------------------------------------------------------
-        # A VEHICLE THAT IS DUE BUT BLOCKED AT THE ENTRANCE IS DELAYED TOO.
-        # Measured: without this the search parked the first car of every
-        # lane at its spawn point, nothing behind it ever entered, and the
-        # controller scored -6.8 against -37 for cruising with ZERO exits --
-        # an optimum of the reward, not of the road. Pending vehicles whose
-        # depart time has passed pay the full standstill delay.
-        blocked = (st == 0.0) & (dep <= t[:, None])
-        r -= DELAY_W * (((V0 - V) * was).sum(1) + V0 * blocked.sum(1)) * dt
+        car = self.reward_mode == "car"
+        r -= (R_RED_CAR if car else R_RED) * ran.sum(1)
+        if car:
+            crossed_g = was & (before < s_stop) & (S >= s_stop) & gm
+            r += R_GREEN * np.where(crossed_g, V / V0, 0.0).sum(1)
 
         # -- collisions: rear-end on a shared lane, crossing at a conflict --
         has, gap, j = self._leaders(m, S, act)
+
+        # -- traffic performance, before the collided cars are removed -------
+        # (see the module docstring for why each term is there)
+        blocked = (st == 0.0) & (dep <= t[:, None])
+        ap = g["appr"][m]
+        vf = np.where(act, V / V0, 0.0)
+        in_net = act | blocked
+        ms, na = np.zeros(n), np.zeros(n)
+        for k_a in range(4):
+            mem = in_net & (ap == k_a)
+            cnt = mem.sum(1)
+            ms = ms + np.where(cnt > 0, np.where(mem, vf, 0.0).sum(1)
+                               / np.maximum(cnt, 1), 0.0)
+            na = na + (cnt > 0)
+        t_speed = W_SPEED * np.where(na > 0, ms / np.maximum(na, 1), 0.0) * dt
+        delay_sum = np.where(in_net, 1.0 - vf, 0.0).sum(1)
+        t_delay = (W_CAR_DELAY if car else W_DELAY) * delay_sum * dt
+        if not car:
+            r += t_speed
+        r -= t_delay
+        d_now = g["s_stop"][m] - S
+        stopped = act & (V < QUEUE_V)
+        red_ok = ~gm & (d_now <= NEAR_INT) if car else ~gm
+        legit = (d_now > 0.0) & ((has & (gap < QUEUE_GAP)) | red_ok)
+        t_stuck = (W_STUCK_CAR if car else W_STUCK) * (stopped & ~legit).sum(1) * dt
+        r -= t_stuck
+        waiting = (stopped & (d_now > 0.0)) | blocked
+        qsq = np.zeros(n)
+        for k_a in range(4):
+            qa = (waiting & (ap == k_a)).sum(1)
+            qsq = qsq + qa * qa
+        t_queue = W_QUEUE * qsq * dt
+        if car:
+            # the red-stop bonus, once per car (a car cannot creep and re-stop
+            # its way to a second one)
+            paid = self._paid(s)
+            stop_red = stopped & (d_now > 0.0) & (d_now <= STOP_ZONE) & ~gm & (paid < 0.5)
+            paid[stop_red] = 1.0
+            r += R_STOP * stop_red.sum(1)
+        else:
+            r -= t_queue
         rear = act & has & (gap < 0.0)
         conf = g["conf"][m[:, :, None], m[:, None, :]]
         idx = np.arange(N)
@@ -635,7 +864,8 @@ class IntersectionBatch:
         n_rear = rear.sum(1)
         n_cross = np.triu(both, 1).sum((1, 2))
         n_ev = n_rear + n_cross
-        r -= R_COLL * n_ev
+        r -= R_COLL * (hit.sum(1) if car else n_ev)
+        t_red = R_RED * ran.sum(1)
         X[:, 6] += n_ev
         X[:, 8] += n_rear
         X[:, 9] += n_cross
@@ -646,6 +876,25 @@ class IntersectionBatch:
         out = (st == 1.0) & (S >= self.s_exit[m])
         st[out] = 2.0
         r += R_EXIT * out.sum(1)
+        t_left = np.zeros(n)
+
+        # -- the end of the episode: every car still waiting pays -----------
+        end = X[:, 4] + 1.0 >= self.duration
+        if end.any():
+            left = ((st == 1.0) | ((st == 0.0) & (dep <= t[:, None]))).sum(1)
+            t_left = np.where(end, R_LEFT * left, 0.0)
+            r -= t_left
+        if self.terms is not None:
+            # DIAGNOSTIC ONLY: undiscounted per-term totals, per episode, so a
+            # ranking the reward gets wrong can be traced to the term behind it
+            if car:
+                t_speed = np.zeros(n)
+                t_queue = np.zeros(n)
+            for key, val in (("speed", t_speed), ("delay", -t_delay),
+                             ("queue", -t_queue), ("stuck", -t_stuck),
+                             ("red", -t_red), ("crash", -R_COLL * n_ev),
+                             ("exit", R_EXIT * out.sum(1)), ("left", -t_left)):
+                self.terms[key] = self.terms.get(key, 0.0) + val
 
         # -- the message has been delivered to every car that OBSERVED from
         # inside the zone this tick: the position at observation time, not
@@ -661,14 +910,27 @@ class IntersectionBatch:
         return s, r, done
 
     # -- the reference rollout -------------------------------------------------
-    def python_rollout(self, vehicle_bank, signal_bank, s, T=None, veh_dev=None):
+    def python_rollout(self, vehicle_bank, signal_bank, s, T=None, veh_dev=None,
+                       reward=None):
         """Both trees on the numpy model. The vehicle tree runs on n * N rows,
         one per slot, with its latch reset when a slot spawns; the signal tree
-        on n rows. `signal_bank` None means the fixed-time plan. Returns G."""
+        on n rows. `signal_bank` None means the fixed-time plan. `reward`
+        "team" or "car" overrides the agent's own. Returns G."""
         from ..memory import MemBank
         T = self.duration if T is None else min(T, self.duration)
         n, N = len(s), self.N
         self._heads(vehicle_bank, signal_bank)
+        self._sig_kind_override = _kind_of(signal_bank)
+        self._reward_override = reward
+        try:
+            return self._python_rollout(vehicle_bank, signal_bank, s, T, veh_dev)
+        finally:
+            self._sig_kind_override = None
+            self._reward_override = None
+
+    def _python_rollout(self, vehicle_bank, signal_bank, s, T, veh_dev):
+        from ..memory import MemBank
+        n, N = len(s), self.N
         pv = MemBank(vehicle_bank, len(self.veh_names))
         pv.reset(n * N)
         ps = None
@@ -753,9 +1015,12 @@ class IntersectionBatch:
         vehicle agent every slot is traced in turn (N rollouts of n_ep
         episodes, a second or two); a slot's failure rows are the `lookback`
         ticks before it was removed by a collision -- it vanished before the
-        exit -- or before it crossed the stop line on red. For the signal the
-        failure rows are the ticks before a tick that paid for a collision or
-        a red run.
+        exit -- before it crossed the stop line on red, and before each spell
+        of being STUCK, judged from what the car itself observed (stopped, and
+        neither close behind a car nor at its line without a green). For the
+        signal they are the ticks before a collision and before a phase's
+        queue reaches LONG_QUEUE -- the two things the reward now charges
+        most, so the grower is pointed at them and not only at crashes.
         """
         from . import intersection_fast as IF
         from ..tick import trace_array
@@ -788,7 +1053,12 @@ class IntersectionBatch:
                     removed_early = (last < T - 1) and d_stop[-1] > -30.0
                     ran = np.flatnonzero((d_stop[:-1] > 0.0) & (d_stop[1:] <= 0.0)
                                          & (np.abs(z[:-1, ix("green")]) < 0.25))
-                    bad = list(ran)
+                    v_obs = z[:, ix("v")]
+                    near_red = (d_stop > 0.0) & (z[:, ix("green")] < 0.5)
+                    behind = (z[:, ix("has_lead")] > 0.5) &                         (z[:, ix("lead_gap")] < QUEUE_GAP)
+                    stuck = (v_obs < QUEUE_V) & ~((d_stop > 0.0) & (behind | near_red))
+                    starts = np.flatnonzero(stuck & ~np.r_[False, stuck[:-1]])
+                    bad = list(ran) + list(starts)
                     if removed_early:
                         bad.append(len(on) - 1)
                     for t in bad:
@@ -800,9 +1070,13 @@ class IntersectionBatch:
             tr = trace_array(n_ep, T, d)
             IF.run(self, vb, sb, s, T, trace=tr, dev=dev)
             r = tr[:, :, d + 2]
+            qcols = [self.sig_names.index("q%d" % k) for k in range(N_PHASES)]
             for i in range(n_ep):
                 rows.append(tr[i, :, :n_obs])
-                for t in np.flatnonzero(r[i] < -2.0):
+                long_q = tr[i, :, qcols].T.max(1) >= LONG_QUEUE
+                starts = np.flatnonzero(long_q & ~np.r_[False, long_q[:-1]])
+                crash = np.flatnonzero(r[i] < -0.5 * R_COLL)
+                for t in sorted(set(starts) | set(crash)):
                     fails.append(tr[i, max(0, t - lookback):t + 1, :n_obs])
         cov = np.concatenate(rows, 0) if rows else np.zeros((0, n_obs))
         fl = np.concatenate(fails, 0) if fails else np.zeros((0, n_obs))
