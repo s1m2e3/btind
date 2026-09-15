@@ -31,8 +31,11 @@ resumes the agent's own last tree (`fit(init_bank=...)`), never a stored score
 from an earlier cycle: those were measured against partners that are gone.
 
 THE CURRICULUM IS A RULE, NOT A CHOICE. Demand starts in light traffic, where a
-red stop pays on its own (e34), and the range widens to the next rung when a
-vehicle stage's last round accepts nothing, or after `per_rung` cycles:
+red stop pays on its own (e34), and the range widens to the next rung after
+`per_rung` cycles, or earlier when the vehicle stage has accepted nothing in
+its last round TWICE in a row -- one stalled round is what noise looks like at
+1400 episodes, and the run left rung 1 after one with a tree that still ran
+every red:
 
     rung 0   4 .. 16     rung 1   16 .. 50     rung 2   50 .. 150
     rung 3   100 .. 300  rung 4   100 .. 600 veh/h on each approach (the target)
@@ -312,8 +315,9 @@ def main(cycles=8, rounds_veh=2, rounds_sig=1, n_ep=500, pop=2, per_rung=2, crit
                 st["sig"].append(b["sig"])
         # the curriculum rule
         st["on_rung"] += 1
-        if rung < len(RUNGS) - 1 and (st.get("veh_stalled") or st["on_rung"] >= per_rung):
-            st["rung"], st["on_rung"] = rung + 1, 0
+        st["stalls"] = st.get("stalls", 0) + 1 if st.get("veh_stalled") else 0
+        if rung < len(RUNGS) - 1 and (st["stalls"] >= 2 or st["on_rung"] >= per_rung):
+            st["rung"], st["on_rung"], st["stalls"] = rung + 1, 0, 0
             print("   -> widening demand to rung %d" % st["rung"], flush=True)
         st["stage"], st["cycle"] = "veh", cyc + 1
         save_state(st)
