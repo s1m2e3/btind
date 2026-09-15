@@ -21,6 +21,13 @@ law can be anchored on directly:
 A learned critic (`intersection_critic.py`) proposes the same triples from far
 more states than a batch of deviations touches; both go through the same test.
 
+WHERE THE TREE FAILED is the third source (`anchors`): the states a few ticks
+before a red-light run, a crash or a stuck spell (`coverage_rows`), each offered
+as a point with the command at a few levels -- full braking, half, hold, full
+acceleration -- or, on a discrete leaf, each action in turn. Measured why: in
+4-16 veh/h traffic only 10 of 154 deviations paid in a round, none of them near a
+red light, so the point that pays there (+12.3, z 3.5) was never proposed.
+
 WHICH COLUMNS A KERNEL READS. The arm's own guard columns first -- the region is
 already defined on them -- then the columns that best separate the deviations
 that paid from the ones that did not, on the rows this law owns. A hint can be
@@ -28,8 +35,12 @@ given (`hint_cols`, what we are allowed to tell the model); it is offered first
 and still has to earn its place through the rollouts. The planted columns are
 never excluded, so the audit that catches them in guards catches them here.
 
-LENGTHSCALES start at the spread of each column over the rows the law owns --
-the range of the inputs, which is the other thing we are allowed to say.
+LENGTHSCALES start from the columns' own structure over the rows the law owns
+(`init_ls`): half the spread of a continuous column, and a quarter of the gap
+between neighbouring values of a column that takes only a few (the light is
+-1 / 0 / 1). Measured why: at the spread (0.8 for the light) a braking point at
+red kept 29% of its weight on green, cars slowed on green and in the box, and
+the point lost 38; at a quarter of the gap it gained +10.1.
 """
 import time
 
@@ -62,6 +73,19 @@ def _guard_cols(bank, c):
     for adv, _ in (bank.get("steps") or [None] * (c + 1))[c] or []:
         cols += [l[0] for l in adv]
     return list(dict.fromkeys(cols))
+
+
+def init_ls(Zown, cols, few=5):
+    """Initial lengthscales: categorical columns sharp, continuous ones broad."""
+    out = []
+    for j in cols:
+        vals = np.unique(Zown[:, j]) if len(Zown) else np.zeros(1)
+        if len(vals) <= few:
+            gaps = np.diff(vals)
+            out.append(0.25 * float(gaps.min()) if len(gaps) else 1.0)
+        else:
+            out.append(max(0.5 * float(Zown[:, j].std()), 1e-3))
+    return np.array(out)
 
 
 def choose_cols(Z, paid, n_cols, prefer=(), hint=(), n_obs=None):
@@ -149,6 +173,42 @@ def bound_seeds(ex, bank, c, k, kern, bounds, Zown):
         q90 = np.quantile(Zown[:, kern["cols"]], 0.9, axis=0)
         for a, b in ((lo, hi), (hi, lo)):
             out.append((kern, np.vstack([q10, q90]), np.array([[a], [b]]), 0.0))
+    return out
+
+
+def anchor_candidates(Zanc, arms, bank, c, k, kern, head, n_rows):
+    """Points at failure states this law owns (step 0), a few commands each."""
+    if Zanc is None or k != 0:
+        return []
+    rows = np.flatnonzero(arms == c)
+    if not len(rows):
+        return []
+    th = _theta(bank, c, k)
+    bounds = KL.bounds_of(bank)
+    kept = []
+    for i in rows:
+        x = Zanc[i, kern["cols"]]
+        if len(kern["X"]) and (np.abs(kern["X"] - x) / kern["ls"]).sum(1).min() < 0.5:
+            continue
+        if any((np.abs(Zanc[j, kern["cols"]] - x) / kern["ls"]).sum() < 0.5 for j in kept):
+            continue
+        kept.append(i)
+        if len(kept) >= n_rows:
+            break
+    out = []
+    for i in kept:
+        x = Zanc[i, kern["cols"]]
+        u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(Zanc[i:i + 1]),
+                         bounds=bounds)[0]
+        if head == "argmax":
+            for a in range(len(u0)):
+                y = u0.copy()
+                y[a] = u0.max() + 1.0 + 0.25 * (u0.max() - u0.min())
+                out.append((kern, x[None], y[None], 0.0))
+        else:
+            lo, hi = bounds if bounds is not None else (u0[0] - 1.0, u0[0] + 1.0)
+            for yv in (lo, 0.5 * lo, min(max(0.0, lo), hi), hi):
+                out.append((kern, x[None], np.array([[yv]]), 0.0))
     return out
 
 
@@ -275,13 +335,17 @@ def _pt(kern, i, cfg):
     return "(%s) -> %s" % (x, what)
 
 
-KDEFAULTS = dict(n_laws=2, max_points=3, n_cols=2, col_pool=5, n_prop=24, n_confirm=4,
-                 dev_ep=800, ks=(1, 3, 8), screen_ep=120, cem_iter=3, cem_K=24,
-                 prune_margin=0.25, min_share=0.05, hint_cols=())
+# SCREENING ON THE TEST'S OWN EPISODES (screen_ep None = n_ep). A point worth
+# +10 against a per-episode spread of ~50 is noise at 120 episodes, and among
+# 300 proposals the top four screened were never the good one: measured, the
+# rung-0 search accepted nothing at 120 and found its red slowdown at 500.
+KDEFAULTS = dict(n_laws=2, max_points=3, n_cols=2, col_pool=5, n_prop=24, n_confirm=8,
+                 dev_ep=3000, ks=(1, 3, 8), screen_ep=None, cem_iter=3, cem_K=24,
+                 prune_margin=0.25, min_share=0.05, hint_cols=(), n_anchor=6)
 
 
 def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0.3,
-                   n_ep=300, rng=None, verbose=True, critic=None, **kw):
+                   n_ep=300, rng=None, verbose=True, critic=None, anchors=None, **kw):
     """Grow, tune and prune inducing points on the laws that carry the most rows.
 
     `critic`, when given, is called as critic(bank, c, k, kern, head) and returns
@@ -290,6 +354,8 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
     cfg = dict(KDEFAULTS, **kw)
     cfg.update(T=T, seed=seed, z=z, min_gain=min_gain, n_ep=n_ep, zn=zn,
                actions=bank.get("actions"))
+    if cfg["screen_ep"] is None:
+        cfg["screen_ep"] = n_ep
     rng = rng or np.random.default_rng(seed)
     head = bank.get("head")
     t0 = time.time()
@@ -301,6 +367,12 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
     share = np.bincount(ex["law"].astype(int), minlength=len(laws)) / len(ex["law"])
     order = [int(i) for i in np.argsort(-share) if share[i] >= cfg["min_share"]]
     Zall = ex["z0"]
+    Zanc = arms_anc = None
+    if anchors is not None and len(anchors):
+        pa = pol_fn(bank)
+        pa.reset(len(anchors))
+        Zanc = pa.z(np.asarray(anchors, float), update=False)
+        arms_anc = pa.arbitrate(Zanc)
     log = []
     for L in order[:cfg["n_laws"]]:
         c, k = laws[L]
@@ -310,15 +382,17 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
         n_out = np.asarray(bank["default"]).shape[1]
 
         def empty(cols):
-            ls = np.maximum(Zall[own][:, cols].std(0), 1e-3)
-            return KL.make(cols, np.zeros((0, len(cols))), np.zeros((0, n_out)), ls)
+            return KL.make(cols, np.zeros((0, len(cols))), np.zeros((0, n_out)),
+                           init_ls(Zall[own], cols))
 
         def propose(kb, n):
             cs = candidates(ex, bank, c, k, kb, head, n)
             if critic is not None:
                 cs = cs + [(kb, np.atleast_2d(t[0]), np.atleast_2d(t[1]), t[2])
                            for t in critic(bank, c, k, kb, head)]
-            return sorted(cs, key=lambda t: -t[3])
+            cs = sorted(cs, key=lambda t: -t[3])
+            return cs + anchor_candidates(Zanc, arms_anc, bank, c, k, kb, head,
+                                          cfg["n_anchor"])
         if KL.n_points(kern):
             cands = propose(kern, cfg["n_prop"])
             sets = [kern["cols"]]

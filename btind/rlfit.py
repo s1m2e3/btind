@@ -347,7 +347,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             bank, cur, klog = search_kernels(
                 env, bank, names, zn, pol_fn, cur, cfg["T"], rseed, z=cfg["z"],
                 min_gain=cfg["min_gain"], n_ep=cfg["n_ep"], rng=rng,
-                verbose=verbose, critic=critic,
+                verbose=verbose, critic=critic, anchors=fail if len(fail) else None,
                 **(cfg["kern_cfg"] or {}))
             n_after = sum(KL.n_points(k) for k in [bank.get("kern_default")] + [
                 x for s_ in (bank.get("kerns") or []) for x in (s_ or [])])

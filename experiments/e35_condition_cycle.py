@@ -196,7 +196,7 @@ def main(cycles=8, rounds_veh=2, rounds_sig=1, n_ep=500, pop=2, per_rung=2, crit
                 grow_arms=2, min_n=200, n_cover=6000, explore_ep=200, cover_ep=80,
                 cem_iter=4, cem_K=32, grow_pool=40, min_gain=1.0,
                 subtree_at=(1,), kern_at=(0, 1), critic=critic, prior="const",
-                kern_cfg=dict(n_laws=2, max_points=4, dev_ep=600))
+                kern_cfg=dict(n_laws=2, max_points=4, dev_ep=3000))
     while st["cycle"] < cycles:
         cyc, rung = st["cycle"], st["rung"]
         cond = RUNGS[rung]
