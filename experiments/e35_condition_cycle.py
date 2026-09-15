@@ -156,11 +156,26 @@ def evaluate(vb, sb, n_ep=400, seed=999):
     return rows
 
 
+def config_key():
+    """What a saved state was produced under. A state from a different setup --
+    other leaves, prior or rungs -- is never resumed: measured, a relaunch with
+    continuous leaves silently continued a discrete run's cycle 2."""
+    env = world(RUNGS[0], "vehicle")
+    return dict(veh_head=env.veh_head, sig_head=env.sig_head, prior="const",
+                rungs=[list(r["approach_vph"]) for r in RUNGS],
+                obs=env.OBS_VERSION, reward=env.REWARD_VERSION)
+
+
 def load_state():
     if os.path.exists(STATE):
         with open(STATE, encoding="utf-8") as fh:
-            return json.load(fh)
-    return dict(cycle=0, stage="veh", rung=0, on_rung=0, veh=[], sig=[], history=[])
+            st = json.load(fh)
+        if st.get("config") != config_key():
+            raise SystemExit("%s was written under a different configuration (%s); "
+                             "move it aside to start fresh" % (STATE, st.get("config")))
+        return st
+    return dict(cycle=0, stage="veh", rung=0, on_rung=0, veh=[], sig=[], history=[],
+                config=config_key())
 
 
 def save_state(st):
