@@ -14,6 +14,15 @@ under plans the trees were never tuned to. e34's tree read `t_sig>28.9` -- a rul
 about one plan's 30 s green -- and a condition distribution is what makes such a
 rule stop paying.
 
+THE LEAVES ARE CONTINUOUS. A car's leaf commands an acceleration in
+[-4.5, 2.6] m/s^2 and the signal's a green time in [5, 60] s -- no action set
+is defined for either; each leaf is a kernel-interpolation law with a CONSTANT
+prior, so every state dependence is a learned inducing point, and the output is
+clipped to the bounds (`kernlaw.py`). The first points a continuous leaf is
+offered are its minimum and maximum response. The per-car reward charges steep
+changes of speed (`W_COMFORT`), and every car sees the vehicles within 50 m,
+including the most urgent crossing rival (`SENSE_R`).
+
 THE CYCLE. Stage V fits the vehicle tree against a population of signals: the
 randomised fixed plan plus the last `pop` discovered signal trees, episodes split
 evenly among them (`intersection_fast.run` with a list). Stage S fits the signal
@@ -25,9 +34,18 @@ THE CURRICULUM IS A RULE, NOT A CHOICE. Demand starts in light traffic, where a
 red stop pays on its own (e34), and the range widens to the next rung when a
 vehicle stage's last round accepts nothing, or after `per_rung` cycles:
 
-    rung 0   approach 16 .. 100 veh/h      rung 1   50 .. 300      rung 2   100 .. 600
+    rung 0   4 .. 16     rung 1   16 .. 50     rung 2   50 .. 150
+    rung 3   100 .. 300  rung 4   100 .. 600 veh/h on each approach (the target)
 
 Only the upper rung is the target; evaluation always reports it.
+
+WHY THE FIRST RUNG IS THAT LIGHT. With continuous leaves and a constant prior a
+red stop pays on its own only where the cars behind are rarely there: measured
+with an accelerate-always default, "near a red -> -2 m/s^2" gained +14.7 (z 4.2)
+at 4-16 veh/h, was neutral at 8-30, and at 16-100 every red-stop rule lost -- a
+car slowing for red was rear-ended (0.54 crashes an episode from none). The
+discrete run had escaped this at 16-100 only because its dense affine prior
+happened to brake for a close leader.
 
 ACCEPTANCE PER CONDITION. A move whose average gain hides a significant loss in
 light, medium or heavy traffic is rejected (`structure.accept`).
@@ -57,14 +75,15 @@ from btind.memory import check_arms, emit, mem_names
 from btind.rlfit import fit
 from btind.runlog import RUNS, bank_from_json, bank_json
 
-RUNGS = [dict(WIDE, approach_vph=(16.0, 100.0)), dict(WIDE, approach_vph=(50.0, 300.0)), WIDE]
+RUNGS = [dict(WIDE, approach_vph=lh) for lh in
+         ((4.0, 16.0), (16.0, 50.0), (50.0, 150.0), (100.0, 300.0))] + [WIDE]
 STATE = os.path.join(RUNS, "e35_state.json")
 N_MAX = 112
 
 
 def world(cond, agent):
     env = IntersectionBatch(n_max=N_MAX, conditions=cond, veh_reward="car",
-                            entry_v=(5.5, 11.0))
+                            entry_v=(5.5, 11.0), veh_head="scalar", sig_head="duration")
     return env.set_agent(agent)
 
 
@@ -152,7 +171,7 @@ def save_state(st):
     os.replace(tmp, STATE)
 
 
-def main(cycles=2, rounds_veh=2, rounds_sig=1, n_ep=300, pop=2, per_rung=2, critic=1,
+def main(cycles=8, rounds_veh=2, rounds_sig=1, n_ep=500, pop=2, per_rung=2, critic=1,
          seed=0):
     cycles, rounds_veh, rounds_sig, n_ep = int(cycles), int(rounds_veh), int(rounds_sig), int(n_ep)
     pop, per_rung, critic, seed = int(pop), int(per_rung), bool(int(critic)), int(seed)
@@ -161,8 +180,8 @@ def main(cycles=2, rounds_veh=2, rounds_sig=1, n_ep=300, pop=2, per_rung=2, crit
     base = dict(n_ep=n_ep, seed=11, val_ep=600, mem_at=99, beta_at=1, steps_at=1,
                 grow_arms=2, min_n=200, n_cover=6000, explore_ep=200, cover_ep=80,
                 cem_iter=4, cem_K=32, grow_pool=40, min_gain=1.0,
-                subtree_at=(1,), kern_at=(0, 1), critic=critic,
-                kern_cfg=dict(n_laws=2, max_points=3, dev_ep=600))
+                subtree_at=(1,), kern_at=(0, 1), critic=critic, prior="const",
+                kern_cfg=dict(n_laws=2, max_points=4, dev_ep=600))
     while st["cycle"] < cycles:
         cyc, rung = st["cycle"], st["rung"]
         cond = RUNGS[rung]

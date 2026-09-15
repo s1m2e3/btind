@@ -242,12 +242,24 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
             out.append(("rand%d" % i,
                         arm_parent + sigma * rng.standard_normal(
                             np.shape(arm_parent))))
+    if bank.get("prior") == "const":
+        # a constant prior: every candidate is its intercept, and duplicates go
+        from .kernlaw import constrain
+        seen, kept = set(), []
+        for nm, th in out:
+            th = constrain(bank, th)
+            key = np.round(th, 9).tobytes()
+            if key not in seen:
+                seen.add(key)
+                kept.append((nm, th))
+        out = kept
     return out
 
 
 def _insert(bank, clause, law, pos):
+    from .kernlaw import constrain
     from .memory import insert_arm
-    return insert_arm(bank, clause, law, pos)
+    return insert_arm(bank, clause, constrain(bank, law), pos)
 
 
 def _with_prefix(prefix, cands):

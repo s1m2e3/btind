@@ -83,7 +83,7 @@ def bank_json(bank, names=None, bt=None):
         # steps carry laws, so they go through the same ndarray -> list path
         steps=_jsonable(bank.get("steps")), fails=_jsonable(bank.get("fails")),
         head=bank.get("head"), actions=bank.get("actions"),
-        u_range=bank.get("u_range"),
+        u_range=bank.get("u_range"), prior=bank.get("prior"),
         kerns=_kerns_json(bank.get("kerns")),
         kern_default=_kern_json(bank.get("kern_default")),
         names=list(names) if names is not None else None, bt=bt)
@@ -112,7 +112,7 @@ def bank_from_json(d):
                betas=d.get("betas"), names=d.get("names"),
                laws_on_z=bool(d.get("laws_on_z")), mem=d.get("mem"),
                sticky=d.get("sticky"), steps=steps, fails=d.get("fails"))
-    for k in ("head", "actions", "u_range"):
+    for k in ("head", "actions", "u_range", "prior"):
         if d.get(k) is not None:
             out[k] = tuple(d[k]) if k == "u_range" else d[k]
     from .kernlaw import from_json

@@ -32,6 +32,26 @@ arm's steps (entry k is step k's kernel, None = plain affine); the default's is
 `bank["kern_default"]`. `kerns` is a per-arm list like `betas`, so every arm
 operator moves it with its arm.
 
+A CONTINUOUS LEAF IS BOUNDED. For an acceleration in [-B_MAX, A_MAX] or a green
+time in [T_MIN, T_MAX] the posterior above is clipped to the range at the
+output, and every target is kept inside it -- so every command the leaf can
+produce respects the bounds, the leaf is exact at each anchor, and between
+anchors the posterior's overshoot (the Matern kernel's K^-1 has negative
+weights) is cut at the limit. No action set is defined: how hard to brake or
+accelerate is a target the search sets.
+
+WHY NOT A LOGIT SCALE. Interpolating logit((u - lo) / (hi - lo)) and mapping back
+through a sigmoid is also bounded, and it was tried first: with the prior at a
+limit (full acceleration, logit +6.9) a braking target of -2.7 (logit -1.1) was
+swamped, so a car 10 m from its anchor still accelerated at +2.2 m/s^2 and a
+red stop on (green, d_stop) gained +0.1 where the same point in command units
+gained +12.7. The blend has to happen in the command's own units.
+
+A CONSTANT PRIOR (`bank["prior"] = "const"`) keeps only the law's intercept, so
+every state dependence of a leaf is one of its points -- "by default do b; near
+x_i do y_i" -- and nothing hides in a dense affine prior. `constrain` enforces
+it wherever a law is created or tuned.
+
 NUMERICS. The reference evaluation accumulates in the same order as the compiled
 one -- over anchors, then dimensions, one at a time -- so an argmax tie between
 two actions whose targets agree is broken identically by both.
@@ -39,6 +59,22 @@ two actions whose targets agree is broken identically by both.
 import numpy as np
 
 JITTER = 1e-6
+
+
+def bounds_of(bank):
+    """(lo, hi) for a continuous leaf with a declared range, else None."""
+    if bank.get("head") in ("scalar", "duration") and bank.get("u_range") is not None:
+        lo, hi = bank["u_range"]
+        return float(lo), float(hi)
+    return None
+
+
+def constrain(bank, theta):
+    """A law as the bank's prior allows: with a constant prior, the intercept only."""
+    th = np.array(theta, float)
+    if bank.get("prior") == "const":
+        th[:-1] = 0.0
+    return th
 
 
 def make(cols, X, Y, ls):
@@ -93,8 +129,9 @@ def ainv(kern):
     return np.linalg.inv(K)
 
 
-def evaluate(theta, kern, Xd, A=None):
-    """(n, n_out) law outputs on design rows Xd (intercept last)."""
+def evaluate(theta, kern, Xd, A=None, bounds=None):
+    """(n, n_out) law outputs on design rows Xd (intercept last). With `bounds`
+    (a continuous leaf) a kernel law's output is clipped to [lo, hi]."""
     th = np.asarray(theta, float)
     m = Xd @ th
     if kern is None or not n_points(kern):
@@ -117,14 +154,17 @@ def evaluate(theta, kern, Xd, A=None):
         for d in range(D):
             delta = delta + th[cols[d]][None, :] * (X[i, d] - Xd[:, cols[d]])[:, None]
         out = out + w[:, None] * (Y[i][None, :] - m - delta)
+    if bounds is not None:
+        out = np.minimum(np.maximum(out, bounds[0]), bounds[1])
     return out
 
 
 # ---------------------------------------------------------------- flattening
-KERN_KEYS = ("k_start", "k_D", "k_cols", "k_X", "k_Y", "k_ls", "k_A", "k_Astart")
+KERN_KEYS = ("k_start", "k_D", "k_cols", "k_X", "k_Y", "k_ls", "k_A", "k_Astart",
+             "k_lo", "k_hi")
 
 
-def pack(kerns, n_out):
+def pack(kerns, n_out, bounds=None):
     """Per FLAT law index (the order `tick.flatten` builds), the arrays a kernel
     reads. A law with no kernel has k_start[L+1] == k_start[L]."""
     L = len(kerns)
@@ -154,7 +194,10 @@ def pack(kerns, n_out):
         k_start=k_start, k_D=k_D, k_cols=k_cols, k_ls=k_ls, k_Astart=k_Astart,
         k_X=np.ascontiguousarray(np.vstack(Xs) if Xs else np.zeros((1, Dmax))),
         k_Y=np.ascontiguousarray(np.vstack(Ys) if Ys else np.zeros((1, n_out))),
-        k_A=np.ascontiguousarray(np.concatenate(As) if As else np.zeros(1)))
+        k_A=np.ascontiguousarray(np.concatenate(As) if As else np.zeros(1)),
+        # a continuous leaf's range; hi <= lo means an unbounded head
+        k_lo=np.array([bounds[0] if bounds else 0.0]),
+        k_hi=np.array([bounds[1] if bounds else 0.0]))
 
 
 def kern_args(f):
@@ -166,7 +209,7 @@ try:
 
     @njit(cache=True, inline="always")
     def law_out(z, law, laws, k_start, k_D, k_cols, k_X, k_Y, k_ls, k_A,
-                k_Astart, out, kv):
+                k_Astart, k_lo, k_hi, out, kv):
         """Write flat law `law`'s outputs on z into `out` (n_out,). `kv` is a
         scratch buffer at least as long as the largest anchor count."""
         d = laws.shape[1]
@@ -200,6 +243,8 @@ try:
                     delta = delta + laws[law, c, a] * (k_X[b0 + i, dd] - z[c])
                 acc = acc + w * (k_Y[b0 + i, a] - m - delta)
             out[a] = acc
+        if k_hi[0] > k_lo[0]:
+            out[0] = min(max(out[0], k_lo[0]), k_hi[0])
 except ImportError:            # the numpy reference needs no numba
     law_out = None
 

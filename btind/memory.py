@@ -348,7 +348,8 @@ class MemBank:
             return Xd @ self.law_of(c, k)
         if (c, k) not in self._ainv:
             self._ainv[(c, k)] = KL.ainv(kern)
-        return KL.evaluate(self.law_of(c, k), kern, Xd, self._ainv[(c, k)])
+        return KL.evaluate(self.law_of(c, k), kern, Xd, self._ainv[(c, k)],
+                           bounds=KL.bounds_of(self.b))
 
     def preferences(self, obs, temp=1.0):
         """Softmax of the scores: the FUZZY reading of a discrete-head law.

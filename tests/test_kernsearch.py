@@ -37,9 +37,13 @@ def _run(head):
     bank = check_arms(dict(names=list(N), laws_on_z=True, head=head, clauses=[], laws=[],
                            default=th, **extra), "b")
     pol = lambda b: MemBank(b, len(N))
-    cur = score(env, bank, pol, 300, env.duration, 11)
+    # a continuous leaf's single braking point is worth ~+5 against a per-episode
+    # spread of ~50 in light traffic once smooth driving is charged for, so the
+    # paired test needs more episodes to see it than the discrete leaf's
+    n_ep = 300 if head == "argmax" else 800
+    cur = score(env, bank, pol, n_ep, env.duration, 11)
     b2, cur2, _ = search_kernels(env, bank, N, mem_names(N, None), pol, cur, env.duration,
-                                 11, min_gain=1.0, n_ep=300, n_laws=1, max_points=2,
+                                 11, min_gain=1.0, n_ep=n_ep, n_laws=1, max_points=2,
                                  verbose=False)
     kern = KL.kern_of(b2, -1, 0)
     return cur.mean(), cur2.mean(), kern, N

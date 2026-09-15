@@ -33,6 +33,8 @@ from .structure import accept, score
 
 
 def _with_law(bank, arm, th):
+    from .kernlaw import constrain
+    th = constrain(bank, th)
     if arm < 0:
         return dict(bank, default=th)
     laws = list(bank["laws"])
@@ -50,8 +52,11 @@ def cem_law(env, bank, arm, pol_fn, n_iter=4, K=64, elite_frac=0.25,
     """
     rng = rng or np.random.default_rng(0)
     base = bank["default"] if arm < 0 else bank["laws"][arm]
-    mu = np.array(base if init is None else init, float)
+    from .kernlaw import constrain
+    mu = constrain(bank, base if init is None else init)
     sigma = np.full(mu.shape, sigma0)
+    if bank.get("prior") == "const":
+        sigma[:-1] = 0.0                  # only the intercept is a parameter
     n_el = max(4, int(round(elite_frac * K)))
     trace = []
     for it in range(n_iter):
@@ -62,6 +67,8 @@ def cem_law(env, bank, arm, pol_fn, n_iter=4, K=64, elite_frac=0.25,
         idx = np.argsort(-g)[:n_el]
         mu = cand[idx].mean(0)
         sigma = np.maximum(cand[idx].std(0), sigma_floor)
+        if bank.get("prior") == "const":
+            sigma[:-1] = 0.0
         trace.append(float(g[idx].mean()))
         if verbose:
             print("      cem it %d: elite %.2f  best %.2f" % (it, trace[-1],

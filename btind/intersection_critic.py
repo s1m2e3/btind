@@ -262,7 +262,8 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
             if any((np.abs(o[0] - x) / kern["ls"]).sum() < 0.5 for o in out):
                 continue
             zi = np.hstack([Z[i], np.zeros(len(th) - 1 - Z.shape[1])])[None]
-            u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(zi))[0]
+            u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(zi),
+                             bounds=KL.bounds_of(b))[0]
             j = int(np.argmax(tab[i]))
             if head == "argmax":
                 y = u0.copy()

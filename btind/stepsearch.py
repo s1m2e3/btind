@@ -55,10 +55,11 @@ def with_step(bank, arm, adv, theta):
     termination, so preemption and the new step's own future beta are what end
     it. That is a change of class the paired test prices like any other.
     """
+    from .kernlaw import constrain
     C = len(bank["clauses"])
     steps = list(bank.get("steps") or [None] * C)
     steps[arm] = list(steps[arm] or []) + [([l[:] for l in adv],
-                                            np.asarray(theta, float))]
+                                            constrain(bank, theta))]
     sticky = list(bank.get("sticky") or [False] * C)
     sticky[arm] = True
     return check_arms(dict(bank, steps=steps, sticky=sticky), "with_step")

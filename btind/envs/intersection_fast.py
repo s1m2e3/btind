@@ -30,10 +30,11 @@ from ..kernlaw import kern_args, law_out
 from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_args
 from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_STOP, STOP_ZONE,
-                           W_CAR_DELAY, W_DELAY, W_QUEUE, W_STUCK_CAR,
+                           W_CAR_DELAY, W_COMFORT, W_DELAY, W_QUEUE, W_STUCK_CAR,
                            W_SPEED, W_STUCK,
                            L_VEH, N_PHASES, NEAR_INT, QUEUE_D, QUEUE_V, R_COLL,
-                           R_EXIT, R_RED, SIG_EMPTY, SIG_HIDDEN, SPAWN_GAP, T_AR,
+                           R_EXIT, R_RED, SENSE_R, SIG_EMPTY, SIG_HIDDEN, SPAWN_GAP,
+                           T_AR, T_V_MIN,
                            T_MAX, T_MIN,
                            V0)
 
@@ -122,7 +123,10 @@ def geometry(env):
             np.ascontiguousarray(g["green"], np.bool_),
             np.ascontiguousarray(FIXED_GREEN, np.float64),
             np.ascontiguousarray(cps, np.float64),
-            np.ascontiguousarray(g["appr"], np.int64))
+            np.ascontiguousarray(g["appr"], np.int64),
+            np.ascontiguousarray(g["cum_f"], np.float64),
+            np.ascontiguousarray(g["pts_f"], np.float64),
+            np.ascontiguousarray(g["n_vert"], np.int64))
 
 
 def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None, reward=None):
@@ -221,7 +225,8 @@ def _write_mem(z, n_obs_flagged, slots, have, age, mem_cols, w_col, w_thr, w_neg
 
 @njit(cache=True, parallel=True)
 def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
-            dirs, lane_group, to_edge, green, fixed_green, cps, appr, T, G,
+            dirs, lane_group, to_edge, green, fixed_green, cps, appr, cum, pts, n_vert,
+            T, G,
             trace, dev,
             vlaws, vmem_cols, vw_col, vw_thr, vw_neg, vn_obs,
             slaws, smem_cols, sw_col, sw_thr, sw_neg, sn_obs, use_sig, vt, st,
@@ -300,6 +305,10 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         sage = 0
         zv = np.zeros(dv)
         zs = np.zeros(ds)
+        px = np.zeros(N)
+        py = np.zeros(N)
+        pvx = np.zeros(N)
+        pvy = np.zeros(N)
         uv = np.zeros(nAv)
         us = np.zeros(nAs)
         kvv = np.zeros(kmax_v)
@@ -322,6 +331,26 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             time_now = t * dt
             # ---- observe + act: vehicles -------------------------------------
             green_now = not in_ar
+            # positions and velocities in the plane, for the radius sensor
+            for q in range(N):
+                if status[q] != 1.0:
+                    continue
+                m = mv[q]
+                kk = -1
+                for vv in range(cum.shape[1]):
+                    if s[q] >= cum[m, vv]:
+                        kk += 1
+                if kk > n_vert[m] - 2:
+                    kk = n_vert[m] - 2
+                if kk < 0:
+                    kk = 0
+                c0 = cum[m, kk]
+                seg = cum[m, kk + 1] - c0
+                f = (s[q] - c0) / seg
+                px[q] = pts[m, kk, 0] + f * (pts[m, kk + 1, 0] - pts[m, kk, 0])
+                py[q] = pts[m, kk, 1] + f * (pts[m, kk + 1, 1] - pts[m, kk, 1])
+                pvx[q] = v[q] * ((pts[m, kk + 1, 0] - pts[m, kk, 0]) / seg)
+                pvy[q] = v[q] * ((pts[m, kk + 1, 1] - pts[m, kk, 1]) / seg)
             for q in range(N):
                 if status[q] != 1.0:
                     continue
@@ -400,6 +429,50 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 zv[12] = 1.0 if dirs[m] == 0 else 0.0
                 zv[13] = (t / duration + clock_phase) % 1.0
                 zv[14] = noise
+                # the radius sensor: every active vehicle within SENSE_R
+                n_near = 0.0
+                near_best = 1e18
+                near_rate = 0.0
+                riv_best = 1e18
+                riv_d = FAR
+                for o in range(N):
+                    if o == q or status[o] != 1.0:
+                        continue
+                    ddx = px[o] - px[q]
+                    ddy = py[o] - py[q]
+                    dist = np.sqrt(ddx * ddx + ddy * ddy)
+                    if dist > SENSE_R:
+                        continue
+                    n_near += 1.0
+                    if dist < near_best:
+                        near_best = dist
+                        near_rate = ddx * (pvx[o] - pvx[q]) + ddy * (pvy[o] - pvy[q])
+                    mo = mv[o]
+                    if conf[m, mo]:
+                        d_me = s_cp[m, mo] - s[q]
+                        d_rv = s_cp[mo, m] - s[o]
+                        if d_me > -HALF_CONF and d_rv > -HALF_CONF:
+                            t_me = (d_me if d_me > 0.0 else 0.0) / (v[q] if v[q] > T_V_MIN else T_V_MIN)
+                            t_rv = (d_rv if d_rv > 0.0 else 0.0) / (v[o] if v[o] > T_V_MIN else T_V_MIN)
+                            gt = abs(t_rv - t_me)
+                            if gt < riv_best:
+                                riv_best = gt
+                                riv_d = d_rv
+                zv[15] = n_near
+                if near_best < 1e17:
+                    zv[16] = near_best
+                    zv[17] = -(near_rate / near_best) if near_best > 1e-9 else 0.0
+                else:
+                    zv[16] = FAR
+                    zv[17] = 0.0
+                if riv_best < 1e17:
+                    zv[18] = 1.0
+                    zv[19] = riv_best
+                    zv[20] = riv_d
+                else:
+                    zv[18] = 0.0
+                    zv[19] = FAR
+                    zv[20] = FAR
                 vhave[q], vage[q] = _write_mem(zv, vn_obs, vslots[q], vhave[q],
                                                vage[q], vmem_cols, vw_col,
                                                vw_thr, vw_neg)
@@ -407,7 +480,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 law, latch[q], step[q] = _tick(zv, latch[q], step[q],
                                                vt[0], vt[1], vt[2], vt[3], vt[4], vt[5], vt[6], vt[7], vt[8], vt[9], vt[10], vt[11], vt[12], vt[13], vt[14], vt[15], vt[16], vt[17], vt[18], vt[19], vt[20], vt[21], vt[22])
                 law_out(zv, law, vlaws, vk[0], vk[1], vk[2], vk[3], vk[4], vk[5],
-                        vk[6], vk[7], uv, kvv)
+                        vk[6], vk[7], vk[8], vk[9], uv, kvv)
                 if vscalar:
                     u = uv[0]
                     if deviating and ts == q and dev[i, 1] > 0.0 and t >= dev[i, 0] \
@@ -473,7 +546,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 s_law, s_latch, s_step = _tick(zs, s_latch, s_step,
                                                st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7], st[8], st[9], st[10], st[11], st[12], st[13], st[14], st[15], st[16], st[17], st[18], st[19], st[20], st[21], st[22])
                 law_out(zs, s_law, slaws, sk[0], sk[1], sk[2], sk[3], sk[4], sk[5],
-                        sk[6], sk[7], us, kvs)
+                        sk[6], sk[7], sk[8], sk[9], us, kvs)
                 if sduration:
                     dur = us[0]
                     a_sig = 0
@@ -564,6 +637,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             # ---- kinematics, red running ----------------------------------------
             n_ran = 0
             green_sum = 0.0
+            comfort_sum = 0.0
             # the traced car's OWN reward under the per-car reward, for the
             # trace (a per-car value function needs it; G is unchanged)
             r_me = 0.0
@@ -572,6 +646,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     continue                     # spawned this tick: not driven yet
                 m = mv[q]
                 before = s[q]
+                vold = v[q]
                 vn = v[q] + acc_v[q] * dt
                 if vn < 0.0:
                     vn = 0.0
@@ -579,6 +654,10 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     vn = V0
                 s[q] = s[q] + vn * dt
                 v[q] = vn
+                jerk = ((vn - vold) / dt / B_MAX) ** 2
+                comfort_sum += jerk
+                if q == ts:
+                    r_me -= W_COMFORT * jerk * dt
                 gm = (not in_ar) and green[phase, m]
                 if before < s_stop[m] and s[q] >= s_stop[m]:
                     if gm:
@@ -592,6 +671,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             r -= (R_RED_CAR if car_r else R_RED) * n_ran
             if car_r:
                 r += R_GREEN * green_sum
+                r -= W_COMFORT * comfort_sum * dt
 
             # ---- collisions -----------------------------------------------------
             n_rear = 0

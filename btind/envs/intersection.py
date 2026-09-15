@@ -19,7 +19,7 @@ find: the physics here is kinematic, and safety is the tree's job.
 
 TWO AGENTS, ONE RETURN. The VEHICLE tree is a single policy every vehicle runs
 -- the way IDM is one model every car follows -- observing its own kinematics,
-its signal, its leader and its worst crossing rival. The SIGNAL tree runs once
+its signal, its leader and the vehicles around it. The SIGNAL tree runs once
 per tick over the queues and chooses EXTEND or SWITCH. Both are ordinary banks
 with an argmax head; the world is told which one is being searched (`agent`)
 and holds the other fixed (`vehicle_bank`, `signal_bank`), so every existing
@@ -87,6 +87,8 @@ to one car, for what that car did:
                               for them with two cars an episode (e34)
     - R_COLL                  per car involved in a collision (each car, once)
     - W_CAR_DELAY x (1 - v/V0) per car-second, blocked-at-entrance cars included
+    - W_COMFORT x (dv/dt / B_MAX)^2   per car-second: a regulariser on steep
+                              changes of speed, so a stop is a controlled one
     - W_STUCK_CAR             per car-second stuck, as above, except that a
                               red excuses a stop only within NEAR_INT of the
                               line, where the light can be seen: stopped on
@@ -137,6 +139,11 @@ QUEUE_GAP, STOP_ZONE = 12.0, 15.0
 LONG_QUEUE = 6           # a phase queue this long anchors the signal's proposals
 # the per-car reward (veh_reward="car"): see the module docstring
 R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 50.0, 3.0
+# COMFORT: each car's change of speed, squared, per car-second, normalised by
+# the braking limit -- a full-braking second costs W_COMFORT, a gentle stop at
+# half the rate a quarter of that per second. Measured on the discrete tree of
+# e35 cycle 0: every stop, for a red or for a leader, was full braking.
+W_COMFORT = 1.0
 
 ACCELS = np.array([-B_MAX, -1.5, 0.0, 1.0, A_MAX])
 ACTIONS = ["BRAKE_HARD", "BRAKE", "HOLD", "ACCEL", "ACCEL_MAX"]
@@ -168,9 +175,28 @@ SIG_HIDDEN = -1.0     # what the signal columns read when the car is not near
 # sentinel). In event mode the message's WINDOW: the earliest and the latest
 # tick, counted from the message, at which MY light can change -- what a SAE
 # J2735 SPaT broadcast carries as minEndTime / maxEndTime.
+#
+# A RADIUS SENSOR, beside the leader. A car sees every vehicle within SENSE_R
+# metres in the plane -- ahead, behind, beside and across the box -- reduced to
+# six numbers a guard can read:
+#   n_near        how many
+#   near_d        distance to the nearest one (FAR when none)
+#   near_closing  how fast that nearest one is getting closer, m/s (0 when none)
+#   has_rival     some vehicle in range is heading for a conflict point it
+#                 shares with me, and neither of us has passed it
+#   rival_dt      the smallest gap, s, between when I and such a rival reach
+#                 our shared point at current speeds (FAR when none) -- the
+#                 gap-acceptance quantity a driver uses at a crossing
+#   rival_d       that rival's distance to the shared point
+# Measured before it existed (e35 cycle 0): the leader was the only other
+# vehicle a car could perceive, so crossing traffic was avoided only by obeying
+# the light.
+SENSE_R = 50.0
+T_V_MIN = 0.5          # the speed floor a time-to-conflict is computed with
 VEH_NAMES = ["v", "d_stop", "near_int", "green", "t_sig", "t_sig_max", "all_red",
              "lead_gap", "lead_dv", "has_lead", "d_conf", "is_left", "is_right",
-             "t_norm", "noise"]
+             "t_norm", "noise",
+             "n_near", "near_d", "near_closing", "has_rival", "rival_dt", "rival_d"]
 # Per phase k, over the vehicles whose movement phase k serves and that are
 # approaching (0 < distance to the stop line < QUEUE_D):
 #   q<k>  how many are queued (speed below QUEUE_V)
@@ -199,6 +225,10 @@ def load_geometry(path=GEOM_PATH):
     out = {k: g[k] for k in g.files}
     out["lane_group"] = out["appr"] * 2 + (out["dirs"] == 2)     # left alone
     out["s_cp"] = np.nan_to_num(out["s_cp"], nan=-1e9)
+    # polylines are NaN-padded to 7 vertices; a padded vertex is never reached
+    out["n_vert"] = np.isfinite(out["cum"]).sum(1).astype(np.int64)
+    out["cum_f"] = np.where(np.isfinite(out["cum"]), out["cum"], np.inf)
+    out["pts_f"] = np.nan_to_num(out["pts"], nan=0.0)
     return out
 
 
@@ -251,8 +281,8 @@ class IntersectionBatch:
     # observation are never resumed on this one -- a checkpoint that learned
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
-    OBS_VERSION = 4
-    REWARD_VERSION = 2          # part of the store key, like OBS_VERSION
+    OBS_VERSION = 5
+    REWARD_VERSION = 3          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -602,6 +632,62 @@ class IntersectionBatch:
         has = np.isfinite(best)
         return has, np.where(has, best - L_VEH, FAR), j
 
+    def _xy(self, m, S):
+        """Position (x, y) in the plane and unit heading (hx, hy) of each slot,
+        from its movement's polyline and its arc-length."""
+        g = self.geom
+        cum, pts, nv = g["cum_f"], g["pts_f"], g["n_vert"]
+        k = (S[..., None] >= cum[m]).sum(-1) - 1
+        k = np.minimum(np.maximum(k, 0), nv[m] - 2)
+        c0 = np.take_along_axis(cum[m], k[..., None], -1)[..., 0]
+        c1 = np.take_along_axis(cum[m], (k + 1)[..., None], -1)[..., 0]
+        P = pts[m]                                          # (n, N, 7, 2)
+        p0 = np.take_along_axis(P, k[..., None, None].repeat(2, -1), -2)[..., 0, :]
+        p1 = np.take_along_axis(P, (k + 1)[..., None, None].repeat(2, -1), -2)[..., 0, :]
+        seg = c1 - c0
+        f = (S - c0) / seg
+        x = p0[..., 0] + f * (p1[..., 0] - p0[..., 0])
+        y = p0[..., 1] + f * (p1[..., 1] - p0[..., 1])
+        hx = (p1[..., 0] - p0[..., 0]) / seg
+        hy = (p1[..., 1] - p0[..., 1]) / seg
+        return x, y, hx, hy
+
+    def _sense(self, m, S, V, act):
+        """The radius sensor's six columns per slot (see VEH_NAMES)."""
+        g = self.geom
+        n, N = S.shape
+        x, y, hx, hy = self._xy(m, S)
+        dx = x[:, None, :] - x[:, :, None]                  # (n, me, other)
+        dy = y[:, None, :] - y[:, :, None]
+        dist = np.sqrt(dx * dx + dy * dy)
+        eye = np.eye(N, dtype=bool)[None]
+        inR = act[:, :, None] & act[:, None, :] & ~eye & (dist <= SENSE_R)
+        n_near = inR.sum(2).astype(float)
+        dd = np.where(inR, dist, np.inf)
+        jn = np.argmin(dd, 2)
+        best = np.take_along_axis(dd, jn[:, :, None], 2)[:, :, 0]
+        has_near = np.isfinite(best)
+        vx, vy = V * hx, V * hy
+        dvx = vx[:, None, :] - vx[:, :, None]
+        dvy = vy[:, None, :] - vy[:, :, None]
+        rate = np.take_along_axis(dx * dvx + dy * dvy, jn[:, :, None], 2)[:, :, 0]
+        closing = np.where(has_near & (best > 1e-9), -(rate / np.where(best > 1e-9, best, 1.0)),
+                           0.0)
+        mq, mo = m[:, :, None], m[:, None, :]
+        conf = g["conf"][mq, mo]
+        d_me = g["s_cp"][mq, mo] - S[:, :, None]
+        d_rv = g["s_cp"][mo, mq] - S[:, None, :]
+        ok = inR & conf & (d_me > -HALF_CONF) & (d_rv > -HALF_CONF)
+        t_me = np.maximum(d_me, 0.0) / np.maximum(V[:, :, None], T_V_MIN)
+        t_rv = np.maximum(d_rv, 0.0) / np.maximum(V[:, None, :], T_V_MIN)
+        gap_t = np.where(ok, np.abs(t_rv - t_me), np.inf)
+        jr = np.argmin(gap_t, 2)
+        rbest = np.take_along_axis(gap_t, jr[:, :, None], 2)[:, :, 0]
+        has_rival = np.isfinite(rbest)
+        r_d = np.take_along_axis(d_rv, jr[:, :, None], 2)[:, :, 0]
+        return (n_near, np.where(has_near, best, FAR), closing, has_rival.astype(float),
+                np.where(has_rival, rbest, FAR), np.where(has_rival, r_d, FAR))
+
     def _d_conf(self, m, s):
         """Distance to MY nearest conflict point still ahead: geometry only."""
         d_conf = np.full(s.shape, FAR)
@@ -668,6 +754,8 @@ class IntersectionBatch:
         # observed column can recover elapsed time from it.
         o[:, :, 13] = np.mod(X[:, 4:5] / self.duration + X[:, 11:12], 1.0)
         o[:, :, 14] = X[:, 5:6]
+        for c_i, col in enumerate(self._sense(m, S, V, act)):
+            o[:, :, 15 + c_i] = col
         o[~act] = 0.0
         return o.reshape(n * N, -1)
 
@@ -754,9 +842,6 @@ class IntersectionBatch:
             if self.event:
                 raise NotImplementedError("signal populations on the Python path "
                                           "in event mode")
-            if any(b is not None and b.get("head") == "duration" for b in pop):
-                raise NotImplementedError("green-time signal trees in a population "
-                                          "on the Python path")
             if fresh_batch or getattr(self, "_pop", None) is None or self._pop_n != n:
                 self._pop = [None if b is None else MemBank(b, len(self.sig_names))
                              for b in pop]
@@ -836,9 +921,10 @@ class IntersectionBatch:
         if a_sig is None:
             a_sig = self.fixed_signal_action(s)
         a_sig = np.asarray(a_sig, float).reshape(n)
-        if np.isnan(a_sig).any():
+        fixmask = np.isnan(a_sig)
+        if fixmask.any():
             # episodes whose partner in a population is the fixed plan
-            a_sig = np.where(np.isnan(a_sig), self.fixed_signal_action(s), a_sig)
+            a_sig = np.where(fixmask, self.fixed_signal_action(s), a_sig)
         r = np.zeros(n)
         t = X[:, 4] * dt
 
@@ -854,11 +940,14 @@ class IntersectionBatch:
         if sig_duration:
             # the plan is read at the first live tick of a phase, then the
             # phase runs until it is out; the tree keeps ticking meanwhile
-            need = live & (X[:, 10] <= 0.0)
+            need = live & ~fixmask & (X[:, 10] <= 0.0)
             X[need, 10] = np.clip(a_sig[need], T_MIN, T_MAX)
             X[live, 1] += dt
-            switch = live & (X[:, 1] >= X[:, 10] - 1e-9)
+            switch = live & ~fixmask & (X[:, 1] >= X[:, 10] - 1e-9)
             X[switch, 10] = 0.0
+            # the fixed-plan partners of a population switch by their own rule
+            switch = switch | (live & fixmask & ((a_sig >= 0.5) & (X[:, 1] >= T_MIN)
+                                                 | (X[:, 1] >= T_MAX)))
         else:
             X[live, 1] += dt
             switch = live & ((a_sig >= 0.5) & (X[:, 1] >= T_MIN) | (X[:, 1] >= T_MAX))
@@ -899,6 +988,7 @@ class IntersectionBatch:
         # -- kinematics: the tree's acceleration, clipped ---------------------
         before = S.copy()
         v_new = np.clip(V + acc * dt, 0.0, V0)
+        jerk = np.where(was, ((v_new - V) / dt / B_MAX) ** 2, 0.0)
         S[was] = S[was] + v_new[was] * dt
         V[was] = v_new[was]
 
@@ -908,9 +998,12 @@ class IntersectionBatch:
         X[:, 7] += ran.sum(1)
         car = self.reward_mode == "car"
         r -= (R_RED_CAR if car else R_RED) * ran.sum(1)
+        t_comfort = np.zeros(n)
         if car:
             crossed_g = was & (before < s_stop) & (S >= s_stop) & gm
             r += R_GREEN * np.where(crossed_g, V / V0, 0.0).sum(1)
+            t_comfort = W_COMFORT * jerk.sum(1) * dt
+            r -= t_comfort
 
         # -- collisions: rear-end on a shared lane, crossing at a conflict --
         has, gap, j = self._leaders(m, S, act)
@@ -1004,7 +1097,9 @@ class IntersectionBatch:
             for key, val in (("speed", t_speed), ("delay", -t_delay),
                              ("queue", -t_queue), ("stuck", -t_stuck),
                              ("red", -t_red), ("crash", -R_COLL * n_ev),
-                             ("exit", R_EXIT * out.sum(1)), ("left", -t_left)):
+                             ("exit", R_EXIT * out.sum(1)), ("left", -t_left),
+                             ("comfort", -t_comfort),
+                             ("n_rear", n_rear.astype(float)), ("n_cross", n_cross.astype(float))):
                 self.terms[key] = self.terms.get(key, 0.0) + val
 
         # -- the message has been delivered to every car that OBSERVED from

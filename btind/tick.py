@@ -159,7 +159,7 @@ def flatten(bank, n_obs):
 
     m = bank.get("mem")
     w_col, w_thr, w_neg, _, _ = _lits([(m or {}).get("write") or []])
-    kp = KL.pack(kerns, laws[0].shape[1])
+    kp = KL.pack(kerns, laws[0].shape[1], KL.bounds_of(bank))
     kp["has_kern"] = any(KL.n_points(k) for k in kerns)
     return dict(
         **kp,

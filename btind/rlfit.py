@@ -47,7 +47,7 @@ DEFAULTS = dict(
     subtree_at=(1, 2), subtree_arms=2, subtree_pool=30,
     explore_ep=300, explore_ks=(1, 3, 8), explore_frac=0.25,
     # kernel-interpolation leaves (`kernsearch.py`): rounds, and its settings
-    kern_at=(), kern_cfg=None, critic=False,
+    kern_at=(), kern_cfg=None, critic=False, prior=None,
     stall_before_kick=2, kick_size=1, hop_budget=2,
     seed_stride=1009, val_seed=90210, val_ep=1200,
 )
@@ -135,6 +135,8 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                          actions=list(getattr(env, "actions", []) or []) or None)
         if head in ("scalar", "duration"):
             seed_bank["u_range"] = tuple(env.u_range)
+        if cfg.get("prior"):
+            seed_bank["prior"] = cfg["prior"]
         th, _ = cem_law(env, seed_bank, -1, pol_fn, n_iter=cfg["cem_iter"],
                         K=cfg["cem_K"], sigma0=cfg["cem_sigma"],
                         n_ep=cfg["n_ep"], T=cfg["T"], seed=cfg["seed"], rng=rng)

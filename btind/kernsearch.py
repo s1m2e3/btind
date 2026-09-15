@@ -102,7 +102,8 @@ def candidates(ex, bank, c, k, kern, head, n_prop, u_range=None):
                 if (np.abs(o[0] - x) / kern["ls"]).sum() < 0.5 and o[2] != float(ex["adv"][i])]
         if near:
             continue
-        u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(z))[0]
+        u0 = KL.evaluate(th, kern if KL.n_points(kern) else None, design_matrix(z),
+                         bounds=KL.bounds_of(bank))[0]
         if head == "argmax":
             a = int(ex["a"][i, 0])
             y = u0.copy()
@@ -120,12 +121,40 @@ def candidates(ex, bank, c, k, kern, head, n_prop, u_range=None):
             out.append((x, y, float(ex["adv"][i])))
         if len(out) >= n_prop:
             break
-    return [(kern, x, y, a) for x, y, a in out]
+    return [(kern, x[None], y[None], a) for x, y, a in out]
+
+
+def bound_seeds(ex, bank, c, k, kern, bounds, Zown):
+    """For a continuous leaf with no points yet: the leaf's two extreme
+    responses as a PAIR of points -- the minimum command where braking hardest
+    paid most, the maximum where accelerating hardest did -- and, whatever the
+    deviations say, the pair across the spread of the leaf's own columns in
+    both orientations. The rollout decides which, if any, the leaf keeps."""
+    lo, hi = bounds
+    L = flat_laws(bank).index((c, k))
+    own = ex["law"].astype(int) == L
+    out = []
+    lvl = ex["a"][:, 0]
+    best = {}
+    for name, target in (("lo", lo), ("hi", hi)):
+        m = own & (ex["adv"] > 0) & (np.abs(lvl - target) < 1e-6)
+        if m.any():
+            i = int(np.flatnonzero(m)[np.argmax(ex["adv"][m])])
+            best[name] = (ex["z0"][i, kern["cols"]], float(ex["adv"][i]))
+    if "lo" in best and "hi" in best:
+        out.append((kern, np.vstack([best["lo"][0], best["hi"][0]]),
+                    np.array([[lo], [hi]]), best["lo"][1] + best["hi"][1]))
+    if len(Zown):
+        q10 = np.quantile(Zown[:, kern["cols"]], 0.1, axis=0)
+        q90 = np.quantile(Zown[:, kern["cols"]], 0.9, axis=0)
+        for a, b in ((lo, hi), (hi, lo)):
+            out.append((kern, np.vstack([q10, q90]), np.array([[a], [b]]), 0.0))
+    return out
 
 
 def _add(kern, x, y):
-    return KL.make(kern["cols"], np.vstack([kern["X"], x[None]]),
-                   np.vstack([kern["Y"], y[None]]), kern["ls"])
+    return KL.make(kern["cols"], np.vstack([kern["X"], np.atleast_2d(x)]),
+                   np.vstack([kern["Y"], np.atleast_2d(y)]), kern["ls"])
 
 
 def add_points(env, bank, c, k, cands, kern, pol_fn, cur, cfg, verbose=False,
@@ -180,9 +209,13 @@ def cem_kernel(env, bank, c, k, kern, pol_fn, cur, cfg, rng, scale, y_sigma,
                          np.log(kern["ls"])])
     sig = np.concatenate([np.full(M * D, 0.25), np.full(M * nA, 0.5), np.full(D, 0.3)])
 
+    bounds = KL.bounds_of(bank)
+
     def unpack(p):
         X = p[:M * D].reshape(M, D) * scale
         Y = p[M * D:M * D + M * nA].reshape(M, nA) * y_sigma
+        if bounds is not None:
+            Y = np.clip(Y, bounds[0], bounds[1])
         return KL.make(kern["cols"], X, Y, np.exp(p[M * D + M * nA:]))
     n_el = max(3, cfg["cem_K"] // 4)
     for it in range(cfg["cem_iter"]):
@@ -236,6 +269,8 @@ def _pt(kern, i, cfg):
                   for j, v in zip(kern["cols"], kern["X"][i]))
     y = kern["Y"][i]
     acts = cfg.get("actions")
+    if len(y) == 1:
+        return "(%s) -> %.3g" % (x, y[0])
     what = (acts[int(np.argmax(y))] if acts and len(y) > 1 else "%.3g" % y[0])
     return "(%s) -> %s" % (x, what)
 
@@ -281,7 +316,8 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
         def propose(kb, n):
             cs = candidates(ex, bank, c, k, kb, head, n)
             if critic is not None:
-                cs = cs + [(kb,) + tuple(t) for t in critic(bank, c, k, kb, head)]
+                cs = cs + [(kb, np.atleast_2d(t[0]), np.atleast_2d(t[1]), t[2])
+                           for t in critic(bank, c, k, kb, head)]
             return sorted(cs, key=lambda t: -t[3])
         if KL.n_points(kern):
             cands = propose(kern, cfg["n_prop"])
@@ -297,6 +333,10 @@ def search_kernels(env, bank, names, zn, pol_fn, cur, T, seed, z=2.0, min_gain=0
             sets = [list(s) for s in combinations(pool, min(cfg["n_cols"], len(pool)))]
             per = max(2 if head == "argmax" else 8, cfg["n_prop"] // max(1, len(sets)))
             cands = [cd for s in sets for cd in propose(empty(s), per)]
+            bnd = KL.bounds_of(bank)
+            if bnd is not None:
+                cands = [cd for s in sets
+                         for cd in bound_seeds(ex, bank, c, k, empty(s), bnd, Zall[own])] + cands
         if verbose:
             print("    kernel on %s (%.0f%% of deviations, %d paid): %d column sets "
                   "from {%s}, %d proposals"
