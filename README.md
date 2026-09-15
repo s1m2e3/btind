@@ -1,7 +1,8 @@
 # btind — inducing behaviour trees by measured return
 
 A behaviour tree is a readable controller: a `Fallback` of guarded `Sequence`s,
-each guard a condition on the observation and each action an affine control law.
+each guard a condition on the observation and each action a control law -- an
+affine law refined by a few learned inducing points ("in state x do y").
 This repository asks whether such a tree can be **discovered** rather than
 written — the partition, the laws, and (latterly) the memory.
 
@@ -26,6 +27,17 @@ iteration, `Q^pi` by probing the action space, then the region-restricted
 deterministic policy gradient on the laws and a boundary term on the guards.
 Each mechanism runs on its own cadence (`loop.py`): gradients every round, the
 discrete law library and structure moves every third, memory once.
+
+**Stage 3 — discovery from zero on the intersection.** No planner and no
+expert. Guards, steps, terminations, failure clauses, nested subtrees and
+blackboards are grown by rollout (`rlfit.py`). Each leaf is a kernel-interpolation
+law whose inducing points, targets, lengthscales and input columns are learned
+(`kernlaw.py`, `kernsearch.py`), proposed where exploratory deviations paid and
+where a critic trained on those exact advantages predicts they would
+(`intersection_critic.py`). The vehicle and signal trees are trained in
+alternating stages against populations of each other, over per-episode
+operating conditions (100–600 veh/h per approach, turning shares, plan greens),
+with a demand curriculum and per-condition acceptance (e35).
 
 **Every move is a proposal.** Nothing is applied because a criterion liked it —
 a paired rollout test accepts or rejects it.
@@ -60,23 +72,47 @@ tied with a planted distractor). What has never mis-ranked is a short rollout.
                                  head: a transient column, its arrival as the
                                  event, a countdown, and the arms that read it
                      rlfit       the pure-RL loop, no expert anywhere
-    experiments/     e18-e32, each with its findings in the docstring
+                     subtree     nested subtrees: grown inside a child, compiled
+                                 flat, factored back for display
+                     kernlaw     the kernel-interpolation leaf (affine prior
+                                 mean + learned inducing points), numpy and numba
+                     kernsearch  proposes, tunes and prunes inducing points
+                     intersection_critic  V-hat and A-hat for the intersection,
+                                 scored on held-out data, proposing points
+    experiments/     e18-e35, each with its findings in the docstring
                      e26-e27: highway and the reactive intersection do NOT
                      reward sequences (progress is observable); e29, e32: the
                      event-mode and occluded intersections DO reward memory
                      (+36 and +6.5 hand-written); e28, e30: discovery from zero
+                     e33: a traffic reward that ranks stop-all < crash/starve <
+                     fixed plan < actuated; e34: one-arm growth cannot reach a
+                     follower at full demand (each piece alone loses), a per-car
+                     reward and a demand ladder can (team -95 vs hand-written
+                     -223, no crashes); e35: kernel leaves, critic, operating
+                     conditions and the vehicle/signal stage cycle
     data/, figs/     measured results
     fit_bt.py        entry point
 
 ## Running
 
-    pip install -r requirements.txt
-    python fit_bt.py --runs 2
+Everything runs in a conda environment (`bt-induction`), never the system Python:
+
+    conda activate bt-induction
+    python -m pytest -q tests
+    python experiments/e35_condition_cycle.py cycles=6   # resumable
 
 Note: import `numba` before `xgboost` — the reverse order breaks llvmlite's DLL
 load on Windows.
 
 ## Honest status
+
+On the intersection, the vehicle tree climbed a demand ladder from zero to a
+team score of -95 against -223 for a hand-written follower, with a two-step
+Sequence, a termination, a fail clause and a nested subtree -- but one of its
+arms read the fixed plan's 30 s green, which is why training now spans
+operating conditions and partner populations (e35, in progress). The learned
+critic ranks advantages usefully at medium and heavy demand and poorly in light
+traffic; it only proposes.
 
 On ForageWorld the emitted tree scores ~21 against a replanning CEM baseline of
 ~13. On NestWorld with partial observability the pipeline does **not** yet work:
