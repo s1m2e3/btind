@@ -171,11 +171,25 @@ W_SPEED, W_DELAY, W_QUEUE, W_STUCK = 1.0, 0.05, 0.02, 25.0
 # Three cases, in the order they deserve:
 #   FREE    stopped on GREEN with nobody close ahead -- nothing is stopping it
 #   QUEUE   stopped on GREEN behind a leader -- the queue should be discharging
-#   EARLY   stopped on RED further than STOP_FAR from the line, with no leader:
-#           legitimate waiting happens AT the line, not halfway down the block
+#   EARLY   stopped on RED with no leader, charged BY DEGREE: the road left
+#           empty beyond STOP_ZONE, so waiting at the line is free and
+#           abandoning the approach 150 m back is not
 # Stopping on red near the line, or behind a queue on red, is free -- that is
 # what a car is supposed to do, and charging it cost 70 an episode in e33.
-W_STUCK_FREE, W_STUCK_QUEUE, W_STUCK_EARLY, STOP_FAR = 25.0, 8.0, 5.0, 40.0
+# EARLY IS CHARGED PER TICK, so its weight is a RATE and must be sized as one.
+# At 5.0 (x3 for the per-car scale) a car waiting 30 s at a red 40 m back paid
+# 900 against the 200 it saved by not running the red, so braking for a red went
+# net negative and the planted rule in test_kernsearch stopped paying -- its best
+# candidate fell from tens of units to +1.35 +-5.77.
+#
+# AND IT IS CHARGED BY DEGREE, NOT BY A CLIFF. There is no one distance that is
+# "too early": a car at 11 m/s needs 13 m to stop, so stopping at 40 m is careful
+# and stopping at 150 m is abandoning the approach, and a threshold between them
+# would call the first a fault and the second no worse. The charge grows with how
+# much road is left standing empty beyond a normal stopping zone, which is also
+# what lets a far car brake smoothly and a near one brake hard without either
+# being penalised for the profile it needed.
+W_STUCK_FREE, W_STUCK_QUEUE, W_STUCK_EARLY = 25.0, 8.0, 0.5
 # GREEN HELD ON A PHASE WITH NOBODY TO SERVE, per second, charged to the signal.
 # Modelled on sumo_test's `LAMBDA_OVER * relu(T_k - T_k_floor)`, whose floor is
 # ZERO when no vehicle sits within its commit distance -- so any green on an
@@ -1190,11 +1204,14 @@ class IntersectionBatch:
         past = stopped & ~(d_now > 0.0)          # stopped in or past the box
         w_free = before & gm_eff & ~led
         w_queue = before & gm_eff & led
-        w_early = before & ~gm_eff & ~led & (d_now > STOP_FAR)
+        # stopped on red with nobody ahead: charged by the road left empty
+        # beyond a normal stopping zone, zero at the line and growing with it
+        early = np.where(before & ~gm_eff & ~led,
+                         np.maximum(d_now - STOP_ZONE, 0.0) / NEAR_INT, 0.0)
         scale = (W_STUCK_CAR / W_STUCK) if car else 1.0
         t_stuck = scale * dt * (W_STUCK_FREE * (w_free | past).sum(1)
                                 + W_STUCK_QUEUE * w_queue.sum(1)
-                                + W_STUCK_EARLY * w_early.sum(1))
+                                + W_STUCK_EARLY * early.sum(1))
         r -= t_stuck
         waiting = (stopped & (d_now > 0.0)) | blocked
         qsq = np.zeros(n)

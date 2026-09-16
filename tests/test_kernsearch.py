@@ -50,24 +50,12 @@ def _run(head):
     return cur.mean(), cur2.mean(), kern, N
 
 
-@pytest.mark.xfail(reason="REWARD_VERSION 5: stopping short of a red beyond "
-                   "STOP_FAR is now charged (W_STUCK_EARLY), which is what these "
-                   "tests learn -- the search now accepts nothing and g1 == g0 "
-                   "exactly. The threshold +10.0 was calibrated to the old flat "
-                   "W_STUCK=1 reward and needs re-baselining against the new one; "
-                   "NOT yet verified to be only a scale change.", strict=False)
 def test_discrete_leaf_learns_a_red_stop_point():
     g0, g1, kern, N = _run("argmax")
     assert g1 > g0 + 10.0
     assert N.index("green") in kern["cols"]
 
 
-@pytest.mark.xfail(reason="REWARD_VERSION 5: stopping short of a red beyond "
-                   "STOP_FAR is now charged (W_STUCK_EARLY), which is what these "
-                   "tests learn -- the search now accepts nothing and g1 == g0 "
-                   "exactly. The threshold +10.0 was calibrated to the old flat "
-                   "W_STUCK=1 reward and needs re-baselining against the new one; "
-                   "NOT yet verified to be only a scale change.", strict=False)
 def test_continuous_leaf_learns_a_braking_point():
     g0, g1, kern, N = _run("scalar")
     assert g1 > g0 + 10.0

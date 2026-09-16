@@ -32,7 +32,7 @@ from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_STOP, STOP_ZONE,
                            W_CAR_DELAY, W_COMFORT, W_DELAY, W_OVER, COMMIT_D,
                            W_QUEUE, W_STUCK_CAR, W_STUCK_FREE, W_STUCK_QUEUE,
-                           W_STUCK_EARLY, STOP_FAR,
+                           W_STUCK_EARLY, STOP_ZONE, NEAR_INT,
                            W_SPEED, W_STUCK,
                            L_VEH, N_PHASES, NEAR_INT, QUEUE_D, QUEUE_V, R_COLL,
                            R_EXIT, R_RED, SENSE_R, SIG_EMPTY, SIG_HIDDEN, SPAWN_GAP,
@@ -750,8 +750,13 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                             w_st = W_STUCK_FREE
                         elif not red_q:
                             w_st = W_STUCK_QUEUE
-                        elif not led_q and d_q > STOP_FAR:
-                            w_st = W_STUCK_EARLY
+                        elif not led_q:
+                            # by degree: the road left empty beyond a normal
+                            # stopping zone, zero at the line
+                            ex = d_q - STOP_ZONE
+                            if ex < 0.0:
+                                ex = 0.0
+                            w_st = W_STUCK_EARLY * ex / NEAR_INT
                         else:
                             w_st = 0.0
                         if w_st > 0.0:
