@@ -94,14 +94,29 @@ def world(agent, cond=SPAN, groups=N_GROUPS):
     return env.set_agent(agent)
 
 
-def load_vehicle(path=VEHICLE):
-    """e37's car, frozen. It is the partner, never the thing under search."""
+def load_vehicle(which="hand", path=VEHICLE):
+    """The frozen partner. It is never the thing under search.
+
+    WHY NOT e37's DISCOVERED CAR, which was the obvious choice: it learned to
+    run red lights -- 52.1 an episode in its own training world against the
+    hand-written follower's 2.1, trading them for throughput because the team
+    return let it. Measured, that made 49.5% of the SIGNAL's objective its
+    partner's law-breaking and left delay and queue together at 0.5%, so the
+    light was being graded almost entirely on something it cannot prevent.
+
+    The follower is a partner, not a teacher: it supplies no targets and never
+    seeds a tree. The light still discovers its own from nothing.
+    """
+    if which == "hand":
+        env = world("signal")
+        print("   frozen partner: the hand-written follower (~7.5 red-runs an "
+              "episode against the discovered car's 133)", flush=True)
+        return env.default_vehicle_bank()
     with open(path, encoding="utf-8") as fh:
         b = json.load(fh)
     vb = bank_from_json(b["veh"])
-    print("   frozen car from e37 round %d (%d arms, target-distribution team "
-          "%.1f +-%.1f)" % (b["round"], len(b["veh"]["clauses"]), b["train"],
-                            b["se"]), flush=True)
+    print("   frozen car from e37 round %d (%d arms) -- WARNING: this one runs "
+          "reds" % (b["round"], len(b["veh"]["clauses"])), flush=True)
     return vb
 
 
@@ -208,7 +223,7 @@ def update_best(st, rows, r):
 
 
 def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
-         n_guard=400, from_sig="", kern_every=3):
+         n_guard=400, from_sig="", kern_every=3, car="hand"):
     rounds, n_ep, seed = int(rounds), int(n_ep), int(seed)
     critic, verbose, n_guard = bool(int(critic)), bool(int(verbose)), int(n_guard)
     kern_every, screen_ep = int(kern_every), int(screen_ep)
@@ -261,7 +276,7 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
           % (SPAN["approach_vph"][0], SPAN["approach_vph"][1],
              SPAN["approach_skew"][0], SPAN["approach_skew"][1], n_ep, N_GROUPS),
           flush=True)
-    vb = load_vehicle()
+    vb = load_vehicle(car)
     demand_table(world("signal"), n_ep, cfg["seed"])
 
     while st["round"] < rounds:

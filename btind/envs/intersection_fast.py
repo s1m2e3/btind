@@ -30,7 +30,9 @@ from ..kernlaw import kern_args, law_out
 from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_args
 from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_STOP, STOP_ZONE,
-                           W_CAR_DELAY, W_COMFORT, W_DELAY, W_QUEUE, W_STUCK_CAR,
+                           W_CAR_DELAY, W_COMFORT, W_DELAY, W_OVER, COMMIT_D,
+                           W_QUEUE, W_STUCK_CAR, W_STUCK_FREE, W_STUCK_QUEUE,
+                           W_STUCK_EARLY, STOP_FAR,
                            W_SPEED, W_STUCK,
                            L_VEH, N_PHASES, NEAR_INT, QUEUE_D, QUEUE_V, R_COLL,
                            R_EXIT, R_RED, SENSE_R, SIG_EMPTY, SIG_HIDDEN, SPAWN_GAP,
@@ -715,7 +717,9 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 q_wait[a4] = 0.0
             delay = 0.0
             n_stuck = 0
+            stuck_w = 0.0
             n_stop = 0
+            n_serv = 0
             for q in range(N):
                 if status[q] == 1.0:
                     m = mv[q]
@@ -723,19 +727,37 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     vf = v[q] / V0
                     sp_sum[a4] += vf
                     sp_cnt[a4] += 1.0
-                    delay += 1.0 - vf
+                    # relu: above free-flow is free, never a delay bonus
+                    dl = 1.0 - vf
+                    if dl < 0.0:
+                        dl = 0.0
+                    delay += dl
                     if q == ts:
-                        r_me -= W_CAR_DELAY * (1.0 - vf) * dt
+                        r_me -= W_CAR_DELAY * dl * dt
+                    d_now_q = s_stop[m] - s[q]
+                    if green[phase, m] and d_now_q > 0.0 and d_now_q < COMMIT_D:
+                        n_serv += 1
                     if v[q] < QUEUE_V:
-                        d_q = s_stop[m] - s[q]
+                        d_q = d_now_q
                         red_q = in_ar or (not green[phase, m])
-                        red_ok = red_q and (d_q <= NEAR_INT or not car_r)
-                        legit = d_q > 0.0 and ((has_lead[q] and lead_gap[q] < QUEUE_GAP)
-                                               or red_ok)
-                        if not legit:
-                            n_stuck += 1
+                        led_q = has_lead[q] and lead_gap[q] < QUEUE_GAP
+                        # three cases, worst first: stopped on green with a free
+                        # lane; stopped on green behind a queue that should be
+                        # moving; stopped on red much too far short of the line
+                        if d_q <= 0.0:
+                            w_st = W_STUCK_FREE
+                        elif not red_q and not led_q:
+                            w_st = W_STUCK_FREE
+                        elif not red_q:
+                            w_st = W_STUCK_QUEUE
+                        elif not led_q and d_q > STOP_FAR:
+                            w_st = W_STUCK_EARLY
+                        else:
+                            w_st = 0.0
+                        if w_st > 0.0:
+                            stuck_w += w_st
                             if q == ts:
-                                r_me -= W_STUCK_CAR * dt
+                                r_me -= (W_STUCK_CAR / W_STUCK) * w_st * dt
                         if d_q > 0.0:
                             q_wait[a4] += 1.0
                         if car_r and red_q and d_q > 0.0 and d_q <= STOP_ZONE \
@@ -760,7 +782,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             if na > 0.0 and not car_r:
                 r += W_SPEED * (ms / na) * dt
             r -= (W_CAR_DELAY if car_r else W_DELAY) * delay * dt
-            r -= (W_STUCK_CAR if car_r else W_STUCK) * n_stuck * dt
+            r -= ((W_STUCK_CAR / W_STUCK) if car_r else 1.0) * stuck_w * dt
             if car_r:
                 r += R_STOP * n_stop
             else:
@@ -768,6 +790,11 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 for a4 in range(4):
                     qsq += q_wait[a4] * q_wait[a4]
                 r -= W_QUEUE * qsq * dt
+                # OVER-GREEN: green held on a phase with nobody within COMMIT_D
+                # of its stop line. sumo_test's floor-of-zero case, charged
+                # directly instead of waiting for someone else's delay.
+                if n_serv == 0 and not in_ar:
+                    r -= W_OVER * dt
 
             hit = np.zeros(N, np.bool_)
             fault = np.zeros(N, np.bool_)

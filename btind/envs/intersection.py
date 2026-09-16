@@ -150,12 +150,44 @@ TAU_MAX = 8.0
 QUEUE_D, QUEUE_V = 120.0, 2.0
 
 # -- rewards ---------------------------------------------------------------------
-R_EXIT, R_COLL, R_RED, R_LEFT = 1.0, 200.0, 10.0, 5.0
-W_SPEED, W_DELAY, W_QUEUE, W_STUCK = 1.0, 0.05, 0.02, 1.0
+# CROSSING ON RED IS NEAR-CATASTROPHIC. At R_RED=10 the discovered car learned
+# to run 52 reds an episode in its own training world against the hand-written
+# follower's 2.1 -- it was trading red-running for throughput and the team
+# return let it, which then made the SIGNAL's objective 49.5% its partner's
+# law-breaking. A red-run is now priced like the collision it risks.
+# A CRASH IS THE WORST THING THAT HAPPENS HERE, and a red-run is the risk of
+# one, so they are priced in that order: 1000 and 100 against an exit's 1.
+R_EXIT, R_COLL, R_RED, R_LEFT = 1.0, 1000.0, 100.0, 5.0
+# W_STUCK SCALES WITH THE SAFETY WEIGHTS, and has to. It is the term that
+# stops a controller buying safety by refusing to serve traffic -- a
+# stopped car never crashes or runs a red. Measured at R_COLL=1000 with
+# W_STUCK=1: stopping every car scored -1931 against the hand-written
+# follower's -2099, so DOING NOTHING WAS THE BEST POLICY AVAILABLE and the
+# search would have found it. Raising the crash price without raising this
+# one re-opens the hole the stuck term was written to close.
+W_SPEED, W_DELAY, W_QUEUE, W_STUCK = 1.0, 0.05, 0.02, 25.0
+# STOPPING IS NOT ONE THING, and one weight for it was charging a car that
+# panicked in an empty green lane the same as one that braked early for a red.
+# Three cases, in the order they deserve:
+#   FREE    stopped on GREEN with nobody close ahead -- nothing is stopping it
+#   QUEUE   stopped on GREEN behind a leader -- the queue should be discharging
+#   EARLY   stopped on RED further than STOP_FAR from the line, with no leader:
+#           legitimate waiting happens AT the line, not halfway down the block
+# Stopping on red near the line, or behind a queue on red, is free -- that is
+# what a car is supposed to do, and charging it cost 70 an episode in e33.
+W_STUCK_FREE, W_STUCK_QUEUE, W_STUCK_EARLY, STOP_FAR = 25.0, 8.0, 5.0, 40.0
+# GREEN HELD ON A PHASE WITH NOBODY TO SERVE, per second, charged to the signal.
+# Modelled on sumo_test's `LAMBDA_OVER * relu(T_k - T_k_floor)`, whose floor is
+# ZERO when no vehicle sits within its commit distance -- so any green on an
+# empty phase is charged directly rather than paid for later in someone else's
+# delay. Measured on this world, delay and queue together were 0.5% of the
+# signal's return, so holding 45 s on an empty phase cost it almost nothing and
+# that is exactly what it learned to do.
+W_OVER, COMMIT_D = 1.0, 60.0
 QUEUE_GAP, STOP_ZONE = 12.0, 15.0
 LONG_QUEUE = 6           # a phase queue this long anchors the signal's proposals
 # the per-car reward (veh_reward="car"): see the module docstring
-R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 50.0, 3.0
+R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 200.0, 75.0
 # COMFORT: each car's change of speed, squared, per car-second, normalised by
 # the braking limit -- a full-braking second costs W_COMFORT, a gentle stop at
 # half the rate a quarter of that per second. Measured on the discrete tree of
@@ -303,7 +335,7 @@ class IntersectionBatch:
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
     OBS_VERSION = 5
-    REWARD_VERSION = 4          # part of the store key, like OBS_VERSION
+    REWARD_VERSION = 5          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -1136,16 +1168,33 @@ class IntersectionBatch:
                                / np.maximum(cnt, 1), 0.0)
             na = na + (cnt > 0)
         t_speed = W_SPEED * np.where(na > 0, ms / np.maximum(na, 1), 0.0) * dt
-        delay_sum = np.where(in_net, 1.0 - vf, 0.0).sum(1)
+        # RELU, as sumo_test charges relu(V0 - v): a car above free-flow used to
+        # earn a delay BONUS here, since 1 - v/V0 goes negative above V0
+        delay_sum = np.where(in_net, np.maximum(1.0 - vf, 0.0), 0.0).sum(1)
         t_delay = (W_CAR_DELAY if car else W_DELAY) * delay_sum * dt
         if not car:
             r += t_speed
         r -= t_delay
         d_now = g["s_stop"][m] - S
         stopped = act & (V < QUEUE_V)
-        red_ok = ~gm & (d_now <= NEAR_INT) if car else ~gm
-        legit = (d_now > 0.0) & ((has & (gap < QUEUE_GAP)) | red_ok)
-        t_stuck = (W_STUCK_CAR if car else W_STUCK) * (stopped & ~legit).sum(1) * dt
+        # ALL-RED IS RED, and the flag has to be read AFTER the phase switch.
+        # `gm` here is plan-green only, and `in_ar` further up was computed
+        # before the switch that may have just started an all-red; the kernel
+        # asks `in_ar or not green[phase, m]` at this point in the tick, so the
+        # two paths disagreed during every all-red. A LOCAL mask, because `gm`
+        # itself is shared with the step path, which wants plan-green.
+        ar_now = X[:, 2] > 0.5
+        gm_eff = gm & ~ar_now[:, None]
+        before = stopped & (d_now > 0.0)
+        led = has & (gap < QUEUE_GAP)
+        past = stopped & ~(d_now > 0.0)          # stopped in or past the box
+        w_free = before & gm_eff & ~led
+        w_queue = before & gm_eff & led
+        w_early = before & ~gm_eff & ~led & (d_now > STOP_FAR)
+        scale = (W_STUCK_CAR / W_STUCK) if car else 1.0
+        t_stuck = scale * dt * (W_STUCK_FREE * (w_free | past).sum(1)
+                                + W_STUCK_QUEUE * w_queue.sum(1)
+                                + W_STUCK_EARLY * w_early.sum(1))
         r -= t_stuck
         waiting = (stopped & (d_now > 0.0)) | blocked
         qsq = np.zeros(n)
@@ -1153,6 +1202,24 @@ class IntersectionBatch:
             qa = (waiting & (ap == k_a)).sum(1)
             qsq = qsq + qa * qa
         t_queue = W_QUEUE * qsq * dt
+        # OVER-GREEN: green held on a phase with nothing to serve. `t_green` is
+        # the count of cars this phase could discharge that are actually within
+        # COMMIT_D of their stop line; when that is zero every second of green
+        # is charged, which is sumo_test's floor-of-zero case.
+        if not car:
+            ph_now = X[:, 0].astype(int)
+            servable = np.zeros(n, bool)
+            for k_ph in range(N_PHASES):
+                sel = ph_now == k_ph
+                if not sel.any():
+                    continue
+                in_k = act[sel] & g["green"][k_ph][m[sel]]
+                near = in_k & (d_now[sel] > 0.0) & (d_now[sel] < COMMIT_D)
+                servable[sel] = near.any(1)
+            t_over = W_OVER * (~servable & (X[:, 2] < 0.5)) * dt
+            r -= t_over
+        else:
+            t_over = np.zeros(n)
         if car:
             # the red-stop bonus, once per car (a car cannot creep and re-stop
             # its way to a second one)
@@ -1210,7 +1277,7 @@ class IntersectionBatch:
             if car:
                 t_speed = np.zeros(n)
                 t_queue = np.zeros(n)
-            for key, val in (("speed", t_speed), ("delay", -t_delay),
+            for key, val in (("over_green", -t_over), ("speed", t_speed), ("delay", -t_delay),
                              ("queue", -t_queue), ("stuck", -t_stuck),
                              ("red", -t_red), ("crash", -R_COLL * n_ev),
                              ("exit", R_EXIT * out.sum(1)), ("left", -t_left),
