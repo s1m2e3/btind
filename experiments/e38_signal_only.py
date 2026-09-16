@@ -59,7 +59,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import btind.structure as ST
-from btind.envs.intersection import WIDE, IntersectionBatch
+from btind.envs.intersection import WIDE, IntersectionBatch, T_MAX
 from btind.rlfit import fit
 from btind.memory import emit
 from btind.runlog import RUNS, bank_from_json, bank_json
@@ -109,7 +109,7 @@ def config_key():
     env = world("signal")
     return dict(signal_only=True, span=list(SPAN["approach_vph"]),
                 skew=list(SPAN["approach_skew"]), groups=N_GROUPS,
-                t_end=T_END, n_max=N_MAX_EP, t_max=env.bounds[1],
+                t_end=T_END, n_max=N_MAX_EP, t_max=T_MAX,
                 sig_head=env.sig_head, prior="const",
                 obs=env.OBS_VERSION, reward=env.REWARD_VERSION)
 
@@ -207,7 +207,7 @@ def update_best(st, rows, r):
     return cur < best["train"] - 2.0 * max(se, best["se"])
 
 
-def main(rounds=100, n_ep=50, screen_ep=20, critic=1, seed=0, verbose=1,
+def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
          n_guard=400, from_sig="", kern_every=3):
     rounds, n_ep, seed = int(rounds), int(n_ep), int(seed)
     critic, verbose, n_guard = bool(int(critic)), bool(int(verbose)), int(n_guard)
@@ -239,17 +239,21 @@ def main(rounds=100, n_ep=50, screen_ep=20, critic=1, seed=0, verbose=1,
                min_gain=1.0, subtree_at=(0,), kern_at=(0,), critic=critic,
                prior="const", kern_cfg=dict(n_laws=2, max_points=4, dev_ep=3000),
                n_ep=n_ep, val_ep=int(1.2 * n_ep), explore_ep=max(200, n_ep // 2),
-               # MORE DECISIONS, NOT MORE PRECISION PER DECISION. A test of 50
-               # episodes costs about 0.1 s here, so a round spends its budget
-               # iterating rather than re-measuring one candidate to three
-               # decimal places. What 50 buys, measured on this world: the
-               # paired test sees gains above ~31 return units, and -- the part
-               # that has to be checked rather than assumed -- `accept`'s
-               # per-demand-group rule engages in all 5 groups at 9-11 episodes
-               # each. It needs >5 in a group, so 20 episodes over 5 groups
-               # would switch the protection that replaced the demand ladder off
-               # ENTIRELY AND SILENTLY. 20 is therefore the screen and never the
-               # verdict: ranking a pool on it is free, deciding on it is not.
+               # MORE DECISIONS, NOT MORE PRECISION PER DECISION -- but the
+               # batch still has to resolve the gains on offer, and 50 did not.
+               # Measured over 52 logged steps at 50 episodes: nothing accepted,
+               # yet the search was finding real gains of +10 to +18 with
+               # standard errors of +-12 to +-36, so the best candidate stood at
+               # t=0.96 against a 1.0 bar and ten more sat between 0.5 and 1.0.
+               # Missing by a factor of ~sqrt(2), so 100 -- which cuts those
+               # errors 1.41x and tips the near-misses over, while still costing
+               # a twelfth of the 1200 this started from.
+               #
+               # `accept`'s per-demand-group rule needs >5 episodes in a group;
+               # at 100 over 5 groups it engages everywhere. 20 episodes would
+               # leave 4 per group and switch that protection -- the one that
+               # replaced the demand ladder -- off ENTIRELY AND SILENTLY, which
+               # is why 20 screens a pool and never decides.
                grow_screen_ep=screen_ep, grow_pool=28)
 
     print("==== e38: the light alone, approach base %g..%g veh/h x skew %g..%g, "
