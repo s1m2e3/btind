@@ -19,6 +19,8 @@ Three operators, one acceptance rule, and one asymmetry that matters:
             a swap of disjoint clauses is a no-op that would still consume a
             rollout and, at z = 2, occasionally be "accepted" by noise.
 """
+from collections import OrderedDict
+
 import numpy as np
 
 from .memory import reindex
@@ -119,11 +121,50 @@ def fast_rollout(env, bank, s, T, trace=None, dev=None):
     return G
 
 
-def starts(env, n_ep, seed):
-    """The episode starts every scoring path uses, from one seed."""
+STARTS_CAP = 256 * 1024 ** 2            # bytes of start states kept per world
+
+
+def _make_starts(env, n_ep, seed):
     rng = np.random.default_rng(seed)
     return (env.sample_starts(n_ep, rng) if hasattr(env, "sample_starts")
             else env.sample_states(n_ep, rng))
+
+
+def starts(env, n_ep, seed):
+    """The episode starts every scoring path uses, from one seed.
+
+    MEMOISED PER WORLD, because a paired test is the whole point: every
+    candidate in a round is scored on the SAME episodes, so the same
+    (n_ep, seed) is rebuilt thousands of times and `sample_starts` loops over
+    episodes in Python. Measured on the intersection at 112 slots: 13.5 ms of a
+    33 ms call at 120 episodes, 212 ms of a 685 ms call at 3000 -- 31-40% of
+    every scoring call at every size, for an array that is identical each time.
+
+    The cache lives ON THE WORLD, not in a module dict: two rungs sample
+    different demands from the same seed, so a key of (n_ep, seed) alone would
+    hand one rung the other's traffic. It dies with the world, and is bounded
+    because the 3000-episode arrays are 19 MB each.
+
+    A COPY IS HANDED OUT. The kernel does not write into the array (checked),
+    but callers own what they are given, and a copy is 0.1-6.9 ms against the
+    13-212 ms it saves.
+    """
+    try:
+        cache = env._starts_cache
+    except AttributeError:
+        try:
+            cache = env._starts_cache = OrderedDict()
+        except Exception:                   # a world that will not be written to
+            return _make_starts(env, n_ep, seed)
+    key = (n_ep, seed)
+    s = cache.get(key)
+    if s is None:
+        s = cache[key] = _make_starts(env, n_ep, seed)
+        while len(cache) > 1 and sum(a.nbytes for a in cache.values()) > STARTS_CAP:
+            cache.popitem(last=False)
+    else:
+        cache.move_to_end(key)
+    return s.copy()
 
 
 def heldout(env, bank, seeds=(11, 12, 13), n_ep=1000, T=None):

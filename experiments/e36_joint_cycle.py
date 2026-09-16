@@ -186,39 +186,44 @@ def main(rounds=16, n_ep=500, per_rung=4, critic=1, seed=0, verbose=1, n_guard=4
         # round so no pass can be kept for fitting one sample of it.
         tgt = world(WIDE, "vehicle")
         s_t = tgt.sample_starts(n_guard, np.random.default_rng(4242 + r))
-        vb0, sb0 = vb, sb
         moved, cred, g_base = [], {}, None
-
-        print("   -- vehicles, against the signal as it is now", flush=True)
-        vb, vlog, vm = one_pass(env, "vehicle", vb, sb, cfg, "e36-veh", seed + r)
-        vmoves = vlog[-1]["moves"] if vlog else []
-        if vmoves and vb0 is not None:
-            keep, g_base, d, se = credit(tgt, s_t, (vb, sb0), (vb0, sb0), "vehicles")
-            cred["vehicle"] = dict(d=d, se=se, kept=keep)
-            if not keep:
-                vb, vmoves = vb0, []
-        moved += vmoves
-        st["veh"] = bank_json(vb, env.veh_names)
-        if verbose:
-            print("\nvehicle tree, round %d (team %.2f)\n%s"
-                  % (r, vm["G"], emit(vb, env.veh_names)), flush=True)
-        save_state(st)
-
-        print("   -- signal, against those vehicles", flush=True)
-        sb, slog, sm = one_pass(env, "signal", sb, vb, cfg, "e36-sig", seed + r)
-        smoves = slog[-1]["moves"] if slog else []
-        if smoves and sb0 is not None:
-            # against the vehicle tree THIS ROUND LEAVES, so the difference is
-            # the signal's own and not a re-reading of the vehicle's pass
-            keep, _, d, se = credit(tgt, s_t, (vb, sb), (vb, sb0), "signal  ", g0=g_base)
-            cred["signal"] = dict(d=d, se=se, kept=keep)
-            if not keep:
-                sb, smoves = sb0, []
-        moved += smoves
-        st["sig"] = bank_json(sb, env.sig_names)
-        if verbose:
-            print("\nsignal tree, round %d (team %.2f)\n%s"
-                  % (r, sm["G"], emit(sb, env.sig_names)), flush=True)
+        banks = {"vehicle": vb, "signal": sb}
+        names = {"vehicle": env.veh_names, "signal": env.sig_names}
+        tags = {"vehicle": "e36-veh", "signal": "e36-sig"}
+        keys = {"vehicle": "veh", "signal": "sig"}
+        metas = {}
+        # NEITHER AGENT IS SYSTEMATICALLY FIRST. Whoever passes second adapts to
+        # a partner that has already moved this round, which is an advantage;
+        # with a fixed order it is always the same agent's advantage, every
+        # round. Both passes share this round's episodes either way -- `rseed`
+        # is the same for both and the start states are cached on the world --
+        # so the second pass re-simulates nothing the first one built.
+        order = ["vehicle", "signal"] if r % 2 == 0 else ["signal", "vehicle"]
+        for who in order:
+            other = "signal" if who == "vehicle" else "vehicle"
+            print("   -- %s, against the %s as it is now" % (who, other), flush=True)
+            was = banks[who]
+            bank, log, meta = one_pass(env, who, was, banks[other], cfg,
+                                       tags[who], seed + r)
+            metas[who] = meta
+            mv = log[-1]["moves"] if log else []
+            if mv and was is not None:
+                new = dict(banks)
+                new[who] = bank
+                keep, g_base, d, se = credit(
+                    tgt, s_t, (new["vehicle"], new["signal"]),
+                    (banks["vehicle"], banks["signal"]), "%-8s" % who, g0=g_base)
+                cred[who] = dict(d=d, se=se, kept=keep)
+                if not keep:
+                    bank, mv = was, []
+            moved += mv
+            banks[who] = bank
+            st[keys[who]] = bank_json(bank, names[who])
+            if verbose:
+                print("\n%s tree, round %d (team %.2f)\n%s"
+                      % (who, r, meta["G"], emit(bank, names[who])), flush=True)
+            save_state(st)
+        vb, sb = banks["vehicle"], banks["signal"]
         rows = evaluate(vb, sb)
         # THE BEHAVIOUR TABLE IS THE ONLY THING LEFT ON THE PYTHON ROLLOUT, at
         # about 50 s a call against 6 s for the whole evaluation. It reports;
