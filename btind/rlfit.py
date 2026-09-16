@@ -327,7 +327,8 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                        seed=rseed, z=cfg["z"],
                                        min_gain=cfg["min_gain"], rng=rng,
                                        n_iter=cfg["cem_iter"], K=cfg["cem_K"],
-                                       sigma0=cfg["cem_sigma"], verbose=verbose)
+                                       sigma0=cfg["cem_sigma"], verbose=verbose,
+                                       cem_ep=cfg.get("cem_ep"))
         if any(l["accepted"] for l in llog):
             rec["moves"].append("cem-laws")
         bank, cur, plog = polish_thresholds(env, bank, pol_fn, Z, cur_G=cur,

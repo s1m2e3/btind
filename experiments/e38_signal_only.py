@@ -269,7 +269,15 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # leave 4 per group and switch that protection -- the one that
                # replaced the demand ladder -- off ENTIRELY AND SILENTLY, which
                # is why 20 screens a pool and never decides.
-               grow_screen_ep=screen_ep, grow_pool=28)
+               grow_screen_ep=screen_ep, grow_pool=28,
+               # CEM's inner evaluations only RANK candidates to refit its
+               # sampling distribution -- `improve_laws` still puts the result
+               # through `accept` at the full n_ep -- and at n_ep they were the
+               # largest single cost in a round: K*iter*n_ep = 32*4*100 = 12800
+               # episode-units an arm against ~1000 for growing's confirms.
+               # Measured 36.6 s -> 6.0 s at 20. Each iteration now draws a
+               # fresh sample too, so a small screen cannot be chased.
+               cem_ep=screen_ep)
 
     print("==== e38: the light alone, approach base %g..%g veh/h x skew %g..%g, "
           "%d episodes a test, %d demand groups"

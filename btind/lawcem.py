@@ -44,7 +44,7 @@ def _with_law(bank, arm, th):
 
 def cem_law(env, bank, arm, pol_fn, n_iter=4, K=64, elite_frac=0.25,
             sigma0=0.35, sigma_floor=0.05, n_ep=400, T=400, seed=777,
-            rng=None, init=None, verbose=False):
+            rng=None, init=None, verbose=False, cem_ep=None):
     """Cross-entropy search over one arm's law. Returns (theta, trace).
 
     `init` seeds the mean; None starts from the law the arm already has, so a
@@ -58,12 +58,22 @@ def cem_law(env, bank, arm, pol_fn, n_iter=4, K=64, elite_frac=0.25,
     if bank.get("prior") == "const":
         sigma[:-1] = 0.0                  # only the intercept is a parameter
     n_el = max(4, int(round(elite_frac * K)))
+    # THE INNER EVALUATIONS ONLY RANK. CEM scores K candidates an iteration to
+    # pick an elite set and refit the sampling distribution -- it never accepts
+    # anything, because `improve_laws` puts the result through `accept` at the
+    # full episode count afterwards. Scoring the ranking at n_ep was the single
+    # largest cost in a round: K * n_iter * n_ep = 32 * 4 * 100 = 12800
+    # episode-units an arm, against roughly 1000 for growing's confirms.
+    ep = int(cem_ep or n_ep)
     trace = []
     for it in range(n_iter):
         cand = mu[None] + sigma[None] * rng.standard_normal((K,) + mu.shape)
         cand[0] = mu                                   # keep the incumbent
-        g = np.array([score(env, _with_law(bank, arm, c), pol_fn, n_ep, T,
-                            seed).mean() for c in cand])
+        # a fresh sample each iteration: with a small `ep` and one fixed seed
+        # the elite set would be refit on the same handful of episodes every
+        # round and CEM would chase that sample rather than the world
+        g = np.array([score(env, _with_law(bank, arm, c), pol_fn, ep, T,
+                            seed + it).mean() for c in cand])
         idx = np.argsort(-g)[:n_el]
         mu = cand[idx].mean(0)
         sigma = np.maximum(cand[idx].std(0), sigma_floor)
