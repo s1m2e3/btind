@@ -36,9 +36,9 @@ def churn(env, bank, pol_fn, n_ep=200, T=400, seed=11):
     the mean length of an uninterrupted run. Ranking by re-entries puts the
     arms that might want to persist at the front of the search.
     """
-    A, AL = _arms_on_kernel(env, bank, n_ep, T, seed)
+    A, AL, row_scale = _arms_on_kernel(env, bank, n_ep, T, seed)
     if A is not None:
-        return _churn_stats(bank, A, AL, n_ep)
+        return _churn_stats(bank, A, AL, n_ep, row_scale)
     pol = pol_fn(bank)
     rng = np.random.default_rng(seed)
     env.seed_kernels(seed)
@@ -73,7 +73,7 @@ def churn(env, bank, pol_fn, n_ep=200, T=400, seed=11):
     return _churn_stats(bank, A, AL, n_ep)
 
 
-def _arms_on_kernel(env, bank, n_ep, T, seed, max_slots=24):
+def _arms_on_kernel(env, bank, n_ep, T, seed, max_slots=64):
     """(arm per row-tick, alive mask) from a fused-kernel trace, or (None, None).
 
     Churn needs two things a trace already records -- which arm each row took
@@ -86,31 +86,44 @@ def _arms_on_kernel(env, bank, n_ep, T, seed, max_slots=24):
     from .structure import fast_rollout, kernel_for, starts
     from .tick import trace_array
     if not bank.get("clauses") or kernel_for(env, bank) is None:
-        return None, None
+        return None, None, 1.0
     d = len(mem_names(bank["names"], bank.get("mem"))) + 1
     s = starts(env, n_ep, seed)
     # which row the trace follows: the signal is one row an episode; a car is
     # one row per slot, so a sample of slots stands in for all of them
     who = [-1]
+    n_all = 1
     if getattr(env, "agent", None) == "vehicle":
         dep = s[:, 4 * env.N:5 * env.N]
         who = [q for q in range(env.N) if np.isfinite(dep[:, q]).mean() > 0.3]
+        n_all = len(who)
         if len(who) > max_slots:
             who = sorted(np.random.default_rng(seed).choice(who, max_slots,
                                                             replace=False))
+    # EXACT FOR THE SIGNAL, SAMPLED FOR A CAR. The light is one row an episode,
+    # so its trace is the whole thing; a car is one row per slot and tracing
+    # every slot costs a rollout each, so a sample of them stands in. That makes
+    # the car's dwell and share estimates (measured, 0.44 against 0.50 on a thin
+    # 24-of-48 sample), which is what churn is for -- it RANKS which arms might
+    # want hysteresis, and the paired rollout still decides what is kept.
+    # RE-ENTRIES ARE A COUNT OVER ROWS, so a sampled subset of slots undercounts
+    # them by exactly the sampling ratio -- 4.7x at 112 slots, 16x at 384 --
+    # while dwell (a mean) and share (a ratio) are unbiased. The Python path
+    # walked every row, so the sample has to be scaled back up to agree.
+    row_scale = float(n_all) / max(len(who), 1) if who else 1.0
     A, AL = [], []
     for q in who:
         dev = np.zeros((len(s), 4))
         dev[:, 3] = q
         tr = trace_array(len(s), T, d)
         if fast_rollout(env, bank, s, T, trace=tr, dev=dev) is None:
-            return None, None
+            return None, None, 1.0
         A.append(tr[:, :, d].astype(int))
         AL.append(tr[:, :, d - 1] > 0.5)
-    return np.concatenate(A, 0), np.concatenate(AL, 0)
+    return np.concatenate(A, 0), np.concatenate(AL, 0), row_scale
 
 
-def _churn_stats(bank, A, AL, n_ep):
+def _churn_stats(bank, A, AL, n_ep, row_scale=1.0):
     n_rows = A.shape[0]
     out = {}
     for c in range(len(bank["clauses"])):
@@ -132,7 +145,7 @@ def _churn_stats(bank, A, AL, n_ep):
                 seen += 1
             reent += max(seen - 1, 0)
         out[c] = dict(dwell=float(np.mean(runs)) if runs else 0.0,
-                      reentries=reent / max(n_ep, 1),
+                      reentries=reent * row_scale / max(n_ep, 1),
                       share=float((A[AL] == c).mean()) if AL.any() else 0.0)
     return out
 

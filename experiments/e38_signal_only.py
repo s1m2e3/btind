@@ -255,7 +255,7 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # episodes by `credit`, which reverts a pass that lost ground.
                z=1.0,
                n_cover=6000, cover_ep=80, cem_iter=4, cem_K=32,
-               min_gain=1.0, subtree_at=(0,), kern_at=(0,), critic=critic,
+               min_gain=1.0, critic=critic,
                prior="const", # NARROWER PROPOSAL SEARCH, SAME ANSWER. The kernel stage was the
                # slowest thing in a round -- 264 scoring calls, ~248 of them
                # screens -- and widening the observation 24 -> 44 widened the
@@ -316,8 +316,15 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
 
         # the kernel stage kept 0 of 16 confirmed points in e37 and e38 while
         # costing a fifth of the round, so it runs periodically, not every round
+        # STAGGER THE EXPENSIVE OPTIONAL STAGES so a round pays for at most one.
+        # Measured from a real round 0: grow 139 s, kernels 134 s, beta ~25 s,
+        # plus subtree and the evaluation. Growing is the stage that actually
+        # builds the tree and runs every round; the other three rotate, so each
+        # still runs regularly and a round costs roughly grow + one of them.
         rcfg = dict(cfg, T=env.duration,
-                    kern_at=(0,) if (kern_every and r % kern_every == 0) else ())
+                    kern_at=(0,) if r % 3 == 0 else (),
+                    beta_at=0 if r % 3 == 1 else 99,
+                    subtree_at=(0,) if r % 3 == 2 else ())
         with env.reward_as("team"):
             new_sb, log, meta = fit(env, list(env.names), rounds=1, warm=sb is None,
                                     init_bank=sb, run_seed=seed + r, tag="e38-sig",
