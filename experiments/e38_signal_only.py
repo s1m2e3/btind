@@ -252,7 +252,20 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                z=1.0,
                n_cover=6000, cover_ep=80, cem_iter=4, cem_K=32,
                min_gain=1.0, subtree_at=(0,), kern_at=(0,), critic=critic,
-               prior="const", kern_cfg=dict(n_laws=2, max_points=4, dev_ep=3000),
+               prior="const", # NARROWER PROPOSAL SEARCH, SAME ANSWER. The kernel stage was the
+               # slowest thing in a round -- 264 scoring calls, ~248 of them
+               # screens -- and widening the observation 24 -> 44 widened the
+               # column-set search that drives it. Measured on this world:
+               # col_pool 5 / n_prop 24 takes 94 s, col_pool 3 / n_prop 12 /
+               # n_confirm 5 takes 56 s and returns the IDENTICAL three points
+               # and the identical +668 gain. One step narrower (col_pool 2)
+               # starts losing gain, so this is the knee.
+               #
+               # NOT screen_ep, deliberately: the module's own note records that
+               # screening cheaply was measured to break this search -- "among
+               # 300 proposals the top four screened were never the good one".
+               kern_cfg=dict(n_laws=2, max_points=4, dev_ep=3000,
+                             col_pool=3, n_prop=12, n_confirm=5),
                n_ep=n_ep, val_ep=int(1.2 * n_ep), explore_ep=max(200, n_ep // 2),
                # MORE DECISIONS, NOT MORE PRECISION PER DECISION -- but the
                # batch still has to resolve the gains on offer, and 50 did not.
