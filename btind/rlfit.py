@@ -282,7 +282,13 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           max_arity=cfg["max_arity"], min_n=cfg["min_n"],
                           min_gain=cfg["min_gain"], labels=None, qhat=None,
                           seed_clauses=seeds if r == 0 else None,
-                          screen_ep=cfg["n_ep"], confirm_ep=cfg["n_ep"],
+                          # SCREEN CHEAP, CONFIRM FULL. Growing screened its whole
+                          # pool at the full episode count -- 40 candidates x n_ep
+                          # -- while every other search screens at a fraction and
+                          # only confirms survivors. Defaults to n_ep so nothing
+                          # that does not set it changes.
+                          screen_ep=cfg.get("grow_screen_ep") or cfg["n_ep"],
+                          confirm_ep=cfg["n_ep"],
                           n_confirm=10, T=cfg["T"], seed=rseed,
                           z=cfg["z"], rng=rng, use_library=False,
                           weights=weights, verbose=verbose)

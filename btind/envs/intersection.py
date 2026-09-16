@@ -135,7 +135,15 @@ V0, A_MAX, B_MAX = 11.0, 2.6, 4.5
 L_VEH, W_VEH = 5.0, 1.8
 HALF_CONF = 0.5 * (L_VEH + W_VEH)      # occupancy half-width at a conflict point
 SPAWN_GAP = 8.0
-T_AR, T_MIN, T_MAX = 3.0, 5.0, 60.0
+T_AR, T_MIN, T_MAX = 3.0, 5.0, 45.0
+# T_MAX IS THE CYCLE'S SCALE. Four phases at the cap plus all-red is a
+# 4*(45+3) = 192 s cycle, and an episode has to hold two of them for the
+# light to be judged on a repeating pattern rather than a fragment: hence
+# T_end=384. At the old 60 s cap the cycle was 252 s and two cycles cost
+# 9.4x per episode; 60 s was also where the learned green pinned, so the
+# bound was setting the policy.
+# NOTE it is compiled INTO the kernel (`intersection_fast` clips the plan
+# against it), so the numba cache must be cleared when it changes.
 N_PHASES = 4
 FAR = 200.0
 TAU_MAX = 8.0
@@ -488,7 +496,15 @@ class IntersectionBatch:
             s[i, 4 * N + k:5 * N] = np.inf
             s[i, N:2 * N] = self.s_spawn[s[i, 0:N].astype(int)]
         b = 5 * N
-        s[:, b + 0] = 0.0
+        # THE STARTING PHASE IS DRAWN, not always 0. An episode is 150 s and a
+        # cycle is 80 s on the fixed plan, so only 3.6 phase changes happen in
+        # one; starting every episode at phase 0 meant the order 0->1->2->3 cut
+        # phase 3 off -- reached in 60% of episodes, 4% of ticks, against phase
+        # 2's 41%. The light could only learn distinctions among the phases it
+        # was shown, and a longer green it learns makes the tail phases rarer
+        # still. Drawing the start spreads the exposure evenly at no cost.
+        s[:, b + 0] = (0.0 if not cd else
+                       rng.integers(0, N_PHASES, n).astype(float))
         s[:, b + 1] = (rng.uniform(0.0, FIXED_GREEN[0], n) if not cd
                        else rng.uniform(0.0, 1.0, n) * plans[:, 0])
         s[:, 7 * N + self.N_MISC:7 * N + self.N_MISC + N_PHASES] = plans
@@ -547,11 +563,15 @@ class IntersectionBatch:
         """
         if self.agent != "signal":
             return None
-        j = self.sig_names.index("t_phase")
-        tp = tr[:, :, j]
-        new = np.zeros(tp.shape, bool)
+        # THE PHASE INDICATOR, not `t_phase`. Read off t_phase ("it stopped
+        # increasing") this over-flagged by 4.7x -- 16.8 ticks an episode
+        # against 3.6 real phase starts -- because t_phase also plateaus inside
+        # the all-red interval. The phase index changing is exact.
+        ph = np.stack([tr[:, :, self.sig_names.index("ph%d" % k)]
+                       for k in range(N_PHASES)], -1).argmax(-1)
+        new = np.zeros(ph.shape, bool)
         new[:, 0] = True
-        new[:, 1:] = tp[:, 1:] <= tp[:, :-1]
+        new[:, 1:] = ph[:, 1:] != ph[:, :-1]
         return new
 
     def condition_groups(self, s, n_groups=None):
