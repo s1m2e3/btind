@@ -58,6 +58,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import btind.structure as ST
 from btind.envs.intersection import WIDE, IntersectionBatch
 from btind.rlfit import fit
 from btind.memory import emit
@@ -211,6 +212,8 @@ def main(rounds=100, n_ep=50, screen_ep=20, critic=1, seed=0, verbose=1,
     rounds, n_ep, seed = int(rounds), int(n_ep), int(seed)
     critic, verbose, n_guard = bool(int(critic)), bool(int(verbose)), int(n_guard)
     kern_every, screen_ep = int(kern_every), int(screen_ep)
+    # one line per learning step: every candidate priced against the incumbent
+    ST.LOG_STEPS = True
     st = load_state()
     # START FROM WHAT WAS ALREADY FOUND. The state file is refused across a
     # configuration change -- the world is a different one -- but the tree is
@@ -221,7 +224,18 @@ def main(rounds=100, n_ep=50, screen_ep=20, critic=1, seed=0, verbose=1,
         print("   seeded the light from %s" % from_sig, flush=True)
     t0 = time.time()
     cfg = dict(seed=11, mem_at=99, beta_at=0, steps_at=0, grow_arms=2, min_n=200,
-               n_cover=6000, cover_ep=80, cem_iter=4, cem_K=32, grow_pool=40,
+               # ONE SIGMA, NOT TWO. At 50 episodes a +37.19 gain was turned away
+               # because 2 se was +49.6, so the search could not move at all.
+               # The loosening is not free -- a worthless candidate now clears
+               # the gain test about one time in six -- and two things absorb
+               # it. The SAME z tightens the tests that protect what already
+               # exists: the per-demand-group veto fires when a group loses by
+               # more than z se, and non-inferiority (collapse, simplify) now
+               # demands d > -1 se, so growth gets cheaper while removal gets
+               # dearer. And every round is re-priced whole on 400 held-out
+               # episodes by `credit`, which reverts a pass that lost ground.
+               z=1.0,
+               n_cover=6000, cover_ep=80, cem_iter=4, cem_K=32,
                min_gain=1.0, subtree_at=(0,), kern_at=(0,), critic=critic,
                prior="const", kern_cfg=dict(n_laws=2, max_points=4, dev_ep=3000),
                n_ep=n_ep, val_ep=int(1.2 * n_ep), explore_ep=max(200, n_ep // 2),

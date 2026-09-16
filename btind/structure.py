@@ -19,6 +19,7 @@ Three operators, one acceptance rule, and one asymmetry that matters:
             a swap of disjoint clauses is a no-op that would still consume a
             rollout and, at z = 2, occasionally be "accepted" by noise.
 """
+import sys
 from collections import OrderedDict
 
 import numpy as np
@@ -123,6 +124,13 @@ def fast_rollout(env, bank, s, T, trace=None, dev=None):
 
 STARTS_CAP = 256 * 1024 ** 2            # bytes of start states kept per world
 
+# EVERY LEARNING STEP ON ONE LINE. A step is one candidate priced against the
+# incumbent on a batch and judged -- the unit the search actually advances by.
+# Off by default so runs that do not ask for it read as before; a driver turns
+# it on with `structure.LOG_STEPS = True`.
+LOG_STEPS = False
+_steps = [0]
+
 
 def _make_starts(env, n_ep, seed):
     rng = np.random.default_rng(seed)
@@ -219,18 +227,29 @@ def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
     se = max(d.std() / np.sqrt(len(d)), 1e-12)
     ok = (d.mean() > z * se if side == "gain"
           else (d.mean() > -margin and d.mean() > -z * se))
+    _steps[0] += 1
+    _step_row = (_steps[0], sys._getframe(1).f_code.co_name, int(n_ep),
+                 float(d.mean()), float(se), side)
     # NO CONDITION MAY PAY FOR ANOTHER. On a world with a condition
     # distribution an average gain can hide a significant loss in light or in
     # heavy traffic; a move is rejected if any demand group loses by more than
     # z standard errors of that group.
     groups = (env.condition_groups(starts(env, n_ep, seed))
               if ok and hasattr(env, "condition_groups") else None)
+    worst = None
     if groups is not None:
         for gi in np.unique(groups):
             dg = d[groups == gi]
             if len(dg) > 5 and dg.mean() < -z * max(dg.std() / np.sqrt(len(dg)), 1e-12):
-                ok = False
+                ok, worst = False, int(gi)
                 break
+    if LOG_STEPS:
+        n, who, nep, dm, sem, sd = _step_row
+        print("      step %5d  %-18s %4d ep  %+8.2f +-%5.2f  %-11s %s"
+              % (n, who, nep, dm, sem, sd,
+                 "ACCEPT" if ok else ("reject: demand group %d loses" % worst
+                                      if worst is not None else "reject")),
+              flush=True)
     return bool(ok), float(d.mean()), g
 
 
