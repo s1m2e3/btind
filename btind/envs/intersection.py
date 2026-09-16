@@ -514,13 +514,29 @@ class IntersectionBatch:
         b = 7 * self.N + self.N_MISC
         return s[:, b:b + N_PHASES]
 
-    def condition_groups(self, s, n_groups=3):
+    n_cond_groups = 3           # raise it to resolve the demand axis more finely
+
+    def condition_groups(self, s, n_groups=None):
         """Episode labels by demand (cars scheduled), for per-condition
-        acceptance; None when the world has no condition distribution."""
+        acceptance; None when the world has no condition distribution.
+
+        TRAINING THE WHOLE DEMAND RANGE IN ONE BATCH puts light and heavy
+        traffic in the same test, and the per-group rule in `structure.accept`
+        is what stops one paying for the other -- so the number of groups is
+        the resolution of that protection.
+
+        FEWER GROUPS MAY COME BACK THAN ASKED FOR. The label is the count of
+        cars scheduled, an integer, so on a narrow demand range two quantile
+        cuts can land on the same count and the groups between them are empty.
+        `accept` iterates the labels that actually occur, so this is safe --
+        but it means the resolution is bounded by the spread of the demand,
+        not by this number alone.
+        """
+        n_groups = self.n_cond_groups if n_groups is None else n_groups
         if not self.cond:
             return None
         cars = np.isfinite(s[:, 4 * self.N:5 * self.N]).sum(1)
-        cuts = np.quantile(cars, np.linspace(0, 1, n_groups + 1)[1:-1])
+        cuts = np.unique(np.quantile(cars, np.linspace(0, 1, n_groups + 1)[1:-1]))
         return np.searchsorted(cuts, cars, side="right")
 
     _reward_override = None

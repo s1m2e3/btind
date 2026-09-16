@@ -92,8 +92,10 @@ def improve_laws(env, bank, pol_fn, arms=None, cur=None, n_ep=400, T=400,
              else list(arms))
     log = []
     for arm in order:
+        # `verbose` was never handed down, so the inner loop -- the one that
+        # actually spends the rollouts -- ran silently
         th, trace = cem_law(env, bank, arm, pol_fn, n_ep=n_ep, T=T, seed=seed,
-                            rng=rng, **cem_kw)
+                            rng=rng, verbose=verbose, **cem_kw)
         cand = _with_law(bank, arm, th)
         ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed, z)
         keep = bool(ok and d > min_gain)
