@@ -266,6 +266,23 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         if sk[0][l + 1] - sk[0][l] > kmax_s:
             kmax_s = sk[0][l + 1] - sk[0][l]
 
+    # the band of each movement's path that holds any of its conflict points
+    n_mv = conf.shape[0]
+    cp_lo = np.empty(n_mv)
+    cp_hi = np.empty(n_mv)
+    for m0 in range(n_mv):
+        lo = 1e18
+        hi = -1e18
+        for m1 in range(n_mv):
+            if conf[m0, m1]:
+                c = s_cp[m0, m1]
+                if c < lo:
+                    lo = c
+                if c > hi:
+                    hi = c
+        cp_lo[m0] = lo
+        cp_hi[m0] = hi
+
     for i in prange(n):
         mv = np.empty(N, np.int64)
         s = np.empty(N)
@@ -320,6 +337,21 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         has_lead = np.zeros(N, np.bool_)
         lead_gap = np.empty(N)
         lead_j = np.zeros(N, np.int64)
+        act_idx = np.zeros(N, np.int64)     # active slots, rebuilt each tick
+        # A LEADER IS ALWAYS IN THE SAME LANE GROUP (or, past the junction, on
+        # the same exit edge), so the scan never has to leave that bucket. Eight
+        # groups and four edges here, which is where the 8x and 4x come from.
+        n_grp = 0
+        n_edg = 0
+        for mm in range(len(lane_group)):
+            if lane_group[mm] + 1 > n_grp:
+                n_grp = lane_group[mm] + 1
+            if to_edge[mm] + 1 > n_edg:
+                n_edg = to_edge[mm] + 1
+        grp_cnt = np.zeros(n_grp, np.int64)
+        grp_slots = np.zeros((n_grp, N), np.int64)
+        edg_cnt = np.zeros(n_edg, np.int64)
+        edg_slots = np.zeros((n_edg, N), np.int64)
         spawned_grp = np.zeros(2 * 4 + 2, np.bool_)
         fresh = np.zeros(N, np.bool_)
         sp_sum = np.zeros(4)
@@ -353,6 +385,11 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 py[q] = pts[m, kk, 1] + f * (pts[m, kk + 1, 1] - pts[m, kk, 1])
                 pvx[q] = v[q] * ((pts[m, kk + 1, 0] - pts[m, kk, 0]) / seg)
                 pvy[q] = v[q] * ((pts[m, kk + 1, 1] - pts[m, kk, 1]) / seg)
+            n_act_s = 0
+            for q in range(N):
+                if status[q] == 1.0:
+                    act_idx[n_act_s] = q
+                    n_act_s += 1
             for q in range(N):
                 if status[q] != 1.0:
                     continue
@@ -437,14 +474,24 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 near_rate = 0.0
                 riv_best = 1e18
                 riv_d = FAR
-                for o in range(N):
-                    if o == q or status[o] != 1.0:
+                # THE OTHER QUADRATIC LOOP, and the dominant one: this runs per
+                # active car per tick to build its observation. Two changes, both
+                # exact. The active list skips empty slots (the old scan tested
+                # `status` on every one of N). And the range test is done on the
+                # SQUARED distance, so the sqrt is paid only by the few pairs
+                # actually within SENSE_R instead of by all N^2 -- d > R and
+                # d^2 > R^2 agree for non-negative d, and `dist` is still the
+                # true distance wherever it is kept.
+                for oi in range(n_act_s):
+                    o = act_idx[oi]
+                    if o == q:
                         continue
                     ddx = px[o] - px[q]
                     ddy = py[o] - py[q]
-                    dist = np.sqrt(ddx * ddx + ddy * ddy)
-                    if dist > SENSE_R:
+                    d2 = ddx * ddx + ddy * ddy
+                    if d2 > SENSE_R * SENSE_R:
                         continue
+                    dist = np.sqrt(d2)
                     n_near += 1.0
                     if dist < near_best:
                         near_best = dist
@@ -678,9 +725,32 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             # ---- collisions -----------------------------------------------------
             n_rear = 0
             n_cross = 0
+            # A LEADER IS ALWAYS IN THE SAME LANE GROUP, or past the junction on
+            # the same exit edge, so the scan never has to leave that bucket.
+            # This was O(N^2) a tick -- at n_max=384 over 768 ticks, 113M pair
+            # tests an episode against 3.8M at the old 112 slots. Buckets are
+            # built in ascending slot order, so each presents the same
+            # candidates in the same order the full scan did: ties break
+            # identically and the result is bit-for-bit what it gave.
+            for gg in range(n_grp):
+                grp_cnt[gg] = 0
+            for ee in range(n_edg):
+                edg_cnt[ee] = 0
             for q in range(N):
                 has_lead[q] = False
                 lead_gap[q] = FAR
+                if status[q] != 1.0:
+                    continue
+                m = mv[q]
+                if s[q] > s_junc[m] + 2.0:
+                    ee = to_edge[m]
+                    edg_slots[ee, edg_cnt[ee]] = q
+                    edg_cnt[ee] += 1
+                else:
+                    gg = lane_group[m]
+                    grp_slots[gg, grp_cnt[gg]] = q
+                    grp_cnt[gg] += 1
+            for q in range(N):
                 if status[q] != 1.0:
                     continue
                 m = mv[q]
@@ -688,21 +758,26 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 xq = path_len[m] - s[q]
                 best = 1e18
                 bj = 0
-                for rr in range(N):
-                    if rr == q or status[rr] != 1.0:
-                        continue
-                    mr = mv[rr]
-                    past_r = s[rr] > s_junc[mr] + 2.0
-                    if (not past_q) and (not past_r) and lane_group[mr] == lane_group[m]:
-                        if s[rr] > s[q]:
-                            dd = s[rr] - s[q]
+                if past_q:
+                    ee = to_edge[m]
+                    for ri in range(edg_cnt[ee]):
+                        rr = edg_slots[ee, ri]
+                        if rr == q:
+                            continue
+                        xr = path_len[mv[rr]] - s[rr]
+                        if xr < xq:
+                            dd = xq - xr
                             if dd < best:
                                 best = dd
                                 bj = rr
-                    if past_q and past_r and to_edge[mr] == to_edge[m]:
-                        xr = path_len[mr] - s[rr]
-                        if xr < xq:
-                            dd = xq - xr
+                else:
+                    gg = lane_group[m]
+                    for ri in range(grp_cnt[gg]):
+                        rr = grp_slots[gg, ri]
+                        if rr == q:
+                            continue
+                        if s[rr] > s[q]:
+                            dd = s[rr] - s[q]
                             if dd < best:
                                 best = dd
                                 bj = rr
@@ -809,13 +884,20 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     fault[q] = True                  # the striker, not the struck
                     hit[lead_j[q]] = True
                     n_rear += 1
-            for q in range(N):
-                if status[q] != 1.0:
-                    continue
+            # CROSSING COLLISIONS ONLY HAPPEN IN THE BOX. Every conflict point
+            # of a movement lies in a narrow band of its path, so a car outside
+            # [cp_lo, cp_hi] +- HALF_CONF cannot be in ANY conflict and its whole
+            # inner loop is dead -- which is most cars most of the time, since
+            # the approaches are long. With the active list this takes the pair
+            # tests from N^2/2 down to (cars near the box)^2/2. Exact: the pairs
+            # skipped are precisely those whose first condition was already false.
+            for ai in range(n_act_s):
+                q = act_idx[ai]
                 m = mv[q]
-                for rr in range(q + 1, N):
-                    if status[rr] != 1.0:
-                        continue
+                if s[q] < cp_lo[m] - HALF_CONF or s[q] > cp_hi[m] + HALF_CONF:
+                    continue
+                for ri in range(ai + 1, n_act_s):
+                    rr = act_idx[ri]
                     mr = mv[rr]
                     if not conf[m, mr]:
                         continue
