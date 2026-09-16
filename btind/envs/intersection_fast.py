@@ -35,6 +35,8 @@ from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            W_STUCK_EARLY, STOP_ZONE, NEAR_INT,
                            W_SPEED, W_STUCK,
                            L_VEH, N_PHASES, NEAR_INT, QUEUE_D, QUEUE_V, R_COLL,
+                           NEAR_D, Q_OFF, QS_OFF, VQ_OFF, N_OFF, V_OFF, NN_OFF,
+                           D_OFF, PH_OFF, MISC_OFF,
                            R_EXIT, R_RED, SENSE_R, SIG_EMPTY, SIG_HIDDEN, SPAWN_GAP,
                            T_AR, T_V_MIN,
                            T_MAX, T_MIN,
@@ -265,6 +267,23 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
     for l in range(sk[0].shape[0] - 1):
         if sk[0][l + 1] - sk[0][l] > kmax_s:
             kmax_s = sk[0][l + 1] - sk[0][l]
+
+    # the two approaches each phase serves, lower index first. They discharge
+    # in parallel, so the queue that governs a phase is the longer of them.
+    ph_a0 = np.zeros(N_PHASES, np.int64)
+    ph_a1 = np.zeros(N_PHASES, np.int64)
+    for k0 in range(N_PHASES):
+        lo = 1 << 30
+        hi = -1
+        for m0 in range(green.shape[1]):
+            if green[k0, m0]:
+                a0 = appr[m0]
+                if a0 < lo:
+                    lo = a0
+                if a0 > hi:
+                    hi = a0
+        ph_a0[k0] = lo
+        ph_a1[k0] = hi
 
     # the band of each movement's path that holds any of its conflict points
     n_mv = conf.shape[0]
@@ -561,31 +580,43 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             for k in range(ds):
                 zs[k] = 0.0
             for k in range(N_PHASES):
-                zs[3 * N_PHASES + k] = FAR
+                zs[D_OFF + k] = FAR
             for q in range(N):
                 if status[q] != 1.0:
                     continue
                 m = mv[q]
                 d_stop = s_stop[m] - s[q]
                 if d_stop > 0.0 and d_stop < QUEUE_D:
+                    a_q = appr[m]
                     for k in range(N_PHASES):
                         if green[k, m]:
-                            zs[N_PHASES + k] += 1.0
-                            zs[2 * N_PHASES + k] += v[q]
-                            if d_stop < zs[3 * N_PHASES + k]:
-                                zs[3 * N_PHASES + k] = d_stop
+                            zs[N_OFF + k] += 1.0
+                            zs[V_OFF + k] += v[q]
+                            if d_stop < NEAR_D:
+                                zs[NN_OFF + k] += 1.0
+                            if d_stop < zs[D_OFF + k]:
+                                zs[D_OFF + k] = d_stop
                             if v[q] < QUEUE_V:
-                                zs[k] += 1.0
+                                zs[Q_OFF + k] += 1.0
+                                sd = 0 if a_q == ph_a0[k] else 1
+                                zs[QS_OFF + 2 * k + sd] += 1.0
+                                zs[VQ_OFF + 2 * k + sd] += v[q]
             for k in range(N_PHASES):
-                if zs[N_PHASES + k] > 0.0:
-                    zs[2 * N_PHASES + k] = zs[2 * N_PHASES + k] / zs[N_PHASES + k]
+                if zs[N_OFF + k] > 0.0:
+                    zs[V_OFF + k] = zs[V_OFF + k] / zs[N_OFF + k]
                 else:
-                    zs[2 * N_PHASES + k] = SIG_EMPTY
-            zs[4 * N_PHASES + phase] = 1.0
-            zs[5 * N_PHASES] = t_phase
-            zs[5 * N_PHASES + 1] = 1.0 if in_ar else 0.0
-            zs[5 * N_PHASES + 2] = (t / duration + clock_phase) % 1.0
-            zs[5 * N_PHASES + 3] = noise
+                    zs[V_OFF + k] = SIG_EMPTY
+                for sd in range(2):
+                    c_q = zs[QS_OFF + 2 * k + sd]
+                    if c_q > 0.0:
+                        zs[VQ_OFF + 2 * k + sd] = zs[VQ_OFF + 2 * k + sd] / c_q
+                    else:
+                        zs[VQ_OFF + 2 * k + sd] = SIG_EMPTY
+            zs[PH_OFF + phase] = 1.0
+            zs[MISC_OFF] = t_phase
+            zs[MISC_OFF + 1] = 1.0 if in_ar else 0.0
+            zs[MISC_OFF + 2] = (t / duration + clock_phase) % 1.0
+            zs[MISC_OFF + 3] = noise
             s_law = -1
             dur = 0.0
             if use_sig:

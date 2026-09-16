@@ -148,6 +148,7 @@ N_PHASES = 4
 FAR = 200.0
 TAU_MAX = 8.0
 QUEUE_D, QUEUE_V = 120.0, 2.0
+NEAR_D = 40.0      # the closer look-back band; the search picks the horizon
 
 # -- rewards ---------------------------------------------------------------------
 # CROSSING ON RED IS NEAR-CATASTROPHIC. At R_RED=10 the discovered car learned
@@ -266,18 +267,55 @@ VEH_NAMES = ["v", "d_stop", "near_int", "green", "t_sig", "t_sig_max", "all_red"
              "n_near", "near_d", "near_closing", "has_rival", "rival_dt", "rival_d"]
 # Per phase k, over the vehicles whose movement phase k serves and that are
 # approaching (0 < distance to the stop line < QUEUE_D):
-#   q<k>  how many are queued (speed below QUEUE_V)
-#   n<k>  how many are approaching
-#   v<k>  their mean speed, or SIG_EMPTY when there are none
-#   d<k>  the distance of the nearest one to its stop line, FAR when none
+#   q<k>a q<k>b  how many are QUEUED (speed below QUEUE_V) on each of the two
+#                approaches that phase serves, a = the lower approach index
+#   vq<k>a/b     the mean speed OF THOSE QUEUED cars, SIG_EMPTY when none
+#   n<k>         how many are approaching within QUEUE_D
+#   nn<k>        how many are approaching within NEAR_D -- a second, closer
+#                horizon, so how far back to look is a column the search picks
+#                rather than a constant chosen here
+#   d<k>         the distance of the nearest one to its stop line, FAR when none
 # -- what loop detectors and a V2I receiver give an actuated controller.
+#
+# WHY PER APPROACH. A phase serves two opposing approaches and they discharge in
+# PARALLEL, so the green it needs is set by its LONGER queue, not by the total:
+# summed, 22 is ambiguous between 11+11 (clears in ~11) and 20+2 (needs ~20).
+# `approach_skew` draws 0.25-1.75 independently per approach, so that imbalance
+# is common by construction and was invisible.
+#
+# WHY THE QUEUE'S OWN SPEED. The old v<k> averaged every APPROACHING car, free-
+# flowing ones 100 m back included, so it could not say whether a queue was
+# discharging or standing still -- which is the thing a controller acts on.
 SIG_EMPTY = -1.0
+# The first four blocks are the original layout, unchanged and at the same
+# offsets so nothing that indexes them by position or name moves. The three
+# appended blocks are the new information.
+Q_OFF, N_OFF, V_OFF, D_OFF, PH_OFF = 0, N_PHASES, 2 * N_PHASES, 3 * N_PHASES, 4 * N_PHASES
+MISC_OFF = 5 * N_PHASES
+QS_OFF, VQ_OFF, NN_OFF = 5 * N_PHASES + 4, 7 * N_PHASES + 4, 9 * N_PHASES + 4
 SIG_NAMES = (["q%d" % k for k in range(N_PHASES)]
              + ["n%d" % k for k in range(N_PHASES)]
              + ["v%d" % k for k in range(N_PHASES)]
              + ["d%d" % k for k in range(N_PHASES)]
              + ["ph%d" % k for k in range(N_PHASES)]
-             + ["t_phase", "all_red", "t_norm", "noise"])
+             + ["t_phase", "all_red", "t_norm", "noise"]
+             # --- appended: what the four blocks above cannot express ---------
+             # q<k>a/b  the QUEUED count split by the two approaches the phase
+             #          serves (a = lower index). They discharge in PARALLEL, so
+             #          the green a phase needs is set by the LONGER queue, not
+             #          the total: summed, 22 is ambiguous between 11+11 (clears
+             #          in ~11) and 20+2 (needs ~20), and `approach_skew` draws
+             #          0.25-1.75 per approach so that gap is common.
+             # vq<k>a/b the mean speed OF THOSE QUEUED cars. v<k> above averages
+             #          every approaching car, free-flowing ones 100 m back
+             #          included, so it cannot say whether a queue is
+             #          discharging or standing still.
+             # nn<k>    approaching within NEAR_D rather than QUEUE_D: a second,
+             #          closer horizon, so how far back to look becomes a column
+             #          the search picks instead of a constant chosen here.
+             + ["q%d%s" % (k, sd) for k in range(N_PHASES) for sd in "ab"]
+             + ["vq%d%s" % (k, sd) for k in range(N_PHASES) for sd in "ab"]
+             + ["nn%d" % k for k in range(N_PHASES)])
 
 
 def _kind_of(signal_bank):
@@ -348,7 +386,7 @@ class IntersectionBatch:
     # observation are never resumed on this one -- a checkpoint that learned
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
-    OBS_VERSION = 5
+    OBS_VERSION = 6
     REWARD_VERSION = 5          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
@@ -386,6 +424,7 @@ class IntersectionBatch:
         self.geom = load_geometry()
         self.M = len(self.geom["path_len"])
         self.veh_names, self.sig_names = list(VEH_NAMES), list(SIG_NAMES)
+        self._phase_appr = None
         self.veh_actions, self.sig_actions = list(ACTIONS), list(SIG_ACTIONS)
         self.veh_n_act, self.sig_n_act = len(ACTIONS), len(SIG_ACTIONS)
         self.agent = "vehicle"
@@ -919,26 +958,48 @@ class IntersectionBatch:
         o[~act] = 0.0
         return o.reshape(n * N, -1)
 
+    @property
+    def phase_appr(self):
+        """(a, b) approach indices each phase serves, a the lower. A phase
+        covers exactly two opposing approaches; they discharge in parallel, so
+        the queue that matters is the longer of the two, not their sum."""
+        if self._phase_appr is None:
+            g, out = self.geom, []
+            for k in range(N_PHASES):
+                aps = sorted({int(a) for a, ok in zip(g["appr"], g["green"][k]) if ok})
+                out.append((aps[0], aps[-1]))
+            self._phase_appr = out
+        return self._phase_appr
+
     def observe_signal(self, s):
         m, S, V, st, dep, X = self._unpack(s)
         n, N = S.shape
         act = st == 1.0
         g = self.geom
         d_stop = g["s_stop"][m] - S
+        ap_m = g["appr"][m]
         appr = act & (d_stop > 0.0) & (d_stop < QUEUE_D)
         queued = appr & (V < QUEUE_V)
         o = np.zeros((n, len(SIG_NAMES)))
         for k in range(N_PHASES):
             in_k = appr & g["green"][k][m]
             cnt = in_k.sum(1)
-            o[:, k] = (queued & g["green"][k][m]).sum(1)
-            o[:, N_PHASES + k] = cnt
+            o[:, Q_OFF + k] = (queued & g["green"][k][m]).sum(1)
+            o[:, N_OFF + k] = cnt
             vsum = np.where(in_k, V, 0.0).sum(1)
-            o[:, 2 * N_PHASES + k] = np.where(cnt > 0, vsum / np.maximum(cnt, 1),
-                                              SIG_EMPTY)
-            o[:, 3 * N_PHASES + k] = np.where(in_k, d_stop, FAR).min(1)
-        o[np.arange(n), 4 * N_PHASES + X[:, 0].astype(int)] = 1.0
-        b = 5 * N_PHASES
+            o[:, V_OFF + k] = np.where(cnt > 0, vsum / np.maximum(cnt, 1), SIG_EMPTY)
+            o[:, D_OFF + k] = np.where(in_k, d_stop, FAR).min(1)
+            o[:, NN_OFF + k] = (in_k & (d_stop < NEAR_D)).sum(1)
+            qk = queued & g["green"][k][m]
+            for side, a in enumerate(self.phase_appr[k]):
+                qa = qk & (ap_m == a)
+                c = qa.sum(1)
+                o[:, QS_OFF + 2 * k + side] = c
+                vq = np.where(qa, V, 0.0).sum(1)
+                o[:, VQ_OFF + 2 * k + side] = np.where(c > 0, vq / np.maximum(c, 1),
+                                                       SIG_EMPTY)
+        o[np.arange(n), PH_OFF + X[:, 0].astype(int)] = 1.0
+        b = MISC_OFF
         o[:, b] = X[:, 1]
         o[:, b + 1] = X[:, 2]
         o[:, b + 2] = np.mod(X[:, 4] / self.duration + X[:, 11], 1.0)
@@ -1476,7 +1537,8 @@ class IntersectionBatch:
             tr = trace_array(n_ep, T, d)
             IF.run(self, vb, sb, s, T, trace=tr, dev=dev)
             r = tr[:, :, d + 2]
-            qcols = [self.sig_names.index("q%d" % k) for k in range(N_PHASES)]
+            qcols = [self.sig_names.index("q%d%s" % (k, sd))
+                     for k in range(N_PHASES) for sd in "ab"]
             for i in range(n_ep):
                 rows.append(tr[i, :, :n_obs])
                 long_q = tr[i, :, qcols].T.max(1) >= LONG_QUEUE
