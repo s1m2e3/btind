@@ -43,6 +43,32 @@ class Weights:
         self.a, self.b = a, b
         self.acc = np.zeros(n_cols)
         self.tried = np.zeros(n_cols)
+        # WHAT EACH PROPOSAL SOURCE ACTUALLY YIELDED, carried across rounds in
+        # the same per-world file. The usefulness gate judged the critic by
+        # three PROXIES for a task it is not asked to do -- ranking arbitrary
+        # deviations -- and twice got it wrong: it inflated a dead critic's
+        # lift, and it would have silenced one whose proposals are in fact the
+        # best source in the search (critic-sourced points 47 kept of 217, 22%,
+        # against deviations' 10% and failure anchors' 18%). Realised keep rate
+        # is the thing the gate was proxying for.
+        self.src = {}                       # src -> [confirmed, kept]
+
+    def note_sources(self, log):
+        """Tally a kernel search's log by proposal source."""
+        for e in log or ():
+            s = e.get("src")
+            if s is None or "accepted" not in e:
+                continue
+            row = self.src.setdefault(str(s), [0.0, 0.0])
+            row[0] += 1.0
+            row[1] += 1.0 if e["accepted"] else 0.0
+
+    def yield_of(self, s):
+        """(keep rate, evidence) for a source; (None, 0) when never tried."""
+        row = self.src.get(str(s))
+        if not row or row[0] < 1:
+            return None, 0.0
+        return row[1] / row[0], row[0]
 
     def probs(self, cols=None):
         w = (self.acc + self.a) / (self.tried + self.a + self.b)
@@ -85,13 +111,15 @@ class Weights:
     # -- persistence -------------------------------------------------------
     def to_json(self):
         return dict(n=self.n, a=self.a, b=self.b, acc=self.acc.tolist(),
-                    tried=self.tried.tolist())
+                    tried=self.tried.tolist(),
+                    src={k: list(v) for k, v in self.src.items()})
 
     @classmethod
     def from_json(cls, d):
         w = cls(int(d["n"]), float(d.get("a", 2.0)), float(d.get("b", 6.0)))
         w.acc = np.asarray(d["acc"], float)
         w.tried = np.asarray(d["tried"], float)
+        w.src = {k: [float(v[0]), float(v[1])] for k, v in (d.get("src") or {}).items()}
         return w
 
 

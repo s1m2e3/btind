@@ -372,7 +372,8 @@ def point_sets(Z, tab, kern, levels, head, target_fn, rng, ks=(2, 3), min_adv=0.
 
 
 def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0.5,
-                min_lift=1.0, min_rank=0.2, min_sign=0.3, verbose=True):
+                min_lift=1.0, min_rank=0.2, min_sign=0.3, verbose=True,
+                yielded=None, min_seen=20.0, min_yield=0.05):
     """Fit V-hat and A-hat on `bank`, and return the proposal function
     `kernsearch.search_kernels(critic=...)` calls, with both reports.
 
@@ -388,9 +389,23 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
     # three-way AND exists because the measures legitimately disagree, but that
     # only holds while each is measuring something; a critic scored on a handful
     # of non-zero advantages is unassessed, not endorsed.
+    # WHAT ITS PROPOSALS ACTUALLY YIELDED WINS over the proxies once there is
+    # enough of it. The three measures below score RANKING arbitrary deviations,
+    # which is not the job: measured across runs, critic-sourced kernel points
+    # were kept 47 of 217 times (22%) against the exact deviations' 10% and the
+    # failure anchors' 18%, while the critic's rank correlation sat at 0.04-0.13.
+    # The proxies have been wrong in the other direction too -- a collapsed base
+    # rate inflated `lift` to 3.5x and held the gate open on a dead critic.
+    rate, seen = (yielded if yielded else (None, 0.0))
+    judged = rate is not None and seen >= min_seen
+    if judged and rate < min_yield:
+        if verbose:
+            print("    critic not used this round: its proposals were kept %.0f%% of "
+                  "%d tries" % (100 * rate, seen), flush=True)
+        return None, dict(value=vrep, advantage=arep, used=False)
     thin = arep["n_informative"] < 50
-    if thin or (arep["lift"] < min_lift and arep["spearman"] < min_rank
-                and arep["sign_big"] < min_sign):
+    if not judged and (thin or (arep["lift"] < min_lift and arep["spearman"] < min_rank
+                                and arep["sign_big"] < min_sign)):
         if verbose:
             print("    critic not used this round: rank %.2f, lift %.1fx, sign %.0f%%"
                   " on %d informative rows -- %s; proposals fall back to deviations "
@@ -400,6 +415,9 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
                      "too few to judge" if thin else "all below their gates"),
                   flush=True)
         return None, dict(value=vrep, advantage=arep, used=False)
+    if judged and verbose:
+        print("    critic used: its proposals were kept %.0f%% of %d tries"
+              % (100 * rate, seen), flush=True)
     OB, _, AL, LAW = record(env, bank, n_ep=max(20, n_ep // 3), seed=seed + 2,
                             max_slots=32)
     Zon = OB.reshape(-1, OB.shape[2])[AL.reshape(-1)]

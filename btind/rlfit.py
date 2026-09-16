@@ -354,13 +354,17 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             critic = None
             if cfg.get("critic") and hasattr(env, "coverage_rows"):
                 from .intersection_critic import make_critic
-                critic, crep = make_critic(env, bank, seed=rseed, verbose=verbose)
+                # gate on what the critic's proposals have ACTUALLY yielded
+                # across rounds, not on proxies for a task it is not asked to do
+                critic, crep = make_critic(env, bank, seed=rseed, verbose=verbose,
+                                           yielded=weights.yield_of("critic"))
                 rec["critic"] = crep
             bank, cur, klog = search_kernels(
                 env, bank, names, zn, pol_fn, cur, cfg["T"], rseed, z=cfg["z"],
                 min_gain=cfg["min_gain"], n_ep=cfg["n_ep"], rng=rng,
                 verbose=verbose, critic=critic, anchors=fail if len(fail) else None,
                 **(cfg["kern_cfg"] or {}))
+            weights.note_sources([e for e in klog if e.get("op") == "add"])
             n_after = sum(KL.n_points(k) for k in [bank.get("kern_default")] + [
                 x for s_ in (bank.get("kerns") or []) for x in (s_ or [])])
             if any(e.get("accepted") and e["op"] != "add" for e in klog) or n_after != n_before:
