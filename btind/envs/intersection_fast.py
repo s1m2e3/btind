@@ -35,7 +35,7 @@ from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            W_STUCK_EARLY, STOP_ZONE, NEAR_INT,
                            W_SPEED, W_STUCK,
                            L_VEH, N_PHASES, NEAR_INT, QUEUE_D, QUEUE_V, R_COLL,
-                           NEAR_D, Q_OFF, QS_OFF, VQ_OFF, N_OFF, V_OFF, NN_OFF,
+                           NEAR_D, Q_OFF, QS_OFF, VA_OFF, N_OFF, V_OFF, NN_OFF,
                            D_OFF, PH_OFF, MISC_OFF,
                            R_EXIT, R_RED, SENSE_R, SIG_EMPTY, SIG_HIDDEN, SPAWN_GAP,
                            T_AR, T_V_MIN,
@@ -357,6 +357,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         lead_gap = np.empty(N)
         lead_j = np.zeros(N, np.int64)
         act_idx = np.zeros(N, np.int64)     # active slots, rebuilt each tick
+        va_n = np.zeros(N_PHASES)           # cars per approach, for va<a>
         # A LEADER IS ALWAYS IN THE SAME LANE GROUP (or, past the junction, on
         # the same exit edge), so the scan never has to leave that bucket. Eight
         # groups and four edges here, which is where the 8x and 4x come from.
@@ -581,6 +582,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 zs[k] = 0.0
             for k in range(N_PHASES):
                 zs[D_OFF + k] = FAR
+                va_n[k] = 0.0
             for q in range(N):
                 if status[q] != 1.0:
                     continue
@@ -600,18 +602,18 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                                 zs[Q_OFF + k] += 1.0
                                 sd = 0 if a_q == ph_a0[k] else 1
                                 zs[QS_OFF + 2 * k + sd] += 1.0
-                                zs[VQ_OFF + 2 * k + sd] += v[q]
+                    # per APPROACH, every vehicle on it, whatever phase serves it
+                    zs[VA_OFF + a_q] += v[q]
+                    va_n[a_q] += 1.0
             for k in range(N_PHASES):
                 if zs[N_OFF + k] > 0.0:
                     zs[V_OFF + k] = zs[V_OFF + k] / zs[N_OFF + k]
                 else:
                     zs[V_OFF + k] = SIG_EMPTY
-                for sd in range(2):
-                    c_q = zs[QS_OFF + 2 * k + sd]
-                    if c_q > 0.0:
-                        zs[VQ_OFF + 2 * k + sd] = zs[VQ_OFF + 2 * k + sd] / c_q
-                    else:
-                        zs[VQ_OFF + 2 * k + sd] = SIG_EMPTY
+                if va_n[k] > 0.0:
+                    zs[VA_OFF + k] = zs[VA_OFF + k] / va_n[k]
+                else:
+                    zs[VA_OFF + k] = SIG_EMPTY
             zs[PH_OFF + phase] = 1.0
             zs[MISC_OFF] = t_phase
             zs[MISC_OFF + 1] = 1.0 if in_ar else 0.0
