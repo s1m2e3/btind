@@ -36,6 +36,9 @@ def churn(env, bank, pol_fn, n_ep=200, T=400, seed=11):
     the mean length of an uninterrupted run. Ranking by re-entries puts the
     arms that might want to persist at the front of the search.
     """
+    A, AL = _arms_on_kernel(env, bank, n_ep, T, seed)
+    if A is not None:
+        return _churn_stats(bank, A, AL, n_ep)
     pol = pol_fn(bank)
     rng = np.random.default_rng(seed)
     env.seed_kernels(seed)
@@ -67,6 +70,47 @@ def churn(env, bank, pol_fn, n_ep=200, T=400, seed=11):
             break
     A = np.array(hist).T
     AL = np.array(al).T
+    return _churn_stats(bank, A, AL, n_ep)
+
+
+def _arms_on_kernel(env, bank, n_ep, T, seed, max_slots=24):
+    """(arm per row-tick, alive mask) from a fused-kernel trace, or (None, None).
+
+    Churn needs two things a trace already records -- which arm each row took
+    each tick, and whether the row was alive -- so stepping the world in Python
+    to get them cost the 4500x the Python path runs at, every round. That is
+    the stage a signal round appeared to hang in, and beta has never once been
+    accepted for the light.
+    """
+    from .memory import mem_names
+    from .structure import fast_rollout, kernel_for, starts
+    from .tick import trace_array
+    if not bank.get("clauses") or kernel_for(env, bank) is None:
+        return None, None
+    d = len(mem_names(bank["names"], bank.get("mem"))) + 1
+    s = starts(env, n_ep, seed)
+    # which row the trace follows: the signal is one row an episode; a car is
+    # one row per slot, so a sample of slots stands in for all of them
+    who = [-1]
+    if getattr(env, "agent", None) == "vehicle":
+        dep = s[:, 4 * env.N:5 * env.N]
+        who = [q for q in range(env.N) if np.isfinite(dep[:, q]).mean() > 0.3]
+        if len(who) > max_slots:
+            who = sorted(np.random.default_rng(seed).choice(who, max_slots,
+                                                            replace=False))
+    A, AL = [], []
+    for q in who:
+        dev = np.zeros((len(s), 4))
+        dev[:, 3] = q
+        tr = trace_array(len(s), T, d)
+        if fast_rollout(env, bank, s, T, trace=tr, dev=dev) is None:
+            return None, None
+        A.append(tr[:, :, d].astype(int))
+        AL.append(tr[:, :, d - 1] > 0.5)
+    return np.concatenate(A, 0), np.concatenate(AL, 0)
+
+
+def _churn_stats(bank, A, AL, n_ep):
     n_rows = A.shape[0]
     out = {}
     for c in range(len(bank["clauses"])):

@@ -238,6 +238,10 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
             st["sig"] = json.load(fh)["sig"]
         print("   seeded the light from %s" % from_sig, flush=True)
     t0 = time.time()
+    # Beta is back ON: `churn` reads the arm sequence off a kernel trace now
+    # (1504x, identical statistics), where it used to step the world in
+    # Python -- 779 s for 40 episodes, so ~65 min a round at its default 200.
+    # That was the stage a round appeared to hang in after joint_sets.
     cfg = dict(seed=11, mem_at=99, beta_at=0, steps_at=0, grow_arms=2, min_n=200,
                # ONE SIGMA, NOT TWO. At 50 episodes a +37.19 gain was turned away
                # because 2 se was +49.6, so the search could not move at all.

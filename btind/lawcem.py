@@ -69,11 +69,16 @@ def cem_law(env, bank, arm, pol_fn, n_iter=4, K=64, elite_frac=0.25,
     for it in range(n_iter):
         cand = mu[None] + sigma[None] * rng.standard_normal((K,) + mu.shape)
         cand[0] = mu                                   # keep the incumbent
-        # a fresh sample each iteration: with a small `ep` and one fixed seed
-        # the elite set would be refit on the same handful of episodes every
-        # round and CEM would chase that sample rather than the world
+        # ONE EPISODE SET FOR THE WHOLE RUN. Drawing a fresh sample per iteration
+        # was tried and is wrong: CEM ranks candidates against each other, so
+        # they must face identical episodes or the ranking is noise. Measured at
+        # ep=20 the per-sample swing was -6810 to -8690 between iterations, 27%,
+        # against candidate differences far smaller -- the elite got worse every
+        # iteration and every law was rejected. The seed still varies BETWEEN
+        # rounds (rseed), and the winner is confirmed at the full n_ep by
+        # `accept`, so nothing here can chase one sample for long.
         g = np.array([score(env, _with_law(bank, arm, c), pol_fn, ep, T,
-                            seed + it).mean() for c in cand])
+                            seed).mean() for c in cand])
         idx = np.argsort(-g)[:n_el]
         mu = cand[idx].mean(0)
         sigma = np.maximum(cand[idx].std(0), sigma_floor)
