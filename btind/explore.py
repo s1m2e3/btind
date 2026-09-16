@@ -107,8 +107,15 @@ def deviations(env, bank, n_ep=400, T=400, seed=11, rng=None, ks=(1, 3, 8),
     acts = _actions(bank, env)
     dev = np.zeros((len(s), 4))
     t0 = np.zeros(len(s), int)
+    # DEVIATE WHERE THE AGENT ACTS, not merely where it exists. `alive` marks
+    # the ticks the agent was present for; for a controller that is asked for a
+    # command only now and then, the rest are no-ops whose advantage is exactly
+    # zero -- spent rollouts that also flatten every estimator fitted on them.
+    acting = env.acting_ticks(tr) if hasattr(env, "acting_ticks") else None
     for i in range(len(s)):
-        on = np.flatnonzero(alive[i])
+        on = np.flatnonzero(alive[i] if acting is None else (alive[i] & acting[i]))
+        if not len(on):                       # never asked: fall back to present
+            on = np.flatnonzero(alive[i])
         t0[i] = int(rng.choice(on)) if len(on) else 0
     k = np.asarray(ks)[rng.integers(len(ks), size=len(s))]
     a_idx = rng.integers(len(acts), size=len(s))

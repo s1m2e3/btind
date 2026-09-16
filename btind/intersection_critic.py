@@ -297,25 +297,42 @@ def fit_advantage(env, bank, vh=None, n_dev=3000, seed=17, ks=(3, 8), verbose=Tr
     m.fit(X[tr], y[tr])
     p = m.predict(X[te])
     from scipy.stats import spearmanr
-    big = np.abs(y[te]) >= np.quantile(np.abs(y[te]), 0.75)
-    # PRECISION AT THE TOP, and its lift over the base rate: of the rows this
-    # critic ranks highest, how many actually paid
-    top = np.argsort(-p)[:max(10, len(te) // 10)]
-    base = float((y[te] > 0).mean())
-    prec = float((y[te][top] > 0).mean())
-    rep = dict(spearman=float(spearmanr(p, y[te]).correlation) if len(te) > 2 else 0.0,
-               sign_big=float((np.sign(p[big]) == np.sign(y[te][big])).mean())
+    yt = y[te]
+    # A DEVIATION THAT CHANGED NOTHING IS NOT EVIDENCE ABOUT THE CRITIC, and
+    # every one of these metrics broke on them. When most advantages are exactly
+    # zero the 75th percentile of |adv| IS zero, so "large" selected every row
+    # and sign(p)==sign(0) never matched: the signal's critic read 5% sign
+    # accuracy no matter how good it was. The base rate was diluted the same
+    # way -- 3% instead of 35% -- which inflated lift = precision/base to 3.5x
+    # on chance-level ranking, and since the gate needs all three measures to
+    # agree, that one spurious number kept a useless critic proposing.
+    nz = yt != 0.0
+    n_inf = int(nz.sum())
+    idx = np.flatnonzero(nz)
+    if n_inf:
+        thr = np.quantile(np.abs(yt[idx]), 0.75)
+        big = nz & (np.abs(yt) >= thr)
+        top = idx[np.argsort(-p[idx])][:max(10, n_inf // 10)]
+        base = float((yt[idx] > 0).mean())
+        prec = float((yt[top] > 0).mean())
+        rank = float(spearmanr(p[idx], yt[idx]).correlation) if n_inf > 2 else 0.0
+    else:
+        big, base, prec, rank = np.zeros(len(yt), bool), 0.0, 0.0, 0.0
+    rep = dict(spearman=rank if np.isfinite(rank) else 0.0,
+               sign_big=float((np.sign(p[big]) == np.sign(yt[big])).mean())
                if big.any() else 0.0,
                prec_top=prec, base_rate=base, lift=prec / max(base, 1e-9),
+               n_informative=n_inf,
                n_train=int(n_tr), n_test=int(len(te)), secs=time.time() - t0)
     m.fit(X, y)                                   # the deployed model sees every row
     ah.m = m
     if verbose:
         print("    A-hat: rank corr %.2f, top-decile precision %.0f%% vs %.0f%% base "
-              "(lift %.1fx), sign of large %.0f%%, %d held-out (%d training) [%.0fs]"
+              "(lift %.1fx), sign of large %.0f%%, %d of %d held-out informative "
+              "(%d training) [%.0fs]"
               % (rep["spearman"], 100 * rep["prec_top"], 100 * rep["base_rate"],
-                 rep["lift"], 100 * rep["sign_big"], rep["n_test"], rep["n_train"],
-                 rep["secs"]), flush=True)
+                 rep["lift"], 100 * rep["sign_big"], rep["n_informative"],
+                 rep["n_test"], rep["n_train"], rep["secs"]), flush=True)
     return ah, rep
 
 
@@ -367,13 +384,21 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
     from .kernsearch import _theta, flat_laws
     vh, vrep = fit_value(env, bank, n_ep=n_ep, seed=seed, verbose=verbose)
     ah, arep = fit_advantage(env, bank, vh, n_dev=n_dev, seed=seed + 1, verbose=verbose)
-    if (arep["lift"] < min_lift and arep["spearman"] < min_rank
-            and arep["sign_big"] < min_sign):
+    # TOO FEW INFORMATIVE ROWS AND THE MEASURES ABSTAIN rather than vote. The
+    # three-way AND exists because the measures legitimately disagree, but that
+    # only holds while each is measuring something; a critic scored on a handful
+    # of non-zero advantages is unassessed, not endorsed.
+    thin = arep["n_informative"] < 50
+    if thin or (arep["lift"] < min_lift and arep["spearman"] < min_rank
+                and arep["sign_big"] < min_sign):
         if verbose:
-            print("    critic not used this round: rank %.2f, lift %.1fx, sign %.0f%% "
-                  "-- all below their gates; proposals fall back to deviations and "
-                  "failure anchors" % (arep["spearman"], arep["lift"],
-                                       100 * arep["sign_big"]), flush=True)
+            print("    critic not used this round: rank %.2f, lift %.1fx, sign %.0f%%"
+                  " on %d informative rows -- %s; proposals fall back to deviations "
+                  "and failure anchors"
+                  % (arep["spearman"], arep["lift"], 100 * arep["sign_big"],
+                     arep["n_informative"],
+                     "too few to judge" if thin else "all below their gates"),
+                  flush=True)
         return None, dict(value=vrep, advantage=arep, used=False)
     OB, _, AL, LAW = record(env, bank, n_ep=max(20, n_ep // 3), seed=seed + 2,
                             max_slots=32)

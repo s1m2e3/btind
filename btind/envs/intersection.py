@@ -165,6 +165,10 @@ FIXED_GREEN = np.array([30.0, 10.0, 30.0, 10.0])
 # carried `t_sig>28.9`, a rule about the fixed plan's 30 s green. Every episode
 # of a batch draws its own:
 #     approach_vph   total flow on EACH approach, independently   veh/h
+#                    (with approach_skew: the junction's BASE flow, one
+#                     draw per episode, multiplied per approach)
+#     approach_skew  per-approach multiplier on that base, one draw each,
+#                    so imbalance varies independently of total load
 #     left, right    turning shares on each approach
 #     green_through  the fixed plan's green for phases 0 and 2     s
 #     green_left     the fixed plan's green for phases 1 and 3     s
@@ -451,7 +455,17 @@ class IntersectionBatch:
             if cd:
                 # this episode's conditions, drawn before its arrivals
                 U = lambda key, size=None: rng.uniform(cd[key][0], cd[key][1], size)
-                q_app = U("approach_vph", 4)
+                # HOW BUSY, AND HOW UNEVENLY, ARE DRAWN SEPARATELY when
+                # `approach_skew` is given: one load for the junction times a
+                # multiplier per approach. Four independent draws from one
+                # range confound the two -- a heavily loaded episode and a
+                # lopsided one are the same event -- and a signal only earns
+                # its keep where the approaches disagree, so the skew has to
+                # vary at a fixed total and the total at a fixed skew.
+                if "approach_skew" in cd:
+                    q_app = float(U("approach_vph")) * U("approach_skew", 4)
+                else:
+                    q_app = U("approach_vph", 4)
                 sh_l, sh_r = U("left", 4), U("right", 4)
                 share = np.stack([sh_r, 1.0 - sh_l - sh_r, sh_l], 1)   # by dirs r, s, l
                 rate = np.array([q_app[a] * share[a, int(dd)] for a, dd in
@@ -515,6 +529,30 @@ class IntersectionBatch:
         return s[:, b:b + N_PHASES]
 
     n_cond_groups = 3           # raise it to resolve the demand axis more finely
+
+    def acting_ticks(self, tr):
+        """Boolean (n, T): the ticks where the agent under search sets an action
+        that something reads. None means "every tick", which is the car's case.
+
+        A CAR COMMANDS AN ACCELERATION EVERY TICK; THE LIGHT DOES NOT. It picks
+        a green time when a phase begins and is not asked again until that phase
+        ends, so a deviation placed at any other tick overrides a command nobody
+        reads and returns an advantage of exactly zero. Measured on e37's best
+        pair, 91.3% of 3000 signal deviations came back exactly 0.0 against the
+        car's 23%: the light was learning from a ninth of its budget, and the
+        zeros also flattened the critic's training targets and broke the metrics
+        that are supposed to notice (`intersection_critic`).
+
+        A new phase is where `t_phase` stops increasing.
+        """
+        if self.agent != "signal":
+            return None
+        j = self.sig_names.index("t_phase")
+        tp = tr[:, :, j]
+        new = np.zeros(tp.shape, bool)
+        new[:, 0] = True
+        new[:, 1:] = tp[:, 1:] <= tp[:, :-1]
+        return new
 
     def condition_groups(self, s, n_groups=None):
         """Episode labels by demand (cars scheduled), for per-condition
