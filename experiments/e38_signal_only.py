@@ -286,7 +286,7 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # leave 4 per group and switch that protection -- the one that
                # replaced the demand ladder -- off ENTIRELY AND SILENTLY, which
                # is why 20 screens a pool and never decides.
-               grow_screen_ep=screen_ep, grow_pool=28,
+               screen_ep=screen_ep, grow_pool=28,
                # CEM's inner evaluations only RANK candidates to refit its
                # sampling distribution -- `improve_laws` still puts the result
                # through `accept` at the full n_ep -- and at n_ep they were the

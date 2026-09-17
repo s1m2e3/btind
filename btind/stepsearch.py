@@ -81,7 +81,20 @@ def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4):
     if head in ("scalar", "duration"):
         from .lawsearch import scalar_primitives
         lo, hi = bank.get("u_range", (-1.0, 1.0))
-        out += list(scalar_primitives(zn, d, lo, hi).items())
+        # SAMPLED, as the discrete branch below already was. The vocabulary is
+        # four laws per column -- two scales, both signs -- so it grows with the
+        # observation: widening the signal from 24 to 46 columns took it from
+        # 102 to 190, and every law is a screening rollout for every advance.
+        # The five constants are kept whole. They are the null a proportional
+        # term has to beat, there are only five of them, and dropping one at
+        # random would make the pool's floor depend on the draw.
+        prim = list(scalar_primitives(zn, d, lo, hi).items())
+        const = [p for p in prim if p[0].startswith("const[")]
+        rest = [p for p in prim if not p[0].startswith("const[")]
+        if len(rest) > n_sample:
+            rest = [rest[i] for i in
+                    rng.choice(len(rest), n_sample, replace=False)]
+        out += const + rest
     elif head == "argmax":
         out += list(discrete_primitives(zn, n_out, d, rng=rng,
                                         n_sample=n_sample).items())

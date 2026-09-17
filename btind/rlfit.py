@@ -287,7 +287,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           # -- while every other search screens at a fraction and
                           # only confirms survivors. Defaults to n_ep so nothing
                           # that does not set it changes.
-                          screen_ep=cfg.get("grow_screen_ep") or cfg["n_ep"],
+                          screen_ep=cfg.get("screen_ep") or cfg["n_ep"],
                           confirm_ep=cfg["n_ep"],
                           n_confirm=10, T=cfg["T"], seed=rseed,
                           z=cfg["z"], rng=rng, use_library=False,
@@ -444,8 +444,16 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             p = pol_fn(bank)
             p.reset(len(obs))
             Zs = p.z(obs, update=False)
+            # SCREEN CHEAP HERE TOO. This stage screens n_adv x |laws|
+            # candidates -- 16 x 190 = 3040 on the 46-column signal -- and it
+            # was pinned to the full episode count while growing, CEM and the
+            # kernel search all screen at a fraction, so it alone cost 985 s an
+            # arm at 100 episodes against growing's whole 139 s. The knob is the
+            # one the caller already sets, and it still defaults to the old
+            # value, so nothing that does not set it changes.
             bank, slog = search_steps(env, bank, zn, Zs, pol_fn, cur_G=cur,
-                                      screen_ep=min(cfg["n_ep"], 120),
+                                      screen_ep=(cfg.get("screen_ep")
+                                                 or min(cfg["n_ep"], 120)),
                                       confirm_ep=cfg["n_ep"], T=cfg["T"],
                                       seed=rseed, z=cfg["z"],
                                       min_gain=cfg["min_gain"], rng=rng,
