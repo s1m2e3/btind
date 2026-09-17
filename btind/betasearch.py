@@ -126,8 +126,9 @@ def _arms_on_kernel(env, bank, n_ep, T, seed, max_slots=64):
 def _churn_stats(bank, A, AL, n_ep, row_scale=1.0):
     n_rows = A.shape[0]
     out = {}
-    for c in range(len(bank["clauses"])):
-        runs, reent = [], 0
+    C = len(bank["clauses"])
+    for c in range(C):
+        runs, reent, latchable = [], 0, 0
         for i in range(n_rows):
             row = A[i][AL[i]]
             if not len(row):
@@ -144,8 +145,20 @@ def _churn_stats(bank, A, AL, n_ep, row_scale=1.0):
                 runs.append(d)
                 seen += 1
             reent += max(seen - 1, 0)
+            # WHAT A LATCH CAN ACTUALLY ACT ON. `_tick` gives a running arm up
+            # the moment a HIGHER-priority guard fires -- preemption beats
+            # stickiness by construction -- so the only departure a beta can
+            # prevent is one where this arm's own guard stopped holding and a
+            # LOWER-priority arm (or the default) took over. Measured on a real
+            # car tree: `is_left` churned 16.6 times an episode, every one of
+            # them a preemption, and latching it was bit-identical over 100
+            # episodes; `d_stop>85.104` churned 0.0 times and latching it
+            # changed all 100. Ranking by re-entries sent the whole stage to
+            # the one arm where stickiness was impossible.
+            latchable += int(((row[:-1] == c) & (row[1:] > c)).sum())
         out[c] = dict(dwell=float(np.mean(runs)) if runs else 0.0,
                       reentries=reent * row_scale / max(n_ep, 1),
+                      latchable=latchable * row_scale / max(n_ep, 1),
                       share=float((A[AL] == c).mean()) if AL.any() else 0.0)
     return out
 
@@ -180,13 +193,17 @@ def search_beta(env, bank, names, Z, pol_fn, cur_G=None, arms=None, n_try=40,
     if not C:
         return bank, [], None
     ch = churn(env, bank, pol_fn)
+    # BY WHAT A LATCH CAN CHANGE, not by how often the arm is left. See
+    # `_churn_stats`: a departure to a higher-priority arm is preemption, which
+    # stickiness cannot prevent, so counting it only points the search at arms
+    # it cannot help.
     order = (arms if arms is not None else
-             sorted(range(C), key=lambda c: -ch[c]["reentries"]))
+             sorted(range(C), key=lambda c: -ch[c].get("latchable", 0.0)))
     cur = (score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G)
     log = []
     for c in order:
-        if ch[c]["share"] < 0.02:
-            continue
+        if ch[c]["share"] < 0.02 or ch[c].get("latchable", 0.0) <= 0.0:
+            continue        # nothing for a beta to hold through
         cands = beta_candidates(Z, names, bank["clauses"][c])
         rng = np.random.default_rng(0)
         if len(cands) > n_try:
@@ -205,8 +222,10 @@ def search_beta(env, bank, names, Z, pol_fn, cur_G=None, arms=None, n_try=40,
             if ok and d > best_d:
                 best, best_d = cand, d
         if verbose:
-            print("    arm %d (re-entries %.1f/ep, dwell %.1f): %s"
-                  % (c, ch[c]["reentries"], ch[c]["dwell"],
+            print("    arm %d (latchable %.1f/ep, re-entries %.1f/ep, "
+                  "dwell %.1f): %s"
+                  % (c, ch[c].get("latchable", 0.0), ch[c]["reentries"],
+                     ch[c]["dwell"],
                      ("sticky, beta %s  %+.2f"
                       % (max((l for l in log if l["arm"] == c and l["accepted"]),
                              key=lambda l: l["delta"])["beta"], best_d))
