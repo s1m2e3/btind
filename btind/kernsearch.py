@@ -189,12 +189,36 @@ def candidates(ex, bank, c, k, kern, head, n_prop, u_range=None):
             # lost 3.3 while -2.7 gained 15.5. Points along the way from the
             # law's current command to the paying one are all proposed.
             a = float(ex["a"][i, 0])
-            ys = [np.array([u0[0] + f * (a - u0[0])]) for f in (1.0, 0.75, 0.5, 0.25)]
+            # THE POINT MOVES THE COMMAND AND LEAVES EVERY OTHER OUTPUT ALONE.
+            # A target used to be built as a one-element array, which is the
+            # whole law only when the head has one output. The `pass` head has
+            # two -- a command and a declaration -- and a deviation varies the
+            # command, so the declaration carries over from what the law already
+            # says there. Identical to the old form when there is one output.
+            ys = []
+            for f in (1.0, 0.75, 0.5, 0.25):
+                y = u0.copy()
+                y[0] = u0[0] + f * (a - u0[0])
+                ys.append(y)
         for y in ys:
             out.append((x, y, float(ex["adv"][i])))
         if len(out) >= n_prop:
             break
     return [(kern, x[None], y[None], a, "dev") for x, y, a in out]
+
+
+def _bound_y(bank, c, k, v0):
+    """A target with command `v0` and every other output at the leaf's baseline.
+
+    A kernel point states the leaf's whole command near its anchor, and a leaf
+    may have more than one output -- the `pass` head commands an acceleration
+    AND a declaration. A proposal about the acceleration must not silently zero
+    the rest, so they take the law's intercept: what the leaf says with no state
+    behind it. Identical to the old one-element array when there is one output.
+    """
+    y = _theta(bank, c, k)[-1].astype(float).copy()
+    y[0] = v0
+    return y
 
 
 def bound_seeds(ex, bank, c, k, kern, bounds, Zown):
@@ -216,12 +240,16 @@ def bound_seeds(ex, bank, c, k, kern, bounds, Zown):
             best[name] = (ex["z0"][i, kern["cols"]], float(ex["adv"][i]))
     if "lo" in best and "hi" in best:
         out.append((kern, np.vstack([best["lo"][0], best["hi"][0]]),
-                    np.array([[lo], [hi]]), best["lo"][1] + best["hi"][1], "bound"))
+                    np.vstack([_bound_y(bank, c, k, lo),
+                               _bound_y(bank, c, k, hi)]),
+                    best["lo"][1] + best["hi"][1], "bound"))
     if len(Zown):
         q10 = np.quantile(Zown[:, kern["cols"]], 0.1, axis=0)
         q90 = np.quantile(Zown[:, kern["cols"]], 0.9, axis=0)
         for a, b in ((lo, hi), (hi, lo)):
-            out.append((kern, np.vstack([q10, q90]), np.array([[a], [b]]), 0.0, "bound"))
+            out.append((kern, np.vstack([q10, q90]),
+                        np.vstack([_bound_y(bank, c, k, a),
+                                   _bound_y(bank, c, k, b)]), 0.0, "bound"))
     return out
 
 
@@ -257,7 +285,9 @@ def anchor_candidates(Zanc, arms, bank, c, k, kern, head, n_rows):
         else:
             lo, hi = bounds if bounds is not None else (u0[0] - 1.0, u0[0] + 1.0)
             for yv in (lo, 0.5 * lo, min(max(0.0, lo), hi), hi):
-                out.append((kern, x[None], np.array([[yv]]), 0.0, "anchor"))
+                y = u0.copy()
+                y[0] = yv
+                out.append((kern, x[None], y[None], 0.0, "anchor"))
     return out
 
 

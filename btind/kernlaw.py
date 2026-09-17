@@ -63,7 +63,8 @@ JITTER = 1e-6
 
 def bounds_of(bank):
     """(lo, hi) for a continuous leaf with a declared range, else None."""
-    if bank.get("head") in ("scalar", "duration") and bank.get("u_range") is not None:
+    if (bank.get("head") in ("scalar", "duration", "pass")
+            and bank.get("u_range") is not None):
         lo, hi = bank["u_range"]
         return float(lo), float(hi)
     return None

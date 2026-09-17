@@ -1635,7 +1635,7 @@ class IntersectionBatch:
             OB, AL = OB[k], AL[k]
         return OB, AL
 
-    def coverage_rows(self, bank, n_ep=200, seed=0, lookback=6):
+    def coverage_rows(self, bank, n_ep=200, seed=0, lookback=6, max_slots=48):
         """Observation rows the agent under search actually visits, and the
         rows just before things went wrong -- from kernel traces.
 
@@ -1665,7 +1665,19 @@ class IntersectionBatch:
         if self.agent == "vehicle":
             n_obs = len(self.veh_names)
             ix = self.veh_names.index
-            for q in range(self.N):
+            # A SAMPLE OF SLOTS, NOT ALL OF THEM. One rollout per slot was
+            # "a second or two" when N was small; these rows only build a
+            # threshold alphabet and point the grower at trouble, and every
+            # slot draws from the same distribution, so a sample says the
+            # same thing. At N=704 the full sweep is 704 x n_ep episodes and
+            # measured 110 s at n_ep=80 -- the single largest cost in a
+            # vehicle round, and entirely avoidable.
+            qs = np.arange(self.N)
+            if self.N > max_slots:
+                qs = np.random.default_rng(seed).choice(self.N, max_slots,
+                                                        replace=False)
+                qs.sort()
+            for q in qs:
                 dev = np.zeros((n_ep, 4))
                 dev[:, 3] = q
                 tr = trace_array(n_ep, T, d)

@@ -69,7 +69,7 @@ def kernel_for(env, bank):
     kind = type(env).__name__
     try:
         if kind == "IntersectionBatch":
-            ok = {"vehicle": ("argmax", "scalar"),
+            ok = {"vehicle": ("argmax", "scalar", "pass"),
                   "signal": ("argmax", "duration")}[env.agent]
             if bank.get("head") not in ok:
                 return None

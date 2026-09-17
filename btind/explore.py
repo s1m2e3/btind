@@ -50,7 +50,9 @@ COMPASS = np.array([[np.cos(a), np.sin(a)]
 
 
 def _actions(bank, env):
-    if bank.get("head") in ("scalar", "duration"):
+    #  deviates on its COMMAND, column 0; the declaration is not a thing
+    # a counterfactual probe can meaningfully randomise on its own.
+    if bank.get("head") in ("scalar", "duration", "pass"):
         # a continuous leaf deviates to one of a few levels across its range:
         # what a random discrete action is to an argmax head
         lo, hi = bank.get("u_range", getattr(env, "u_range", (-1.0, 1.0)))

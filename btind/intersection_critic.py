@@ -448,7 +448,14 @@ def make_critic(env, bank, n_ep=150, n_dev=3000, seed=17, k=3, top=24, min_adv=0
                 y = u0.copy()
                 y[j] = u0.max() + 1.0 + 0.25 * (u0.max() - u0.min())
                 return y
-            return np.array([u0[0] + f * (ah.levels[j] - u0[0])])
+            # THE COMMAND MOVES, EVERY OTHER OUTPUT STAYS. A one-element
+            # target is the whole law only for a one-output head; the `pass`
+            # head commands an acceleration AND a declaration, and the critic
+            # has an opinion about the first, not the second. Identical to the
+            # old form when there is one output.
+            y = u0.copy()
+            y[0] = u0[0] + f * (ah.levels[j] - u0[0])
+            return y
         out = []
         for i in np.argsort(-best):
             if best[i] < min_adv or len(out) >= top:
