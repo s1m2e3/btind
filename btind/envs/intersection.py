@@ -225,6 +225,12 @@ R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 200.0, 75.
 # risks, and at R_RED=10 the discovered car ran 52 an episode and made the
 # signal's objective 49.5% its partner's law-breaking.
 R_RED_FLOOR, T_SAFE = 20.0, 3.0
+# The share of a crossing collision borne by the car that entered without the
+# green. At 1.0 the total is what it was and simply moves onto the responsible
+# party; above 1.0 a pass that ends in a crossing costs MORE than the old
+# both-parties split, which is the "penalised double for crashing" that buys
+# the freedom to cross when it is safe.
+W_CROSS_FAULT = 2.0
 # COMFORT: each car's change of speed, squared, per car-second, normalised by
 # the braking limit -- a full-braking second costs W_COMFORT, a gentle stop at
 # half the rate a quarter of that per second. Measured on the discrete tree of
@@ -286,7 +292,21 @@ T_V_MIN = 0.5          # the speed floor a time-to-conflict is computed with
 VEH_NAMES = ["v", "d_stop", "near_int", "green", "t_sig", "t_sig_max", "all_red",
              "lead_gap", "lead_dv", "has_lead", "d_conf", "is_left", "is_right",
              "t_norm", "noise",
-             "n_near", "near_d", "near_closing", "has_rival", "rival_dt", "rival_d"]
+             "n_near", "near_d", "near_closing", "has_rival", "rival_dt", "rival_d",
+             # WHO IS COMING, AND WHETHER THEY HAVE THE RIGHT TO. `rival_dt`
+             # says a vehicle is heading for a shared conflict point and when
+             # it gets there; it does not say whether that vehicle intends to
+             # STOP. That did not matter while every red crossing was charged a
+             # flat 200 and so almost none happened. Now that a crossing which
+             # risks nothing costs only the floor, an opportunistic pass is a
+             # rational move and a car with the green has to reason about one.
+             #   rival_red  the rival does NOT have the green: it is either
+             #              stopping or coming through against the light
+             #   rival_v    how fast it is going, which is what separates the
+             #              two -- a rival on red doing 9 m/s is not stopping
+             # Inferred from the world, not declared by the rival: there is no
+             # message to send and so nothing to send falsely.
+             "rival_red", "rival_v"]
 # Per phase k, over the vehicles whose movement phase k serves and that are
 # approaching (0 < distance to the stop line < QUEUE_D):
 #   q<k>a q<k>b  how many are QUEUED (speed below QUEUE_V) on each of the two
@@ -414,8 +434,8 @@ class IntersectionBatch:
     # observation are never resumed on this one -- a checkpoint that learned
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
-    OBS_VERSION = 8
-    REWARD_VERSION = 6          # part of the store key, like OBS_VERSION
+    OBS_VERSION = 9
+    REWARD_VERSION = 7          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -905,8 +925,8 @@ class IntersectionBatch:
         best = gap_t.min(2)
         return np.where(np.isfinite(best), best, FAR)
 
-    def _sense(self, m, S, V, act):
-        """The radius sensor's six columns per slot (see VEH_NAMES)."""
+    def _sense(self, m, S, V, act, gm):
+        """The radius sensor's eight columns per slot (see VEH_NAMES)."""
         g = self.geom
         n, N = S.shape
         x, y, hx, hy = self._xy(m, S)
@@ -938,8 +958,11 @@ class IntersectionBatch:
         rbest = np.take_along_axis(gap_t, jr[:, :, None], 2)[:, :, 0]
         has_rival = np.isfinite(rbest)
         r_d = np.take_along_axis(d_rv, jr[:, :, None], 2)[:, :, 0]
+        r_red = np.take_along_axis((~gm).astype(float), jr, 1)
+        r_v = np.take_along_axis(V, jr, 1)
         return (n_near, np.where(has_near, best, FAR), closing, has_rival.astype(float),
-                np.where(has_rival, rbest, FAR), np.where(has_rival, r_d, FAR))
+                np.where(has_rival, rbest, FAR), np.where(has_rival, r_d, FAR),
+                np.where(has_rival, r_red, 0.0), np.where(has_rival, r_v, 0.0))
 
     def _d_conf(self, m, s):
         """Distance to MY nearest conflict point still ahead: geometry only."""
@@ -1007,7 +1030,7 @@ class IntersectionBatch:
         # observed column can recover elapsed time from it.
         o[:, :, 13] = np.mod(X[:, 4:5] / self.duration + X[:, 11:12], 1.0)
         o[:, :, 14] = X[:, 5:6]
-        for c_i, col in enumerate(self._sense(m, S, V, act)):
+        for c_i, col in enumerate(self._sense(m, S, V, act, gm)):
             o[:, :, 15 + c_i] = col
         o[~act] = 0.0
         return o.reshape(n * N, -1)
@@ -1389,9 +1412,21 @@ class IntersectionBatch:
         n_rear = rear.sum(1)
         n_cross = np.triu(both, 1).sum((1, 2))
         n_ev = n_rear + n_cross
-        # the per-car reward charges the cars at fault: the striker of a
-        # rear-end, both parties of a crossing
-        r -= R_COLL * ((rear | cross).sum(1) if car else n_ev)
+        # THE CAR THAT HAD THE GREEN IS NOT AT FAULT. This charged BOTH
+        # parties of a crossing 1000, which was defensible while a red crossing
+        # cost a flat 200 and so hardly ever happened. It is not defensible now:
+        # a crossing that risks nothing costs only the floor, so opportunistic
+        # passing is rational, and a lawful car being charged 1000 for being hit
+        # by a red-runner makes yielding-by-default the only safe policy and
+        # destroys the throughput the rest of the reward is asking for.
+        # Fault follows right of way -- and where neither party has it, during
+        # an all-red, both are charged, as before: `gm_eff` is plan-green with
+        # the all-red taken out, and during one NOBODY has the right to be in
+        # the box. Plain `gm` would have excused whichever movement the plan
+        # happened to favour at that moment.
+        cross_fault = cross & ~gm_eff
+        r -= R_COLL * ((rear.sum(1) + W_CROSS_FAULT * cross_fault.sum(1))
+                       if car else n_ev)
         t_red = R_RED * ran.sum(1)
         X[:, 6] += n_ev
         X[:, 8] += n_rear

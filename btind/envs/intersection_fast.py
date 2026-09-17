@@ -30,7 +30,7 @@ from ..kernlaw import kern_args, law_out
 from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_args
 from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_RED_FLOOR,
-                           R_STOP, STOP_ZONE, T_SAFE,
+                           R_STOP, STOP_ZONE, T_SAFE, W_CROSS_FAULT,
                            W_CAR_DELAY, W_COMFORT, W_DELAY, W_OVER, COMMIT_D,
                            W_QUEUE, W_STUCK_CAR, W_STUCK_FREE, W_STUCK_QUEUE,
                            W_STUCK_EARLY, STOP_ZONE, NEAR_INT,
@@ -498,6 +498,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 near_rate = 0.0
                 riv_best = 1e18
                 riv_d = FAR
+                riv_o = -1
                 # THE OTHER QUADRATIC LOOP, and the dominant one: this runs per
                 # active car per tick to build its observation. Two changes, both
                 # exact. The active list skips empty slots (the old scan tested
@@ -531,6 +532,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                             if gt < riv_best:
                                 riv_best = gt
                                 riv_d = d_rv
+                                riv_o = o
                 zv[15] = n_near
                 if near_best < 1e17:
                     zv[16] = near_best
@@ -542,10 +544,15 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     zv[18] = 1.0
                     zv[19] = riv_best
                     zv[20] = riv_d
+                    # does the one that is coming have the right to?
+                    zv[21] = 0.0 if (green_now and green[phase, mv[riv_o]])                         else 1.0
+                    zv[22] = v[riv_o]
                 else:
                     zv[18] = 0.0
                     zv[19] = FAR
                     zv[20] = FAR
+                    zv[21] = 0.0
+                    zv[22] = 0.0
                 rdt[q] = zv[19]
                 vhave[q], vage[q] = _write_mem(zv, vn_obs, vslots[q], vhave[q],
                                                vage[q], vmem_cols, vw_col,
@@ -931,6 +938,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
 
             hit = np.zeros(N, np.bool_)
             fault = np.zeros(N, np.bool_)
+            xfault = np.zeros(N, np.bool_)      # crossing, without the green
             for q in range(N):
                 if status[q] == 1.0 and has_lead[q] and lead_gap[q] < 0.0:
                     hit[q] = True
@@ -958,10 +966,13 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                             abs(s_cp[mr, m] - s[rr]) < HALF_CONF:
                         hit[q] = True
                         hit[rr] = True
-                        fault[q] = True
-                        fault[rr] = True
+                        if not ((not in_ar) and green[phase, m]):
+                            xfault[q] = True
+                        if not ((not in_ar) and green[phase, mr]):
+                            xfault[rr] = True
                         n_cross += 1
             n_fault = 0
+            n_xfault = 0
             for q in range(N):
                 if hit[q]:
                     status[q] = 2.0
@@ -970,7 +981,14 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     n_fault += 1
                     if q == ts:
                         r_me -= R_COLL
-            r -= R_COLL * (n_fault if car_r else (n_rear + n_cross))
+                if xfault[q]:
+                    n_xfault += 1
+                    if q == ts:
+                        r_me -= W_CROSS_FAULT * R_COLL
+            if car_r:
+                r -= R_COLL * (n_fault + W_CROSS_FAULT * n_xfault)
+            else:
+                r -= R_COLL * (n_rear + n_cross)
 
             # ---- exits ------------------------------------------------------------
             n_out = 0
