@@ -460,7 +460,24 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
         # SPEND THE CONFIRM BUDGET ON DISTINCT CANDIDATES. Unfiltered, a real
         # round confirmed 20 laws that were 6 different controllers.
         for d, cl, th, lname, nrow in dedupe_screened(rows)[:n_confirm]:
+            # A POSITION THAT CLAIMS NOTHING IS NOT A CANDIDATE. Inserted below
+            # arms that already cover its rows, a new arm owns nothing, the bank
+            # is unchanged, and the confirmation is a 100-episode paired test of
+            # a tree against ITSELF -- it can only ever return +0.00 +-0.00. In
+            # a real round that was 20 of growing's 50 confirmations, alternating
+            # one-for-one with the real ones. Two positions that leave the new
+            # arm the same rows are likewise one candidate: `_insert` reorders
+            # nothing, so every other arm keeps its rows too.
+            seen_pos = set()
             for pos in positions:
+                above = np.zeros(len(Z), bool)
+                for q in range(min(pos, len(bank["clauses"]))):
+                    above |= _match(bank["clauses"][q], Z)
+                claim = _match(cl, Z) & ~above & ~claimed
+                key = np.packbits(claim).tobytes()
+                if not claim.any() or key in seen_pos:
+                    continue
+                seen_pos.add(key)
                 cand = _insert(bank, cl, th, pos)
                 ok, dl, _ = accept(env, cand, pol_fn, cur_full, confirm_ep, T,
                                    seed_c, z)
