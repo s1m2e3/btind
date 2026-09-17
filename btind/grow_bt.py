@@ -206,9 +206,23 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
             # proportional terms, from `u_range` the world declares.
             from .lawsearch import scalar_primitives
             lo, hi = bank.get("u_range", (-1.0, 1.0))
-            out += list(scalar_primitives(zn, d_law, lo, hi,
+            # SAMPLED TO `n_sample`, as the discrete branch below already is.
+            # It was not, so `law_sample` -- which the subtree search sets to 10
+            # precisely because it sweeps every threshold on the region's own
+            # alphabet -- did nothing on a continuous head. Crossing 402 seed
+            # clauses with all 189 laws put one subtree stage at 65 minutes.
+            # The constants are kept whole: there are five, and they are the
+            # null a proportional term has to beat.
+            prim = list(scalar_primitives(zn, d_law, lo, hi,
                                           Z=Z[region] if len(region) else Z
                                           ).items())
+            const = [p for p in prim if p[0].startswith("const[")]
+            rest = [p for p in prim if not p[0].startswith("const[")]
+            if n_sample and len(rest) > n_sample:
+                r2 = rng or np.random.default_rng(0)
+                rest = [rest[i] for i in
+                        r2.choice(len(rest), int(n_sample), replace=False)]
+            out += const + rest
         elif head == "vector":
             out += list(structural_primitives(zn, d_law).items())
         else:

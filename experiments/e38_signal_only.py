@@ -89,6 +89,12 @@ T_END, N_MAX_EP = 384.0, 384
 # two dry rounds is the signal that the monotone moves are exhausted; a hop
 # then gets two rounds to be re-optimised before it is priced and kept or not
 STALL_BEFORE_KICK, KICK_SIZE, HOP_BUDGET = 2, 1, 2
+# The law class, at module scope because `config_key` has to report the one
+# actually in use. It said prior="const" as a literal while the cfg below moved
+# to "sparse", so a bank grown under constants-only would have been resumed
+# under a class that can carry slopes -- silently, which is the single thing
+# the configuration guard exists to prevent.
+PRIOR, PRIOR_K, VALUE_LAWS = "sparse", 10, True
 
 
 def world(agent, cond=SPAN, groups=N_GROUPS):
@@ -130,7 +136,8 @@ def config_key():
     return dict(signal_only=True, span=list(SPAN["approach_vph"]),
                 skew=list(SPAN["approach_skew"]), groups=N_GROUPS,
                 t_end=T_END, n_max=N_MAX_EP, t_max=T_MAX,
-                sig_head=env.sig_head, prior="const",
+                sig_head=env.sig_head, prior=PRIOR, prior_k=PRIOR_K,
+                value_laws=VALUE_LAWS,
                 obs=env.OBS_VERSION, reward=env.REWARD_VERSION)
 
 
@@ -216,11 +223,39 @@ def credit(tgt, s, vb, new_sb, old_sb, z=2.0, g0=None):
     return keep, (g1 if keep else g0), float(d.mean()), se
 
 
+def load_best():
+    """The best tree any previous run of this configuration reached.
+
+    `runs/e38_best.json` is written every time the best improves and is the one
+    file worth carrying between snapshots -- a snapshot starts with no state
+    file, so without this a fresh one throws away everything the last one
+    found. It is refused across a configuration change for the same reason the
+    state file is: the tree would be a tree, but not of this world.
+    """
+    if not os.path.exists(BEST):
+        return None
+    with open(BEST, encoding="utf-8") as fh:
+        b = json.load(fh)
+    if not b.get("sig"):
+        return None
+    # A MISSING KEY IS A MISMATCH. Files written before the law class was part
+    # of the configuration carry no provenance at all, and loading one under a
+    # class that can carry slopes when it was grown under constants-only is the
+    # exact silent swap this guard exists to stop. `from_sig=` is the explicit
+    # override for when that is what you want.
+    if b.get("config") != config_key():
+        print("   %s was written under a different configuration -- ignored "
+              "(pass from_sig=<path> to load it anyway)" % BEST, flush=True)
+        return None
+    return b
+
+
 def update_best(st, rows, r):
     cur, se = rows["train 300-600"]["discovered"], rows["train 300-600"]["se"]
     best = st.get("best")
     if best is None or cur > best["train"]:
-        st["best"] = dict(round=r, train=cur, se=se, sig=st["sig"])
+        st["best"] = dict(round=r, train=cur, se=se, sig=st["sig"],
+                          config=config_key())
         os.makedirs(os.path.dirname(BEST), exist_ok=True)
         with open(BEST, "w", encoding="utf-8") as fh:
             json.dump(st["best"], fh)
@@ -229,7 +264,7 @@ def update_best(st, rows, r):
 
 
 def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
-         n_guard=400, from_sig="", kern_every=3, car="hand"):
+         n_guard=400, from_sig="", kern_every=3, car="hand", resume="best"):
     rounds, n_ep, seed = int(rounds), int(n_ep), int(seed)
     critic, verbose, n_guard = bool(int(critic)), bool(int(verbose)), int(n_guard)
     kern_every, screen_ep = int(kern_every), int(screen_ep)
@@ -243,6 +278,23 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
         with open(from_sig, encoding="utf-8") as fh:
             st["sig"] = json.load(fh)["sig"]
         print("   seeded the light from %s" % from_sig, flush=True)
+    # RESUME FROM THE BEST TREE, NOT THE LAST ONE. `st["sig"]` is wherever the
+    # search happened to stop, and a round is kept whenever it is not
+    # SIGNIFICANTLY worse, so a run can drift down and did: rounds 3 and 4 of
+    # the previous run lost 10.6 and 14.9 against a best that was two rounds
+    # behind them. Restarting from that is restarting from the drift.
+    if resume != "off" and not from_sig:
+        b = st.get("best") or load_best()
+        if b and b.get("sig"):
+            if resume == "best":
+                st["sig"], st["best"] = b["sig"], b
+                print("   resuming from the BEST tree held: round %s, train "
+                      "%.1f +-%.1f" % (b.get("round"), b["train"], b["se"]),
+                      flush=True)
+            elif st["sig"] is None:
+                st["sig"], st["best"] = b["sig"], b
+                print("   no state file; seeded from %s (round %s, train %.1f)"
+                      % (BEST, b.get("round"), b["train"]), flush=True)
     t0 = time.time()
     # Beta is back ON: `churn` reads the arm sequence off a kernel trace now
     # (1504x, identical statistics), where it used to step the world in
@@ -275,7 +327,7 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                #   green = 20.9 + 10.1*ph2 + 9.7*ph0 + 7.0*ph1 + 2.5*q1b + ...
                # which is a phase plan with a queue term, the thing a signal
                # controller actually is. Set prior="const" to go back.
-               prior="sparse", prior_k=10,
+               prior=PRIOR, prior_k=PRIOR_K,
                # NARROWER PROPOSAL SEARCH, SAME ANSWER. The kernel stage was the
                # slowest thing in a round -- 264 scoring calls, ~248 of them
                # screens -- and widening the observation 24 -> 44 widened the
@@ -316,7 +368,7 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # fresh sample too, so a small screen cannot be chased.
                cem_ep=screen_ep,
                # FIT LAWS BY VALUE, not only by picking from a vocabulary.
-               value_laws=True, value_ep=300)
+               value_laws=VALUE_LAWS, value_ep=300)
 
     print("==== e38: the light alone, approach base %g..%g veh/h x skew %g..%g, "
           "%d episodes a test, %d demand groups"
