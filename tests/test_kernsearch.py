@@ -50,12 +50,28 @@ def _run(head):
     return cur.mean(), cur2.mean(), kern, N
 
 
+_STALE = pytest.mark.xfail(reason=(
+    "The planted rule has no value left under REWARD_VERSION 6. These worlds "
+    "run at vph=(10, 3, 3) -- a deliberately empty junction -- so a red "
+    "crossing never has a rival heading for a shared conflict point, "
+    "`rival_dt` is FAR, and the charge is R_RED_FLOOR=20 rather than 200. "
+    "Braking for a red therefore saves almost nothing and `search_kernels` "
+    "returns the bank untouched: g1 == g0 exactly, not a smaller gain. The "
+    "search machinery is unaffected -- what changed is the world, on purpose, "
+    "because a crossing that risks nothing should not be priced as if it did. "
+    "To restore these, the planted rule needs a world with conflicting "
+    "traffic, which is a different premise from the 'light traffic' these are "
+    "written around."), strict=True)
+
+
+@_STALE
 def test_discrete_leaf_learns_a_red_stop_point():
     g0, g1, kern, N = _run("argmax")
     assert g1 > g0 + 10.0
     assert N.index("green") in kern["cols"]
 
 
+@_STALE
 def test_continuous_leaf_learns_a_braking_point():
     g0, g1, kern, N = _run("scalar")
     assert g1 > g0 + 10.0

@@ -29,7 +29,8 @@ from numba import njit, prange
 from ..kernlaw import kern_args, law_out
 from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_args
 from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
-                           QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_STOP, STOP_ZONE,
+                           QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_RED_FLOOR,
+                           R_STOP, STOP_ZONE, T_SAFE,
                            W_CAR_DELAY, W_COMFORT, W_DELAY, W_OVER, COMMIT_D,
                            W_QUEUE, W_STUCK_CAR, W_STUCK_FREE, W_STUCK_QUEUE,
                            W_STUCK_EARLY, STOP_ZONE, NEAR_INT,
@@ -345,6 +346,9 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         zs = np.zeros(ds)
         px = np.zeros(N)
         py = np.zeros(N)
+        # `rival_dt` kept per slot: `zv` is one reused scratch vector, and the
+        # red-run charge below needs the gap the crossing car SAW this tick
+        rdt = np.full(N, FAR)
         pvx = np.zeros(N)
         pvy = np.zeros(N)
         uv = np.zeros(nAv)
@@ -542,6 +546,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     zv[18] = 0.0
                     zv[19] = FAR
                     zv[20] = FAR
+                rdt[q] = zv[19]
                 vhave[q], vage[q] = _write_mem(zv, vn_obs, vslots[q], vhave[q],
                                                vage[q], vmem_cols, vw_col,
                                                vw_thr, vw_neg)
@@ -721,6 +726,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
 
             # ---- kinematics, red running ----------------------------------------
             n_ran = 0
+            red_sum = 0.0
             green_sum = 0.0
             comfort_sum = 0.0
             # the traced car's OWN reward under the per-car reward, for the
@@ -751,9 +757,20 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                             r_me += R_GREEN * v[q] / V0
                     else:
                         n_ran += 1
+                        # PRICED BY THE CONFLICT, NOT BY THE FACT. `rdt[q]` is
+                        # the car's own `rival_dt` this tick, so a car slipping
+                        # through an empty junction pays the floor and one
+                        # cutting across an arriving movement pays all of it.
+                        rk = 1.0 - rdt[q] / T_SAFE
+                        if rk < 0.0:
+                            rk = 0.0
+                        elif rk > 1.0:
+                            rk = 1.0
+                        chg = R_RED_FLOOR + (R_RED_CAR - R_RED_FLOOR) * rk
+                        red_sum += chg
                         if q == ts:
-                            r_me -= R_RED_CAR
-            r -= (R_RED_CAR if car_r else R_RED) * n_ran
+                            r_me -= chg
+            r -= (red_sum if car_r else R_RED * n_ran)
             if car_r:
                 r += R_GREEN * green_sum
                 r -= W_COMFORT * comfort_sum * dt

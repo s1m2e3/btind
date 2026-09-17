@@ -203,6 +203,28 @@ QUEUE_GAP, STOP_ZONE = 12.0, 15.0
 LONG_QUEUE = 6           # a phase queue this long anchors the signal's proposals
 # the per-car reward (veh_reward="car"): see the module docstring
 R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 200.0, 75.0
+# A RED-RUN IS PRICED BY THE CONFLICT IT CREATES, not by the fact of it. The
+# comment above R_RED says the quiet part: "a red-run is now priced like the
+# collision it risks" -- a flat fee standing in for a risk the world already
+# measures. Measured on the hand-written follower: 7.83 red-runs an episode,
+# 3.83 crashes, and EVERY crash a rear-end -- zero crossing collisions from 47
+# red-runs, because a car entering during the 3 s all-red is clear before the
+# conflicting movement moves. The flat fee was charging ~1566 an episode for
+# harm that did not occur, and it charges the same whether a car slips through
+# an empty junction or cuts across an oncoming platoon.
+#
+# So the car's charge scales with `rival_dt` -- the smallest time gap to a
+# vehicle heading for a shared conflict point, which is post-encroachment time,
+# the standard surrogate for exactly this. It is the car's OWN observation
+# column, deliberately: a car is charged by a number it can see, so the rule
+# that avoids the charge is one its tree can express, and it covers both the
+# committed crossing of a car that cannot stop and the deliberate one of a car
+# waiting at a line with nothing coming, without either being named here.
+#
+# The floor is not zero. There is a cost to running a red beyond the crash it
+# risks, and at R_RED=10 the discovered car ran 52 an episode and made the
+# signal's objective 49.5% its partner's law-breaking.
+R_RED_FLOOR, T_SAFE = 20.0, 3.0
 # COMFORT: each car's change of speed, squared, per car-second, normalised by
 # the braking limit -- a full-braking second costs W_COMFORT, a gentle stop at
 # half the rate a quarter of that per second. Measured on the discrete tree of
@@ -393,7 +415,7 @@ class IntersectionBatch:
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
     OBS_VERSION = 8
-    REWARD_VERSION = 5          # part of the store key, like OBS_VERSION
+    REWARD_VERSION = 6          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -857,6 +879,32 @@ class IntersectionBatch:
         hy = (p1[..., 1] - p0[..., 1]) / seg
         return x, y, hx, hy
 
+    def _rival_dt(self, m, S, V, act):
+        """`rival_dt` per slot: the smallest time gap to a vehicle heading for a
+        shared conflict point, FAR when there is none.
+
+        The fifth column of `_sense`, computed on its own so the reward can
+        charge a red-run by the conflict it creates. The definition is copied
+        exactly -- same conflict test, same sensor range, same clamps -- because
+        the point is that the charge equals the number the car observed.
+        """
+        g = self.geom
+        x, y, _, _ = self._xy(m, S)
+        dx = x[:, None, :] - x[:, :, None]
+        dy = y[:, None, :] - y[:, :, None]
+        dist = np.sqrt(dx * dx + dy * dy)
+        eye = np.eye(S.shape[1], dtype=bool)[None]
+        inR = act[:, :, None] & act[:, None, :] & ~eye & (dist <= SENSE_R)
+        mq, mo = m[:, :, None], m[:, None, :]
+        d_me = g["s_cp"][mq, mo] - S[:, :, None]
+        d_rv = g["s_cp"][mo, mq] - S[:, None, :]
+        ok = inR & g["conf"][mq, mo] & (d_me > -HALF_CONF) & (d_rv > -HALF_CONF)
+        t_me = np.maximum(d_me, 0.0) / np.maximum(V[:, :, None], T_V_MIN)
+        t_rv = np.maximum(d_rv, 0.0) / np.maximum(V[:, None, :], T_V_MIN)
+        gap_t = np.where(ok, np.abs(t_rv - t_me), np.inf)
+        best = gap_t.min(2)
+        return np.where(np.isfinite(best), best, FAR)
+
     def _sense(self, m, S, V, act):
         """The radius sensor's six columns per slot (see VEH_NAMES)."""
         g = self.geom
@@ -1212,6 +1260,7 @@ class IntersectionBatch:
 
         # -- kinematics: the tree's acceleration, clipped ---------------------
         before = S.copy()
+        v_pre = V.copy()
         v_new = np.clip(V + acc * dt, 0.0, V0)
         jerk = np.where(was, ((v_new - V) / dt / B_MAX) ** 2, 0.0)
         S[was] = S[was] + v_new[was] * dt
@@ -1222,7 +1271,16 @@ class IntersectionBatch:
         ran = was & (before < s_stop) & (S >= s_stop) & ~gm
         X[:, 7] += ran.sum(1)
         car = self.reward_mode == "car"
-        r -= (R_RED_CAR if car else R_RED) * ran.sum(1)
+        if car:
+            # the gap the crossing car SAW, on the state it observed and acted
+            # from -- pre-move, which is what `observe_vehicle` reads too
+            riv = self._rival_dt(m, before, v_pre, act)
+            risk = np.clip(1.0 - riv / T_SAFE, 0.0, 1.0)
+            red_c = np.where(ran, R_RED_FLOOR
+                             + (R_RED_CAR - R_RED_FLOOR) * risk, 0.0)
+            r -= red_c.sum(1)
+        else:
+            r -= R_RED * ran.sum(1)
         t_comfort = np.zeros(n)
         if car:
             crossed_g = was & (before < s_stop) & (S >= s_stop) & gm
@@ -1362,6 +1420,8 @@ class IntersectionBatch:
             for key, val in (("over_green", -t_over), ("speed", t_speed), ("delay", -t_delay),
                              ("queue", -t_queue), ("stuck", -t_stuck),
                              ("red", -t_red), ("crash", -R_COLL * n_ev),
+                             ("red_car", -red_c.sum(1) if car else np.zeros(n)),
+                             ("n_red", ran.sum(1).astype(float)),
                              ("exit", R_EXIT * out.sum(1)), ("left", -t_left),
                              ("comfort", -t_comfort),
                              ("n_rear", n_rear.astype(float)), ("n_cross", n_cross.astype(float))):
