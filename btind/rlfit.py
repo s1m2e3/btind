@@ -462,7 +462,9 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                 rec["moves"].append("steps")
                 cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
             bank, flog = search_fails(env, bank, zn, Zs, pol_fn, cur_G=cur,
-                                      n_ep=cfg["n_ep"], T=cfg["T"], seed=rseed,
+                                      n_ep=cfg["n_ep"],
+                                      screen_ep=cfg.get("screen_ep"),
+                                      T=cfg["T"], seed=rseed,
                                       z=cfg["z"], min_gain=cfg["min_gain"],
                                       rng=rng, weights=weights, verbose=verbose)
             if any(f["accepted"] for f in flog):

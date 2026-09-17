@@ -133,6 +133,28 @@ LOG_STEPS = False
 _steps = [0]
 
 
+def dedupe_screened(rows, score_of=None):
+    """Drop candidates whose screen score is bit-identical to one already kept.
+
+    Two candidates that score EXACTLY the same mean over the SAME episodes are
+    the same controller. `scalar_primitives` puts a term on every column, so on
+    any column the arm never reads every coefficient gives the identical
+    rollout, and the top of the screen fills up with copies. Measured on a real
+    round: growing confirmed 20 candidates that were 6 distinct ones, and the
+    step search's top eight were four. Exact float equality over a 20-episode
+    mean does not happen by chance, so this is safe as an identity test.
+    """
+    score_of = score_of or (lambda r: r[0])
+    seen, out = set(), []
+    for r in rows:
+        v = float(score_of(r))
+        if v in seen:
+            continue
+        seen.add(v)
+        out.append(r)
+    return out
+
+
 class ticker:
     """A heartbeat for a SCREENING loop.
 
@@ -494,7 +516,8 @@ def collapse_bottom(env, bank, pol_fn, cur_G=None, n_ep=600, T=400, seed=777,
 
 def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,
                       seed=777, z=2.0, min_gain=0.1, steps=(0.04, 0.1, 0.25, 0.6, 1.2),
-                      max_sweeps=4, names=None, verbose=True, max_cover=0.98):
+                      max_sweeps=4, names=None, verbose=True, max_cover=0.98,
+                      min_cover=0.02):
     """Coordinate-wise line search on every threshold, decided by rollout.
 
     A threshold arrives wherever the random draw that proposed it happened to
@@ -514,6 +537,7 @@ def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,
     something already bought, not the purchase of a new arm, so a tenth of a
     return unit is worth keeping.
     """
+    from .landscape import _match_cols
     iqr = {j: float(np.subtract(*np.percentile(Z[:, j], [75, 25])) or 1.0)
            for j in range(Z.shape[1])}
     cur = (score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G)
@@ -523,6 +547,7 @@ def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,
         for c in range(len(bank["clauses"])):
             for k in range(len(bank["clauses"][c])):
                 j, thr, neg = bank["clauses"][c][k]
+                base_m = _match_cols(bank["clauses"][c], Z)
                 best, best_d = None, min_gain
                 for mult in steps:
                     for sgn in (-1.0, 1.0):
@@ -536,7 +561,26 @@ def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,
                         # the arm's law simply replaced the default's. But it
                         # silently made the default and every arm below it
                         # unreachable, and the memory search appends there.
-                        if coverage(cl[c], Z) > max_cover:
+                        # A THRESHOLD MAY NOT SLIDE PAST THE OTHER END
+                        # EITHER. `ph3` is a phase one-hot: its middle half is
+                        # a single value, so its IQR is 0, the fallback scale
+                        # is 1.0 -- the column's whole range -- and a step of
+                        # 1.2 took `ph3 > 0.0` to `ph3 > 1.2`, which matches
+                        # NOTHING. Coverage 0 passed the upper bound, the arm
+                        # went dead, and the rollout scored that as +274.34
+                        # because deleting the arm helped. `drop_arm` then
+                        # accepted at +0.00, confirming there was nothing left.
+                        # The search bought an arm and unbought it in one round.
+                        m = _match_cols(cl[c], Z)
+                        cv = float(m.mean())
+                        if cv > max_cover or cv < min_cover:
+                            continue
+                        # SAME PARTITION, SAME CONTROLLER. A binary column has
+                        # one meaningful cut, so every step inside (0, 1) gives
+                        # the identical arm and a paired test of a controller
+                        # against itself: 31 of round 4's 58 threshold
+                        # confirmations came back +0.00 +- 0.00.
+                        if np.array_equal(m, base_m):
                             continue
                         cand = dict(bank, clauses=cl)
                         ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed,

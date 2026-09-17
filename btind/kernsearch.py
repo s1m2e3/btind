@@ -76,7 +76,7 @@ import numpy as np
 from . import explore as EX
 from . import kernlaw as KL
 from .collect import design_matrix
-from .structure import accept, score, ticker
+from .structure import accept, dedupe_screened, score, ticker
 from .tick import n_steps_of
 
 
@@ -289,6 +289,7 @@ def add_points(env, bank, c, k, cands, kern, pol_fn, cur, cfg, verbose=False,
             tick(d_scr)
             rows.append((d_scr, j))
         rows.sort(key=lambda r: -r[0])
+        rows = dedupe_screened(rows)
         best = None
         for d_screen, j in rows[:cfg["n_confirm"]]:
             kb, x, y, _, src = cands[j]

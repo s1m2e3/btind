@@ -53,7 +53,7 @@ import numpy as np
 from .collect import design_matrix
 from .evotm import Alphabet, _match, _rand_literal, dedupe_literals
 from .lawsearch import library, structural_primitives
-from .structure import accept, score, ticker
+from .structure import accept, dedupe_screened, score, ticker
 from .valuesplit import fit_value_law
 
 
@@ -422,7 +422,9 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
             rows = sorted(tuned + rows, key=lambda r: -r[0])
 
         best, best_d, desc = None, min_gain, None
-        for d, cl, th, lname, nrow in rows[:n_confirm]:
+        # SPEND THE CONFIRM BUDGET ON DISTINCT CANDIDATES. Unfiltered, a real
+        # round confirmed 20 laws that were 6 different controllers.
+        for d, cl, th, lname, nrow in dedupe_screened(rows)[:n_confirm]:
             for pos in positions:
                 cand = _insert(bank, cl, th, pos)
                 ok, dl, _ = accept(env, cand, pol_fn, cur_full, confirm_ep, T,

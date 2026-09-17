@@ -44,7 +44,7 @@ import numpy as np
 from .betasearch import beta_candidates, churn
 from .lawsearch import discrete_primitives, structural_primitives
 from .memory import check_arms
-from .structure import accept, score, ticker
+from .structure import accept, dedupe_screened, score, ticker
 from .tick import law_of, n_steps_of
 
 
@@ -158,6 +158,7 @@ def search_steps(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_adv=16,
                 tick(dlt)
                 rows.append((dlt, adv, alab, lname, th))
         rows.sort(key=lambda r: -r[0])
+        rows = dedupe_screened(rows)
         for dlt, adv, alab, lname, th in rows[n_confirm:]:
             log.append(dict(kind="step", arm=c, clause=adv, adv=alab, law=lname,
                             screen=dlt, stage="screen", accepted=False))
@@ -181,8 +182,8 @@ def search_steps(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_adv=16,
 
 
 def search_fails(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_try=24,
-                 n_ep=600, T=400, seed=777, z=2.0, min_gain=0.3, rng=None,
-                 weights=None, verbose=True):
+                 n_ep=600, screen_ep=None, n_confirm=6, T=400, seed=777, z=2.0,
+                 min_gain=0.3, rng=None, weights=None, verbose=True):
     """Give one latched arm the fail clause that wins its rollout.
 
     Only sticky arms are offered one: a fail clause acts on a RUNNING arm, and a
@@ -206,6 +207,24 @@ def search_fails(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_try=24,
         own = {l[0] for l in bank["clauses"][c]}
         cands = _pick(beta_candidates(Z, zn, bank["clauses"][c]), own, n_try,
                       rng, weights)
+        # SCREEN THEN CONFIRM, like every other stage. This was the one search
+        # that priced its whole pool at the full episode count: measured over
+        # five rounds it ran 236 confirmations and accepted none of them, every
+        # delta between -300 and -500. Screening first costs a fifth as much
+        # per candidate and still puts the survivors through the same test.
+        sep = int(screen_ep or n_ep)
+        if sep < n_ep and len(cands) > n_confirm:
+            cheap = score(env, bank, pol_fn, sep, T, seed)
+            ftick = ticker("fails arm %d" % c, len(cands), verbose)
+            scr = []
+            for cl, label in cands:
+                g = score(env, with_fail(bank, c, cl), pol_fn, sep, T, seed)
+                dlt = float((g - cheap).mean())
+                ftick(dlt)
+                scr.append((dlt, cl, label))
+            scr.sort(key=lambda r: -r[0])
+            cands = [(cl, label) for _, cl, label in
+                     dedupe_screened(scr)[:n_confirm]]
         best, best_d = None, min_gain
         for cl, label in cands:
             cand = with_fail(bank, c, cl)
