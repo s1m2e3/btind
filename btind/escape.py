@@ -50,12 +50,18 @@ def _swap(bank, rng):
     return reindex(bank, order), "swap arms %d,%d" % (c, c + 1)
 
 
-def _relax(bank, rng, Z, frac=0.35):
+def _relax(bank, rng, Z, frac=(0.2, 0.8)):
     """Widen one guard sharply, handing its arm a region it was not fitted for.
 
     Not a jitter: the step is a large fraction of the column's spread and in the
     loosening direction only, so the arm claims states the arms below currently
     own. The refit that follows is what decides whether that was worth doing.
+
+    THE SIZE IS DRAWN, not fixed. On a one-arm tree `_drop` and `_swap` are both
+    unavailable, so this is the only kick there is, and at a fixed 0.35 every
+    hop proposed the IDENTICAL bank -- measured, five kicks of the live run's
+    tree all returned `relax arm 0 lit 0` at G -9047.3. A drawn fraction is what
+    makes a second hop a different question from the first.
     """
     n = len(bank["clauses"])
     if not n:
@@ -66,9 +72,11 @@ def _relax(bank, rng, Z, frac=0.35):
     if j >= Z.shape[1]:
         return None, ""
     span = float(np.subtract(*np.percentile(Z[:, j], [75, 25])) or 1.0)
+    f = (float(rng.uniform(*frac)) if isinstance(frac, (tuple, list))
+         else float(frac))
     cl = [[l[:] for l in x] for x in bank["clauses"]]
-    cl[c][k][1] = float(thr + (frac * span if neg else -frac * span))
-    return dict(bank, clauses=cl), "relax arm %d lit %d" % (c, k)
+    cl[c][k][1] = float(thr + (f * span if neg else -f * span))
+    return dict(bank, clauses=cl), "relax arm %d lit %d by %.2f" % (c, k, f)
 
 
 KICKS = (_drop, _swap, _relax)
@@ -95,8 +103,12 @@ def kick(bank, Z, rng, n=1):
     """One deliberate non-improving move, applied without a test."""
     out, why = bank, []
     for _ in range(n):
+        # ONLY MOVES THAT CAN ACTUALLY APPLY. `_swap` needs two arms and
+        # returns the bank untouched below that, so on a one-arm tree two of
+        # the three picks were no-ops that still spent a hop from the budget.
         pool = [f for f in KICKS
-                if f is not _drop or len(out["clauses"]) >= MIN_ARMS_TO_DROP]
+                if (f is not _drop or len(out["clauses"]) >= MIN_ARMS_TO_DROP)
+                and (f is not _swap or len(out["clauses"]) >= 2)]
         f = pool[int(rng.integers(len(pool)))]
         b, lab = (f(out, rng, Z) if f is _relax else f(out, rng))
         if b is not None:

@@ -60,6 +60,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import btind.structure as ST
 from btind.envs.intersection import WIDE, IntersectionBatch, T_MAX
+from btind.escape import kick
+from btind.memory import MemBank
 from btind.rlfit import fit
 from btind.memory import emit
 from btind.runlog import RUNS, bank_from_json, bank_json
@@ -84,6 +86,9 @@ N_GROUPS = 5
 # skewed demand was silently dropping cars in 9% of episodes, and 384 leaves
 # none. Costs 7.3x an episode, paid for by fewer episodes and a cheaper screen.
 T_END, N_MAX_EP = 384.0, 384
+# two dry rounds is the signal that the monotone moves are exhausted; a hop
+# then gets two rounds to be re-optimised before it is priced and kept or not
+STALL_BEFORE_KICK, KICK_SIZE, HOP_BUDGET = 2, 1, 2
 
 
 def world(agent, cond=SPAN, groups=N_GROUPS):
@@ -137,7 +142,8 @@ def load_state():
             raise SystemExit("%s was written under a different configuration; move "
                              "it aside to start fresh" % STATE)
         return st
-    return dict(round=0, sig=None, history=[], config=config_key())
+    return dict(round=0, sig=None, history=[], config=config_key(),
+                stalled=0, hop_left=0, pre_hop=None)
 
 
 def save_state(st):
@@ -314,6 +320,26 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
         s_t = tgt.sample_starts(n_guard, np.random.default_rng(4242 + r))
         sb = bank_from_json(st["sig"]) if st["sig"] else None
 
+        # BASIN-HOP WHEN THE MONOTONE SEARCH RUNS DRY. Every operator here
+        # accepts only improvements, so a tree with no accepted move left is
+        # finished and running more rounds finds nothing -- which is what
+        # rounds 2 and 5 were. `escape.kick` is this project's answer and it
+        # has never fired: `fit` owns the stall counter, e38 calls it with
+        # rounds=1, so `stalled` was reset to 0 before every single check.
+        # The counter belongs out here, where the rounds actually are.
+        kicked = None
+        if sb is not None and st.get("stalled", 0) >= STALL_BEFORE_KICK:
+            cov, _ = env.coverage_rows(sb, n_ep=60, seed=r)
+            p = MemBank(sb, len(env.names))
+            p.reset(len(cov))
+            st["pre_hop"] = bank_json(sb, env.sig_names)
+            sb, kicked = kick(sb, p.z(cov, update=False),
+                              np.random.default_rng(9000 + r), n=KICK_SIZE)
+            st["hop_left"], st["stalled"] = HOP_BUDGET, 0
+            print("   stalled %d rounds -- kick: %s  (re-optimising for %d "
+                  "rounds, reverted if it does not pay)"
+                  % (STALL_BEFORE_KICK, kicked, HOP_BUDGET), flush=True)
+
         # the kernel stage kept 0 of 16 confirmed points in e37 and e38 while
         # costing a fifth of the round, so it runs periodically, not every round
         # STAGGER THE EXPENSIVE OPTIONAL STAGES so a round pays for at most one.
@@ -332,12 +358,27 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
         mv = log[-1]["moves"] if log else []
         print("   moves: %s" % (", ".join(mv) or "none"), flush=True)
         cred = {}
-        if mv and sb is not None:
+        # A HOP IS WORSE BY CONSTRUCTION, so the per-round guard is suspended
+        # while one is being re-optimised; the whole hop is priced at its end
+        # against the tree it started from, which is the outer guarantee
+        # basin-hopping actually needs.
+        if mv and sb is not None and not st.get("hop_left"):
             keep, _, d, se = credit(tgt, s_t, vb, new_sb, sb)
             cred = dict(d=d, se=se, kept=keep)
             if not keep:
                 new_sb, mv = sb, []
         sb = new_sb
+        if st.get("hop_left"):
+            st["hop_left"] -= 1
+            if not st["hop_left"] and st.get("pre_hop"):
+                base = bank_from_json(st["pre_hop"])
+                keep, _, d, se = credit(tgt, s_t, vb, sb, base)
+                cred = dict(d=d, se=se, kept=keep, hop=True)
+                print("   hop over: %+.1f +-%.1f against the pre-kick tree -- %s"
+                      % (d, se, "kept" if keep else "reverted"), flush=True)
+                if not keep:
+                    sb, mv = base, []
+                st["pre_hop"] = None
         st["sig"] = bank_json(sb, env.sig_names)
         if verbose:
             print("\nsignal tree, round %d (team %.2f)\n%s"
@@ -345,7 +386,9 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
         save_state(st)
 
         rows = evaluate(vb, sb)
-        st["history"].append(dict(round=r, eval=rows, moves=mv, credit=cred))
+        st["stalled"] = 0 if mv else st.get("stalled", 0) + 1
+        st["history"].append(dict(round=r, eval=rows, moves=mv, credit=cred,
+                                  kick=kicked, stalled=st["stalled"]))
         revert = update_best(st, rows, r)
         b = st["best"]
         print("   best signal so far: round %d, train %.1f +-%.1f%s"
