@@ -75,7 +75,17 @@ VEHICLE = os.path.join(RUNS, "e37_final", "e37_best.json")
 
 # Load and skew drawn separately: `approach_vph` is now the junction's base
 # flow, one draw an episode, and each approach multiplies it by its own factor.
-SPAN = dict(WIDE, approach_vph=(300.0, 600.0), approach_skew=(0.25, 1.75))
+# TRAIN ON THE BAND YOU REPORT. The span was 300-600 while the evaluation
+# also reported 600-800, so heavy demand was measured and never trained on --
+# and nothing protected it. `credit` prices a round on held-out episodes of the
+# TRAINING distribution, the per-demand-group veto splits that same
+# distribution, and `update_best` reads one band. Measured: the basin hop took
+# the train band from -130.4 to -99.0 against the fixed plan and the heavy band
+# from +99.5 to -321.5 in the same move, and was recorded as the best tree ever
+# found. It was selecting on one distribution and reporting on two.
+SPAN = dict(WIDE, approach_vph=(300.0, 800.0), approach_skew=(0.25, 1.75))
+# The band `update_best` and `credit` are scored on: the training span itself.
+MAIN_BAND = "train 300-800"
 N_GROUPS = 5
 
 # AN EPISODE MUST HOLD TWO FULL CYCLES. At T_MAX=45 plus 3 s all-red a cycle of
@@ -85,7 +95,7 @@ N_GROUPS = 5
 # truncates arrivals), so it has to grow with the episode: at 112 slots the
 # skewed demand was silently dropping cars in 9% of episodes, and 384 leaves
 # none. Costs 7.3x an episode, paid for by fewer episodes and a cheaper screen.
-T_END, N_MAX_EP = 384.0, 384
+T_END, N_MAX_EP = 384.0, 704
 # two dry rounds is the signal that the monotone moves are exhausted; a hop
 # then gets two rounds to be re-optimised before it is priced and kept or not
 STALL_BEFORE_KICK, KICK_SIZE, HOP_BUDGET = 2, 1, 2
@@ -189,9 +199,14 @@ def evaluate(vb, sb, n_ep=600, seed=999):
     tgt = world("signal")
     act = actuated(tgt)
     hand = tgt.default_vehicle_bank()
-    sets = {"train 300-600": tgt.sample_starts(n_ep, np.random.default_rng(seed)),
-            "heavy 600-800": world("signal", cond=dict(SPAN, approach_vph=(600.0, 800.0)))
-            .sample_starts(n_ep, np.random.default_rng(seed))}
+    # THE TRAINING BAND FIRST, then its two tails reported separately, because
+    # an average over the span can hide a regression at one end of it -- which
+    # is exactly what went unseen while heavy demand sat outside the span.
+    band = lambda a, b: (world("signal", cond=dict(SPAN, approach_vph=(a, b)))
+                         .sample_starts(n_ep, np.random.default_rng(seed)))
+    sets = {MAIN_BAND: tgt.sample_starts(n_ep, np.random.default_rng(seed)),
+            "light 300-500": band(300.0, 500.0),
+            "heavy 600-800": band(600.0, 800.0)}
     rows = {}
     for name, s in sets.items():
         R = lambda v, g: IF.run(tgt, v, g, s, tgt.duration, reward="team")
@@ -251,7 +266,7 @@ def load_best():
 
 
 def update_best(st, rows, r):
-    cur, se = rows["train 300-600"]["discovered"], rows["train 300-600"]["se"]
+    cur, se = rows[MAIN_BAND]["discovered"], rows[MAIN_BAND]["se"]
     best = st.get("best")
     if best is None or cur > best["train"]:
         st["best"] = dict(round=r, train=cur, se=se, sig=st["sig"],

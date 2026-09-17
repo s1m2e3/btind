@@ -58,7 +58,7 @@ def test_the_config_key_reports_the_prior_actually_in_use():
 
 def test_update_best_stamps_the_configuration(best_file, monkeypatch):
     st = dict(sig={"clauses": []}, best=None)
-    rows = {"train 300-600": {"discovered": -8700.0, "se": 68.0}}
+    rows = {E.MAIN_BAND: {"discovered": -8700.0, "se": 68.0}}
     E.update_best(st, rows, 4)
     assert st["best"]["config"] == E.config_key()
     assert E.load_best()["round"] == 4
