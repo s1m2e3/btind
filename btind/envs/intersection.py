@@ -292,7 +292,7 @@ SIG_EMPTY = -1.0
 # appended blocks are the new information.
 Q_OFF, N_OFF, V_OFF, D_OFF, PH_OFF = 0, N_PHASES, 2 * N_PHASES, 3 * N_PHASES, 4 * N_PHASES
 MISC_OFF = 5 * N_PHASES
-QS_OFF, VA_OFF, NN_OFF = 5 * N_PHASES + 4, 7 * N_PHASES + 4, 8 * N_PHASES + 4
+QS_OFF, VA_OFF, NN_OFF = 5 * N_PHASES + 4, 7 * N_PHASES + 4, 9 * N_PHASES + 4
 SIG_NAMES = (["q%d" % k for k in range(N_PHASES)]
              + ["n%d" % k for k in range(N_PHASES)]
              + ["v%d" % k for k in range(N_PHASES)]
@@ -306,19 +306,21 @@ SIG_NAMES = (["q%d" % k for k in range(N_PHASES)]
              #          the total: summed, 22 is ambiguous between 11+11 (clears
              #          in ~11) and 20+2 (needs ~20), and `approach_skew` draws
              #          0.25-1.75 per approach so that gap is common.
-             # va<a>   the mean speed of every vehicle on APPROACH a within
-             #          QUEUE_D, whatever phase serves it, SIG_EMPTY when the
-             #          approach is empty. This replaces a per-(phase, side)
-             #          mean over QUEUED cars, which was measured to carry
-             #          almost nothing: 46% of ticks were the empty sentinel and
-             #          the rest averaged 0.04 m/s against a 1.8 m/s ceiling,
-             #          because a car only counts as queued below QUEUE_V=2. It
-             #          said "is there a queue", which q<k>a/b already says.
+             # va<k>a/b the mean speed of every vehicle within QUEUE_D that phase
+             #          k serves on that approach -- moving or stopped, SIG_EMPTY
+             #          when none. SAME GRANULARITY AS THE QUEUE, so through and
+             #          left are separable on one approach: (k=0, a) is approach
+             #          a's through+right and (k=1, a) its left.
+             #          It replaces a mean over QUEUED cars, measured to carry
+             #          almost nothing -- 46% of ticks the empty sentinel and the
+             #          rest averaging 0.04 m/s against a 1.8 ceiling, because a
+             #          car only counts as queued below QUEUE_V=2. That said "is
+             #          there a queue", which q<k>a/b already says.
              # nn<k>    approaching within NEAR_D rather than QUEUE_D: a second,
              #          closer horizon, so how far back to look becomes a column
              #          the search picks instead of a constant chosen here.
              + ["q%d%s" % (k, sd) for k in range(N_PHASES) for sd in "ab"]
-             + ["va%d" % a for a in range(N_PHASES)]
+             + ["va%d%s" % (k, sd) for k in range(N_PHASES) for sd in "ab"]
              + ["nn%d" % k for k in range(N_PHASES)])
 
 
@@ -390,7 +392,7 @@ class IntersectionBatch:
     # observation are never resumed on this one -- a checkpoint that learned
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
-    OBS_VERSION = 7
+    OBS_VERSION = 8
     REWARD_VERSION = 5          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
@@ -994,17 +996,12 @@ class IntersectionBatch:
             o[:, V_OFF + k] = np.where(cnt > 0, vsum / np.maximum(cnt, 1), SIG_EMPTY)
             o[:, D_OFF + k] = np.where(in_k, d_stop, FAR).min(1)
             o[:, NN_OFF + k] = (in_k & (d_stop < NEAR_D)).sum(1)
-            qk = queued & g["green"][k][m]
             for side, a in enumerate(self.phase_appr[k]):
-                o[:, QS_OFF + 2 * k + side] = (qk & (ap_m == a)).sum(1)
-        # per APPROACH, over every vehicle on it, whatever phase serves it
-        near = act & (d_stop > 0.0) & (d_stop < QUEUE_D)
-        for a in range(N_PHASES):
-            on_a = near & (ap_m == a)
-            c = on_a.sum(1)
-            o[:, VA_OFF + a] = np.where(c > 0,
-                                        np.where(on_a, V, 0.0).sum(1) / np.maximum(c, 1),
-                                        SIG_EMPTY)
+                on = in_k & (ap_m == a)
+                o[:, QS_OFF + 2 * k + side] = (on & (V < QUEUE_V)).sum(1)
+                c = on.sum(1)
+                o[:, VA_OFF + 2 * k + side] = np.where(
+                    c > 0, np.where(on, V, 0.0).sum(1) / np.maximum(c, 1), SIG_EMPTY)
         o[np.arange(n), PH_OFF + X[:, 0].astype(int)] = 1.0
         b = MISC_OFF
         o[:, b] = X[:, 1]
