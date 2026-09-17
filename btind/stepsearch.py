@@ -44,7 +44,7 @@ import numpy as np
 from .betasearch import beta_candidates, churn
 from .lawsearch import discrete_primitives, structural_primitives
 from .memory import check_arms
-from .structure import accept, score
+from .structure import accept, score, ticker
 from .tick import law_of, n_steps_of
 
 
@@ -148,12 +148,15 @@ def search_steps(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_adv=16,
                      rng, weights)
         laws = _law_pool(bank, zn, c, rng, n_sample=n_law_sample)
         cheap = score(env, bank, pol_fn, screen_ep, T, seed)
+        tick = ticker("steps arm %d" % c, len(advs) * len(laws), verbose)
         rows = []
         for adv, alab in advs:
             for lname, th in laws:
                 g = score(env, with_step(bank, c, adv, th), pol_fn, screen_ep,
                           T, seed)
-                rows.append((float((g - cheap).mean()), adv, alab, lname, th))
+                dlt = float((g - cheap).mean())
+                tick(dlt)
+                rows.append((dlt, adv, alab, lname, th))
         rows.sort(key=lambda r: -r[0])
         for dlt, adv, alab, lname, th in rows[n_confirm:]:
             log.append(dict(kind="step", arm=c, clause=adv, adv=alab, law=lname,

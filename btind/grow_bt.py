@@ -53,7 +53,7 @@ import numpy as np
 from .collect import design_matrix
 from .evotm import Alphabet, _match, _rand_literal, dedupe_literals
 from .lawsearch import library, structural_primitives
-from .structure import accept, score
+from .structure import accept, score, ticker
 from .valuesplit import fit_value_law
 
 
@@ -305,7 +305,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
          use_library=False, cem_region=True, cem_top=10, cem_iter=3,
          cem_K=24, cem_sigma=0.4, cols=None, structural=True, weights=None,
          prefix=None, parent_law=None, where=None, law_sample=60,
-         n_perturb=8):
+         n_perturb=8, progress=None, label="grow"):
     """Add arms while a rollout says they pay by more than `min_gain`.
 
     REGION HOOKS, for growing INSIDE an existing child (`subtree.py`):
@@ -358,12 +358,16 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                                  (0, list(range(len(bank["clauses"]) + 1))))
 
         rows = []
+        tick = ticker("%s arm %d" % (label, k), len(cands),
+                      verbose if progress is None else progress)
         for cl in cands:
             m = _match(cl, Z) & ~claimed
             region = np.flatnonzero(m)
             if len(region) < min_n:
+                tick()
                 continue
             parent = bank["default"] if parent_law is None else parent_law
+            here = None
             for lname, th in _laws_for(bank, region, names, zn, obs, Z, labels,
                                        qhat, w, lib, parent, rng=rng,
                                        structural=structural,
@@ -371,8 +375,10 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                                        n_perturb=n_perturb):
                 g = score(env, _insert(bank, cl, th, screen_pos), pol_fn,
                           screen_ep, T, seed)
-                rows.append((float((g - cur_cheap).mean()), cl, th, lname,
-                             len(region)))
+                d_scr = float((g - cur_cheap).mean())
+                here = d_scr if here is None or d_scr > here else here
+                rows.append((d_scr, cl, th, lname, len(region)))
+            tick(here)
         if not rows:
             if verbose:
                 print("    arm %d: no candidate region held %d rows -- stopping"
@@ -401,6 +407,8 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
         if cem_region:
             from .lawcem import cem_law
             tuned = []
+            ctick = ticker("%s arm %d cem" % (label, k), len(rows[:cem_top]),
+                           verbose if progress is None else progress)
             for d, cl, th, lname, nrow in rows[:cem_top]:
                 probe = _insert(bank, cl, th, screen_pos)
                 th2, _ = cem_law(env, probe, screen_pos, pol_fn, n_iter=cem_iter,
@@ -408,8 +416,9 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                                  T=T, seed=seed, rng=rng)
                 g = score(env, _insert(bank, cl, th2, screen_pos), pol_fn,
                           screen_ep, T, seed)
-                tuned.append((float((g - cur_cheap).mean()), cl, th2,
-                              lname + "+cem", nrow))
+                d_cem = float((g - cur_cheap).mean())
+                ctick(d_cem)
+                tuned.append((d_cem, cl, th2, lname + "+cem", nrow))
             rows = sorted(tuned + rows, key=lambda r: -r[0])
 
         best, best_d, desc = None, min_gain, None

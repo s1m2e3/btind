@@ -20,6 +20,7 @@ Three operators, one acceptance rule, and one asymmetry that matters:
             rollout and, at z = 2, occasionally be "accepted" by noise.
 """
 import sys
+import time
 from collections import OrderedDict
 
 import numpy as np
@@ -130,6 +131,44 @@ STARTS_CAP = 256 * 1024 ** 2            # bytes of start states kept per world
 # it on with `structure.LOG_STEPS = True`.
 LOG_STEPS = False
 _steps = [0]
+
+
+class ticker:
+    """A heartbeat for a SCREENING loop.
+
+    A screen calls `score`, not `accept`, so `LOG_STEPS` never sees it: a stage
+    that screens hundreds of candidates prints nothing between the line that
+    announces it and the line that reports its answer. `search_steps` screened
+    800 of them in silence, which is indistinguishable from a hang, and that --
+    not the cost -- is what a run looked like it was stuck in.
+
+    Call the instance once per screened candidate, with the candidate's delta if
+    there is one. It prints at most one line every `period` seconds, plus one
+    when the loop ends, so the output stays readable however long the loop is.
+    """
+    __slots__ = ("label", "total", "verbose", "period", "n", "best", "t0", "last")
+
+    def __init__(self, label, total, verbose=True, period=15.0):
+        self.label, self.total = str(label), int(total)
+        self.verbose, self.period = bool(verbose), float(period)
+        self.n, self.best = 0, None
+        self.t0 = self.last = time.time()
+
+    def __call__(self, delta=None):
+        self.n += 1
+        if delta is not None and (self.best is None or delta > self.best):
+            self.best = float(delta)
+        now = time.time()
+        done = self.n >= self.total
+        if not self.verbose or (now - self.last < self.period and not done):
+            return
+        self.last = now
+        el = now - self.t0
+        print("      %-20s screened %5d/%-5d  best %s  %4.0fs%s"
+              % (self.label, self.n, self.total,
+                 "   --   " if self.best is None else "%+8.2f" % self.best,
+                 el, "" if done else "  ~%.0fs left"
+                 % (el * (self.total - self.n) / max(self.n, 1))), flush=True)
 
 
 def _make_starts(env, n_ep, seed):

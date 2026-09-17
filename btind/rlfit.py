@@ -483,7 +483,8 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             bank, tlog = search_subtrees(
                 env, bank, names, zn, pol_fn, obs, Zt, verbose=verbose,
                 max_arms=cfg["subtree_arms"], pool=cfg["subtree_pool"],
-                min_gain=cfg["min_gain"], screen_ep=min(cfg["n_ep"], 120),
+                min_gain=cfg["min_gain"],
+                screen_ep=cfg.get("screen_ep") or min(cfg["n_ep"], 120),
                 confirm_ep=cfg["n_ep"], T=cfg["T"], seed=rseed, z=cfg["z"],
                 rng=rng, weights=weights, cem_iter=max(2, cfg["cem_iter"] // 3),
                 cem_K=max(12, cfg["cem_K"] // 4))

@@ -76,7 +76,7 @@ import numpy as np
 from . import explore as EX
 from . import kernlaw as KL
 from .collect import design_matrix
-from .structure import accept, score
+from .structure import accept, score, ticker
 from .tick import n_steps_of
 
 
@@ -281,10 +281,13 @@ def add_points(env, bank, c, k, cands, kern, pol_fn, cur, cfg, verbose=False,
             break
         cur_cheap = score(env, bank, pol_fn, cfg["screen_ep"], cfg["T"], cfg["seed"])
         rows = []
+        tick = ticker("kernel (%d,%d) points" % (c, k), len(cands), verbose)
         for j, (kb, x, y, adv, src) in enumerate(cands):
             b = KL.with_kern(bank, c, k, _add(kb, x, y))
             g = score(env, b, pol_fn, cfg["screen_ep"], cfg["T"], cfg["seed"])
-            rows.append(((g - cur_cheap).mean(), j))
+            d_scr = float((g - cur_cheap).mean())
+            tick(d_scr)
+            rows.append((d_scr, j))
         rows.sort(key=lambda r: -r[0])
         best = None
         for d_screen, j in rows[:cfg["n_confirm"]]:
@@ -532,13 +535,17 @@ def joint_sets(env, bank, joint, pol_fn, cur, cfg, verbose=False, top=2):
     laws = sorted(joint)[:3]
     per_law = [sorted(joint[L], key=lambda t: -t[3])[:top] for L in laws]
     cur_cheap = score(env, bank, pol_fn, cfg["screen_ep"], cfg["T"], cfg["seed"])
+    combos = list(product(*per_law))
     rows = []
-    for combo in product(*per_law):
+    tick = ticker("kernel joint sets", len(combos), verbose)
+    for combo in combos:
         b = bank
         for (c, k), (kb, X, Y, adv, src) in zip(laws, combo):
             b = KL.with_kern(b, c, k, _add(kb, X, Y))
         g = score(env, b, pol_fn, cfg["screen_ep"], cfg["T"], cfg["seed"])
-        rows.append((float((g - cur_cheap).mean()), b, combo))
+        d_scr = float((g - cur_cheap).mean())
+        tick(d_scr)
+        rows.append((d_scr, b, combo))
     rows.sort(key=lambda r: -r[0])
     log = []
     for d_screen, b, combo in rows[:cfg["n_confirm"] // 2 or 1]:
