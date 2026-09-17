@@ -29,6 +29,7 @@ import numpy as np
 from . import explore as EX
 from . import proposal as PR
 from . import store as ST
+from . import valuesplit as VS
 from .betasearch import search_beta
 from .grow_bt import failure_states, grow
 from .lawcem import cem_law, improve_laws
@@ -48,6 +49,8 @@ DEFAULTS = dict(
     explore_ep=300, explore_ks=(1, 3, 8), explore_frac=0.25,
     # kernel-interpolation leaves (`kernsearch.py`): rounds, and its settings
     kern_at=(), kern_cfg=None, critic=False, prior=None,
+    # a local Q sample per round, and laws fitted by value against it
+    value_laws=False, value_ep=300, value_min_rows=20, prior_k=None,
     stall_before_kick=2, kick_size=1, hop_budget=2,
     seed_stride=1009, val_seed=90210, val_ep=1200,
 )
@@ -137,6 +140,8 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             seed_bank["u_range"] = tuple(env.u_range)
         if cfg.get("prior"):
             seed_bank["prior"] = cfg["prior"]
+            if cfg.get("prior_k"):
+                seed_bank["prior_k"] = cfg["prior_k"]
         th, _ = cem_law(env, seed_bank, -1, pol_fn, n_iter=cfg["cem_iter"],
                         K=cfg["cem_K"], sigma0=cfg["cem_sigma"],
                         n_ep=cfg["n_ep"], T=cfg["T"], seed=cfg["seed"], rng=rng)
@@ -226,7 +231,49 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         ex_obs = (ex["z0"][EX.hot_rows(ex, frac=cfg["explore_frac"]), :n_obs]
                   if ex is not None else np.zeros((0, n_obs)))
         anchors = [a for a in (fail, ex_obs) if len(a)]
+        # THE LAW'S OWN EVIDENCE. Every law in the tree so far comes from a
+        # fixed vocabulary of constants and single-column terms, plus random
+        # perturbations -- on the intersection the round header says so
+        # outright, "law sources: structural parent-perturbations". The two
+        # sources that would fit a law to what the ACTION is worth are both
+        # dark: `fitted` wants labels nobody supplies, and `grad` wants an
+        # advantage critic that sits at rank 0.05 and is correctly gated off.
+        #
+        # A local Q sample supplies the labels without a planner: try every
+        # action at one on-policy tick, roll the incumbent tree on from each,
+        # and fit a quadratic through the returns. That gives the peak and the
+        # curvature around it per state. Measured on the live run's tree, the
+        # five green levels spread return by 1300 on average at a SINGLE
+        # decision, and the fitted peak sits 13.1 s away from the constant
+        # 25.1 s the tree emits -- a state-dependent target whose mean is
+        # exactly the constant the search settled on.
+        labels, lq = None, None
+        if cfg.get("value_laws"):
+            lq = EX.local_q(env, bank, n_ep=cfg["value_ep"], T=cfg["T"],
+                            seed=rseed, rng=rng)
+        if lq is not None and len(lq["z0"]):
+            u_lo, u_hi = bank.get("u_range",
+                                  getattr(env, "u_range", (-1.0, 1.0)))
+            nu = lq["a0"].shape[2]
+            U_lq, M_lq = VS.local_optimum(lq["a0"], lq["G"],
+                                          np.full(nu, float(u_lo)),
+                                          np.full(nu, float(u_hi)))
+            anchors.append(lq["z0"][:, :n_obs])
         obs = np.vstack([cov] + anchors) if anchors else cov
+        if lq is not None and len(lq["z0"]):
+            # ROWS WITHOUT A SAMPLE GET ZERO CURVATURE, which is precisely
+            # "this row says nothing about the action": it contributes nothing
+            # to A or b, so the fit uses the labelled rows of the region and
+            # ignores the rest without any indexing bookkeeping.
+            n_before = len(obs) - len(U_lq)
+            labels = (np.vstack([np.zeros((n_before, nu)), U_lq]),
+                      np.concatenate([np.zeros((n_before, nu, nu)), M_lq]))
+            if verbose:
+                pk = float(np.mean(M_lq.reshape(len(M_lq), -1).any(axis=1)))
+                print("  local Q: %d states x %d actions, %.0f%% with a peak, "
+                      "u* mean %.1f sd %.1f"
+                      % (len(U_lq), lq["a0"].shape[1], 100 * pk,
+                         U_lq.mean(), U_lq.std()), flush=True)
         hot = np.arange(len(cov), len(obs))
         if verbose and ex is not None:
             sm = EX.summary(ex, actions=bank.get("actions"))
@@ -280,13 +327,19 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         bank, glog = grow(env, bank, names, zn, pol_fn, obs, Z,
                           max_arms=cfg["grow_arms"], pool=cfg["grow_pool"],
                           max_arity=cfg["max_arity"], min_n=cfg["min_n"],
-                          min_gain=cfg["min_gain"], labels=None, qhat=None,
+                          # `labels` was pinned to None here, which is what
+                          # kept the fitted-law source dark on every world.
+                          # `qhat` stays None: the gradient source needs an
+                          # advantage critic and this one sits at rank 0.05.
+                          min_gain=cfg["min_gain"], qhat=None,
                           seed_clauses=seeds if r == 0 else None,
                           # SCREEN CHEAP, CONFIRM FULL. Growing screened its whole
                           # pool at the full episode count -- 40 candidates x n_ep
                           # -- while every other search screens at a fraction and
                           # only confirms survivors. Defaults to n_ep so nothing
                           # that does not set it changes.
+                          labels=labels,
+                          min_lab=cfg["value_min_rows"],
                           screen_ep=cfg.get("screen_ep") or cfg["n_ep"],
                           confirm_ep=cfg["n_ep"],
                           n_confirm=10, T=cfg["T"], seed=rseed,

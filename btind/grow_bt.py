@@ -189,7 +189,7 @@ def _clause_pool(rng, alpha, Z, hot, pool, max_arity, last, seeds,
 
 def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
               etas=(0.05, 0.2), n_perturb=8, sigma=0.4, rng=None,
-              structural=True, n_sample=60):
+              structural=True, n_sample=60, min_lab=20):
     """Every law worth trying on one candidate region, from every source.
 
     THE FITTED LAW IS THE PRIMARY SOURCE, as it has been since e18: solve the
@@ -223,10 +223,20 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
     if labels is not None:
         U, M = labels
         Mw = M[region] if w is None else (w[region, None, None] * M[region])
-        try:
-            out.append(("fitted", fit_value_law(Xd[region], U[region], Mw)))
-        except np.linalg.LinAlgError:
-            pass
+        # A REGION NEEDS ITS OWN EVIDENCE. Only the rows carrying a local Q
+        # sample have non-zero curvature; a region holding too few of them
+        # would be fitted almost entirely by the ridge, which is a law about
+        # nothing dressed as a law about this region.
+        n_lab = int((np.abs(Mw).reshape(len(Mw), -1).sum(1) > 1e-12).sum())
+        if n_lab >= min_lab:
+            try:
+                out.append(("fitted",
+                            fit_value_law(Xd[region], U[region], Mw,
+                                          k=(bank.get("prior_k")
+                                             if bank.get("prior") == "sparse"
+                                             else None))))
+            except np.linalg.LinAlgError:
+                pass
     if qhat is not None:
         th = arm_parent
         u = np.clip(Xd[region] @ th, -1, 1)
@@ -307,7 +317,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
          use_library=False, cem_region=True, cem_top=10, cem_iter=3,
          cem_K=24, cem_sigma=0.4, cols=None, structural=True, weights=None,
          prefix=None, parent_law=None, where=None, law_sample=60,
-         n_perturb=8, progress=None, label="grow"):
+         n_perturb=8, progress=None, label="grow", min_lab=20):
     """Add arms while a rollout says they pay by more than `min_gain`.
 
     REGION HOOKS, for growing INSIDE an existing child (`subtree.py`):
@@ -374,7 +384,8 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                                        qhat, w, lib, parent, rng=rng,
                                        structural=structural,
                                        n_sample=law_sample,
-                                       n_perturb=n_perturb):
+                                       n_perturb=n_perturb,
+                                       min_lab=min_lab):
                 g = score(env, _insert(bank, cl, th, screen_pos), pol_fn,
                           screen_ep, T, seed)
                 d_scr = float((g - cur_cheap).mean())

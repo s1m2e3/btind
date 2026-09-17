@@ -70,10 +70,22 @@ def bounds_of(bank):
 
 
 def constrain(bank, theta):
-    """A law as the bank's prior allows: with a constant prior, the intercept only."""
+    """A law as the bank's prior allows.
+
+    `const` keeps the intercept only. `sparse` keeps the intercept and the
+    `prior_k` largest slopes, zeroing the rest -- the same "nothing hides in a
+    dense affine prior" rule, relaxed from zero terms to a few named ones, so a
+    leaf still reads as a sentence: `green = 27 + 11*ph1 + 8*ph2 + 2*q1b`.
+    """
     th = np.array(theta, float)
     if bank.get("prior") == "const":
         th[:-1] = 0.0
+    elif bank.get("prior") == "sparse":
+        k = int(bank.get("prior_k", 4))
+        sl = th[:-1]
+        if len(sl) > k:
+            mag = np.abs(sl).max(axis=1) if sl.ndim > 1 else np.abs(sl)
+            sl[np.argsort(-mag)[k:]] = 0.0
     return th
 
 

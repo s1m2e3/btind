@@ -134,6 +134,66 @@ def deviations(env, bank, n_ep=400, T=400, seed=11, rng=None, ks=(1, 3, 8),
                 law=tr[np.arange(len(s)), np.minimum(t0, T - 1), d][keep])
 
 
+def local_q(env, bank, n_ep=300, T=400, seed=11, rng=None, levels=None,
+            same_start=True):
+    """A local sample of Q(s, .): every action tried at the SAME tick.
+
+    `deviations` takes ONE action per episode, which prices that action against
+    the incumbent and nothing else. Trying the whole action set at one tick
+    gives K returns at one state, and a quadratic through them is a MEASURED
+    local Q -- the curvature `valuesplit` weights its law fit by, and the peak
+    it fits toward.
+
+    NOTHING HERE PLANS. `search.py`, the CEM trajectory planner these labels
+    were originally taken from, is the expert this project does not use. Every
+    rollout is the incumbent tree continuing from the deviated action, so the
+    sample says what the tree would ACTUALLY get, not what an oracle could --
+    and the peak is therefore a one-step improvement on the current policy,
+    which is what policy iteration asks for and all a rollout can honestly give.
+
+    Costs K + 1 rollouts of `n_ep` episodes. At the intersection's five green
+    levels and 300 episodes that is 1800 episodes, about six seconds.
+    """
+    if kernel_for(env, bank) is None:
+        return None
+    rng = rng or np.random.default_rng(seed)
+    env.seed_kernels(seed)
+    s = starts(env, n_ep, seed if same_start else int(rng.integers(2 ** 31)))
+    d = len(mem_names(bank["names"], bank.get("mem"))) + 1
+    tr = trace_array(len(s), T, d)
+    who = _agents(env, s, rng)
+    base_dev = np.zeros((len(s), 4))
+    base_dev[:, 3] = who
+    G0 = fast_rollout(env, bank, s, T, trace=tr, dev=base_dev)
+    alive = tr[:, :, d - 1] > 0.5
+    length = alive.sum(1)
+    # THE SAME TICK FOR EVERY ACTION, and one the agent actually acts on --
+    # K returns at K different states are not a sample of Q(s, .) at all.
+    acting = env.acting_ticks(tr) if hasattr(env, "acting_ticks") else None
+    t0 = np.zeros(len(s), int)
+    for i in range(len(s)):
+        on = np.flatnonzero(alive[i] if acting is None else (alive[i] & acting[i]))
+        if not len(on):
+            on = np.flatnonzero(alive[i])
+        t0[i] = int(rng.choice(on)) if len(on) else 0
+    acts = list(_actions(bank, env)) if levels is None else list(levels)
+    width = 1 if bank.get("head") in ("scalar", "duration") else 2
+    G = np.zeros((len(s), len(acts)))
+    a0 = np.zeros((len(s), len(acts), width))
+    for j, a in enumerate(acts):
+        dev = np.zeros((len(s), 4))
+        dev[:, 0] = t0
+        dev[:, 1] = 1                                  # one tick: a FIRST action
+        dev[:, 2:4] = a
+        if type(env).__name__ == "IntersectionBatch":
+            dev[:, 3] = who
+        G[:, j] = fast_rollout(env, bank, s, T, dev=dev)
+        a0[:, j, :] = np.asarray(a, float)[:width]
+    keep = length > 0
+    z0 = tr[np.arange(len(s)), np.minimum(t0, T - 1), :d - 1]
+    return dict(z0=z0[keep], a0=a0[keep], G=G[keep], G0=G0[keep], t0=t0[keep])
+
+
 def hot_rows(ex, frac=0.25, min_adv=0.0):
     """Indices into `ex["z0"]` of the deviations that paid most.
 

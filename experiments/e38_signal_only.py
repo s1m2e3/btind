@@ -262,7 +262,21 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                z=1.0,
                n_cover=6000, cover_ep=80, cem_iter=4, cem_K=32,
                min_gain=1.0, critic=critic,
-               prior="const", # NARROWER PROPOSAL SEARCH, SAME ANSWER. The kernel stage was the
+               # A SPARSE PRIOR, NOT A CONSTANT ONE. `const` keeps only a
+               # leaf's intercept so that every state dependence is a named
+               # inducing point and "nothing hides in a dense affine prior".
+               # That is a readability rule, and it was costing the whole of
+               # what a law can express here: the value-fitted default is worth
+               # +104.42 on 400 held-out episodes with its slopes and -23.27
+               # constrained to its intercept, while the kernel that is meant
+               # to carry the state dependence instead has found two points in
+               # five rounds. Ten terms, selected and refitted, recover +104.40
+               # of it and still read as a sentence --
+               #   green = 20.9 + 10.1*ph2 + 9.7*ph0 + 7.0*ph1 + 2.5*q1b + ...
+               # which is a phase plan with a queue term, the thing a signal
+               # controller actually is. Set prior="const" to go back.
+               prior="sparse", prior_k=10,
+               # NARROWER PROPOSAL SEARCH, SAME ANSWER. The kernel stage was the
                # slowest thing in a round -- 264 scoring calls, ~248 of them
                # screens -- and widening the observation 24 -> 44 widened the
                # column-set search that drives it. Measured on this world:
@@ -300,7 +314,9 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # episode-units an arm against ~1000 for growing's confirms.
                # Measured 36.6 s -> 6.0 s at 20. Each iteration now draws a
                # fresh sample too, so a small screen cannot be chased.
-               cem_ep=screen_ep)
+               cem_ep=screen_ep,
+               # FIT LAWS BY VALUE, not only by picking from a vocabulary.
+               value_laws=True, value_ep=300)
 
     print("==== e38: the light alone, approach base %g..%g veh/h x skew %g..%g, "
           "%d episodes a test, %d demand groups"

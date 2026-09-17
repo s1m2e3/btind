@@ -42,25 +42,50 @@ RIDGE = 1e-6
 
 
 # --------------------------------------------------------------------- M_i
+def _quadratic_fit(a, G):
+    """Least-squares quadratic in the action, per state. Returns (g, H).
+
+    `a` is (n, K, A) candidate first actions and `G` is (n, K) their returns,
+    so this is a LOCAL SAMPLE OF Q(s, .) taken by rollout -- K actions tried at
+    one state with the incumbent tree continuing from each. No planner is
+    involved and none is available: `search.py` is the expert this project does
+    not use.
+
+    Any action width A is accepted. The basis is 1, the A linear terms and the
+    A(A+1)/2 quadratic ones, which is the 6-term basis this module was written
+    with when A is 2, and 3 terms for a one-dimensional command such as a green
+    time or an acceleration -- the two this project actually has.
+    """
+    a = np.asarray(a, float)
+    n, K, A = a.shape
+    pairs = [(i, j) for i in range(A) for j in range(i, A)]
+    cols = [np.ones((n, K))] + [a[:, :, i] for i in range(A)]
+    cols += [a[:, :, i] * a[:, :, j] for i, j in pairs]
+    Zb = np.stack(cols, axis=2)
+    p = Zb.shape[2]
+    ZtZ = np.einsum("nkp,nkq->npq", Zb, Zb)
+    Zty = np.einsum("nkp,nk->np", Zb, np.asarray(G, float))
+    ZtZ[:, np.arange(p), np.arange(p)] += 1e-8
+    # numpy 2 treats a 2-D rhs as a matrix, not a stack of vectors
+    beta = np.linalg.solve(ZtZ, Zty[..., None])[..., 0]
+    g = beta[:, 1:1 + A]                                   # gradient at a = 0
+    H = np.zeros((n, A, A))
+    for t, (i, j) in enumerate(pairs):
+        b = beta[:, 1 + A + t]
+        if i == j:
+            H[:, i, i] = 2.0 * b
+        else:
+            H[:, i, j] = H[:, j, i] = b
+    return g, H
+
+
 def action_curvature(elite_or_all_a, G, clip_q=99.0):
     """Per-state curvature of return w.r.t. the first action.
 
-    a: (n, K, 2) candidate first actions, G: (n, K) their returns.
-    Returns M (n, 2, 2), PSD, = -Hessian of the fitted quadratic.
+    a: (n, K, A) candidate first actions, G: (n, K) their returns.
+    Returns M (n, A, A), PSD, = -Hessian of the fitted quadratic.
     """
-    a = elite_or_all_a
-    ax, ay = a[:, :, 0], a[:, :, 1]
-    Z = np.stack([np.ones_like(ax), ax, ay, ax * ax, ay * ay, ax * ay], axis=2)
-    ZtZ = np.einsum("nkp,nkq->npq", Z, Z)
-    Zty = np.einsum("nkp,nk->np", Z, G)
-    ZtZ[:, np.arange(6), np.arange(6)] += 1e-8
-    # numpy 2 treats a 2-D rhs as a matrix, not a stack of vectors
-    beta = np.linalg.solve(ZtZ, Zty[..., None])[..., 0]    # (n, 6)
-
-    H = np.empty((len(a), 2, 2))
-    H[:, 0, 0] = 2.0 * beta[:, 3]
-    H[:, 1, 1] = 2.0 * beta[:, 4]
-    H[:, 0, 1] = H[:, 1, 0] = beta[:, 5]
+    _, H = _quadratic_fit(elite_or_all_a, G)
     M = -H                                                 # return is maximised
 
     # project to PSD: a non-concave fit means the sample says nothing here
@@ -71,13 +96,45 @@ def action_curvature(elite_or_all_a, G, clip_q=99.0):
     return np.einsum("nij,nj,nkj->nik", V, w, V)
 
 
+def local_optimum(a, G, lo=None, hi=None, clip_q=99.0):
+    """(u*, M) from a local Q sample: the fitted peak and the curvature at it.
+
+    u* is where the quadratic is maximised, `M u = g`, clipped to the action
+    range. Where the fit is not concave -- the sample says nothing about a
+    peak -- the BEST SAMPLED ACTION stands in, which is the honest answer a
+    rollout can give: it is the best thing actually tried there.
+    """
+    a = np.asarray(a, float)
+    g, H = _quadratic_fit(a, G)
+    M = -H
+    w, V = np.linalg.eigh(M)
+    ok = w.min(axis=1) > 1e-9
+    w = np.clip(w, 0.0, None)
+    cap = np.percentile(w[w > 0], clip_q) if (w > 0).any() else 1.0
+    w = np.minimum(w, cap)
+    M = np.einsum("nij,nj,nkj->nik", V, w, V)
+    best = a[np.arange(len(a)), np.argmax(np.asarray(G, float), axis=1)]
+    u = best.copy()
+    if ok.any():
+        # numpy 2 treats a 2-D rhs as a matrix, not a stack of vectors
+        u[ok] = np.linalg.solve(M[ok] + 1e-9 * np.eye(a.shape[2]),
+                                g[ok][..., None])[..., 0]
+    if lo is not None:
+        u = np.clip(u, lo, hi)
+    inside = np.all((u >= (lo if lo is not None else -np.inf) - 1e-9)
+                    & (u <= (hi if hi is not None else np.inf) + 1e-9), axis=1)
+    u = np.where((ok & inside)[:, None], u, best)
+    return u, M
+
+
 # ------------------------------------------------------- fit / loss / gain
 def _Ab(X, U, M):
-    """Per-sample contributions to A ((d,2,d,2)) and b ((d,2)), flattened."""
+    """Per-sample contributions to A ((d,A,d,A)) and b ((d,A)), flattened."""
     n, d = X.shape
-    Ai = np.einsum("ip,ik,iqm->ipqkm", X, X, M).reshape(n, 2 * d, 2 * d)
+    A = np.shape(M)[1]
+    Ai = np.einsum("ip,ik,iqm->ipqkm", X, X, M).reshape(n, A * d, A * d)
     Mu = np.einsum("iqm,im->iq", M, U)
-    bi = np.einsum("ip,iq->ipq", X, Mu).reshape(n, 2 * d)
+    bi = np.einsum("ip,iq->ipq", X, Mu).reshape(n, A * d)
     return Ai, bi
 
 
@@ -90,12 +147,36 @@ def _score(A, b, ridge=RIDGE):
         return float(b @ np.linalg.lstsq(A, b, rcond=None)[0])
 
 
-def fit_value_law(X, U, M, ridge=RIDGE):
-    """Affine law minimising the M-weighted value loss. Returns theta (d, 2)."""
+def fit_value_law(X, U, M, ridge=RIDGE, k=None):
+    """Affine law minimising the M-weighted value loss. Returns theta (d, A).
+
+    With `k`, the law is SPARSE: fit once, keep the k columns the fit leans on
+    hardest in units of their own spread, and REFIT on those alone. Refitting
+    is the point -- the coefficients of a joint fit are not independent, so
+    truncating one is not a smaller law but a broken one. Measured on the
+    intersection's signal, truncation gave -83, -4, -62, +16 at 2, 3, 4 and 6
+    terms against the dense law's +104; selecting and refitting gives +12, +53
+    and +104 at 4, 6 and 10, so ten named terms carry the whole gain.
+
+    The intercept is never dropped: it is the constant a leaf falls back to.
+    """
     d = X.shape[1]
-    Ai, bi = _Ab(X, U, M)
-    A = Ai.sum(0) + ridge * np.eye(2 * d)
-    return np.linalg.solve(A, bi.sum(0)).reshape(d, 2)
+    nu = np.shape(M)[1]
+
+    def solve(Xs):
+        Ai, bi = _Ab(Xs, U, M)
+        A = Ai.sum(0) + ridge * np.eye(nu * Xs.shape[1])
+        return np.linalg.solve(A, bi.sum(0)).reshape(Xs.shape[1], nu)
+
+    th = solve(X)
+    if k is None or k >= d - 1:
+        return th
+    lean = np.abs(th[:-1]).max(axis=1) * X[:, :-1].std(axis=0)
+    cols = np.sort(np.argsort(-lean)[:max(0, int(k))])
+    idx = np.concatenate([cols, [d - 1]]).astype(int)
+    out = np.zeros((d, nu))
+    out[idx] = solve(X[:, idx])
+    return out
 
 
 def best_value_split(X, U, M, Z, cand_vars, n_cand=48, min_frac=0.10,
