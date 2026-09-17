@@ -72,7 +72,46 @@ def with_fail(bank, arm, clause):
     return check_arms(dict(bank, fails=fails), "with_fail")
 
 
-def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4):
+def _distinct_laws(pool, Z, u_range):
+    """Keep one law per DISTINCT command on the data.
+
+    A law is a different controller only if it commands something different
+    somewhere. After clipping to the world's range most do not: on a real tree
+    50 laws gave 17 distinct commands, 33 of them the constant 5. One matrix
+    product settles it here, instead of the rollout discovering it 121 screened
+    candidates later.
+    """
+    lo, hi = float(u_range[0]), float(u_range[1])
+    Z = np.asarray(Z, float)
+    seen, out = set(), []
+    for name, th in pool:
+        a = np.asarray(th, float)
+        if a.shape[0] != Z.shape[1] + 1:
+            out.append((name, th))
+            continue
+        u = np.clip(Z @ a[:-1] + a[-1], lo, hi)
+        key = np.round(u, 6).tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, th))
+    return out
+
+
+def _distinct_advances(cands, Z):
+    """Keep one advance per DISTINCT set of rows it fires on."""
+    from .landscape import _match_cols
+    seen, out = set(), []
+    for cl, label in cands:
+        key = np.packbits(_match_cols(cl, Z)).tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((cl, label))
+    return out
+
+
+def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4, Z=None):
     """Laws a new step may carry, from the same sources the grower uses."""
     parent = np.asarray(law_of(bank, arm, n_steps_of(bank, arm) - 1), float)
     d, n_out = parent.shape
@@ -88,7 +127,7 @@ def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4):
         # The five constants are kept whole. They are the null a proportional
         # term has to beat, there are only five of them, and dropping one at
         # random would make the pool's floor depend on the draw.
-        prim = list(scalar_primitives(zn, d, lo, hi).items())
+        prim = list(scalar_primitives(zn, d, lo, hi, Z=Z).items())
         const = [p for p in prim if p[0].startswith("const[")]
         rest = [p for p in prim if not p[0].startswith("const[")]
         if len(rest) > n_sample:
@@ -102,6 +141,8 @@ def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4):
         out += list(structural_primitives(zn, d).items())
     for i in range(n_perturb):
         out.append(("rand%d" % i, parent + sigma * rng.standard_normal(parent.shape)))
+    if Z is not None:
+        out = _distinct_laws(out, Z, bank.get("u_range", (-1.0, 1.0)))
     return out
 
 
@@ -129,7 +170,7 @@ def _pick(cands, own_cols, n, rng, weights=None):
 def search_steps(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_adv=16,
                  screen_ep=120, confirm_ep=600, n_confirm=8, T=400, seed=777,
                  z=2.0, min_gain=0.3, max_steps=3, rng=None, weights=None,
-                 verbose=True, n_law_sample=40):
+                 verbose=True, n_law_sample=40, n_law_keep=3):
     """Append one step to one arm, the (advance, law) pair that wins its rollout."""
     rng = rng or np.random.default_rng(0)
     C = len(bank["clauses"])
@@ -144,14 +185,39 @@ def search_steps(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_adv=16,
         if ch[c]["share"] < 0.02 or n_steps_of(bank, c) >= max_steps:
             continue
         own = {l[0] for l in bank["clauses"][c]}
-        advs = _pick(beta_candidates(Z, zn, bank["clauses"][c]), own, n_adv,
-                     rng, weights)
-        laws = _law_pool(bank, zn, c, rng, n_sample=n_law_sample)
+        # DISTINCT CANDIDATES ONLY, decided before any rollout is paid for.
+        # Measured on a real tree: 46 advances x 50 laws = 2300 screens that
+        # were 19 different controllers, 119 s to rank copies of each other.
+        advs = _distinct_advances(
+            _pick(beta_candidates(Z, zn, bank["clauses"][c]), own, n_adv,
+                  rng, weights), Z)
+        laws = _law_pool(bank, zn, c, rng, n_sample=n_law_sample, Z=Z)
         cheap = score(env, bank, pol_fn, screen_ep, T, seed)
-        tick = ticker("steps arm %d" % c, len(advs) * len(laws), verbose)
+        # SCREEN THE TWO DIMENSIONS SEPARATELY, not their product. Measured on a
+        # real tree: 46 advances with the law held fixed gave ONE distinct
+        # rollout, while 49 laws with the advance held fixed gave 18. An
+        # appended step is the arm's LAST, so its advance says when to hand over
+        # to a step that does not exist, and the product was 46 copies of the
+        # law sweep -- 2254 screens, 52 distinct controllers, 120 s to rank
+        # duplicates of each other. Sweeping the law first and the advance only
+        # against the laws that survived costs 49 + 3 x 46 instead, and shrinks
+        # the selection bias with it: the best of 187 noisy estimates sits far
+        # closer to the truth than the best of 2254.
+        tick = ticker("steps arm %d laws" % c, len(laws), verbose)
+        lrows = []
+        for lname, th in laws:
+            g = score(env, with_step(bank, c, advs[0][0], th), pol_fn,
+                      screen_ep, T, seed)
+            dlt = float((g - cheap).mean())
+            tick(dlt)
+            lrows.append((dlt, lname, th))
+        lrows.sort(key=lambda r: -r[0])
+        lrows = dedupe_screened(lrows)[:max(1, n_law_keep)]
+        tick = ticker("steps arm %d advances" % c, len(advs) * len(lrows),
+                      verbose)
         rows = []
-        for adv, alab in advs:
-            for lname, th in laws:
+        for _, lname, th in lrows:
+            for adv, alab in advs:
                 g = score(env, with_step(bank, c, adv, th), pol_fn, screen_ep,
                           T, seed)
                 dlt = float((g - cheap).mean())

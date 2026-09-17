@@ -125,25 +125,49 @@ def discrete_primitives(names, n_act, d, rng=None, n_sample=None):
     return out
 
 
-def scalar_primitives(names, d, lo, hi, scales=(1.0, 0.1)):
+def scalar_primitives(names, d, lo, hi, scales=(1.0, 0.1), Z=None):
     """The law vocabulary for a one-output continuous head. Names nothing.
 
     CONSTANT LEVELS across the world's range -- the honest null for a command
     that is clipped to [lo, hi] -- and single-column proportional terms at two
-    scales, both signs: "command in proportion to column j". The scale is
-    needed because a column in metres and a column in {0, 1} cannot share one
-    coefficient; CEM refines whatever the rollout picks.
+    scales, both signs: "command in proportion to column j".
+
+    WHY THE TERMS ARE CENTRED AND SCALED when `Z` is given. `sgn * sc * column`
+    only means anything if 0 lies inside [lo, hi]. It does for a car, whose
+    range is [-B_MAX, A_MAX]. It does NOT for the signal, whose command is a
+    green time in [5, 45]: every negative coefficient on a non-negative column
+    lands below 5, and so does every 0.1 coefficient on a column smaller than
+    50, so the clip turns them all into the same constant. Measured on a real
+    tree, 38 of 50 laws in the step search's pool were the CONSTANT 5 after
+    clipping, 50 laws gave 17 distinct commands, and 2300 screened candidates
+    were 19 distinct controllers -- the search paid 119 s to rank copies.
+
+    With `Z` a term is `mid + sgn * sc * (column - median) * half / spread`,
+    so one column's 10th-to-90th-percentile sweep moves the command across
+    half the range whatever its units, and both signs say something. Without
+    `Z` the old uncentred form is returned unchanged, so a caller that does not
+    pass it -- and a world whose range straddles 0 -- is unaffected.
     """
     out = {}
     for f in (0.0, 0.25, 0.5, 0.75, 1.0):
         th = np.zeros((d, 1))
         th[-1, 0] = lo + f * (hi - lo)
         out["const[%.3g]" % th[-1, 0]] = th
+    mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
     for j in range(len(names)):
+        gain, centre = 1.0, 0.0
+        if Z is not None and j < np.shape(Z)[1]:
+            col = np.asarray(Z[:, j], float)
+            spread = float(np.percentile(col, 90) - np.percentile(col, 10))
+            if spread <= 1e-9:
+                # a column that does not move cannot carry a proportional term
+                continue
+            gain, centre = half / spread, float(np.median(col))
         for sc in scales:
             for sgn in (1.0, -1.0):
                 th = np.zeros((d, 1))
-                th[j, 0] = sgn * sc
+                th[j, 0] = sgn * sc * gain
+                th[-1, 0] = mid - sgn * sc * gain * centre if Z is not None else 0.0
                 out["%s%.3g*%s" % ("+" if sgn > 0 else "-", sc, names[j])] = th
     return out
 

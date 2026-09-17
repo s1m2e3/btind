@@ -206,7 +206,9 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
             # proportional terms, from `u_range` the world declares.
             from .lawsearch import scalar_primitives
             lo, hi = bank.get("u_range", (-1.0, 1.0))
-            out += list(scalar_primitives(zn, d_law, lo, hi).items())
+            out += list(scalar_primitives(zn, d_law, lo, hi,
+                                          Z=Z[region] if len(region) else Z
+                                          ).items())
         elif head == "vector":
             out += list(structural_primitives(zn, d_law).items())
         else:
