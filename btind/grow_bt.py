@@ -53,7 +53,7 @@ import numpy as np
 from .collect import design_matrix
 from .evotm import Alphabet, _match, _rand_literal, dedupe_literals
 from .lawsearch import library, structural_primitives
-from .structure import accept, dedupe_screened, score, ticker
+from .structure import accept, dedupe_screened, distinct_laws, score, ticker
 from .valuesplit import fit_value_law
 
 
@@ -254,16 +254,24 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
             out.append(("rand%d" % i,
                         arm_parent + sigma * rng.standard_normal(
                             np.shape(arm_parent))))
-    if bank.get("prior") == "const":
-        # a constant prior: every candidate is its intercept, and duplicates go
+    if True:
+        # EVERY PRIOR, NOT JUST THE CONSTANT ONE. Under `const` each candidate
+        # collapses to its intercept and the duplicates are obvious, which is
+        # why this was written here -- but `constrain` is a no-op without a
+        # prior and the duplicates are just as real: two laws that differ only
+        # on a column the region never reads are one candidate, and screening
+        # both costs a rollout each. Gating the deduplication on `const` meant
+        # moving to a sparse prior silently restored the whole redundant pool
+        # and took growing's first arm from 51 s to 322 s.
         from .kernlaw import constrain
-        seen, kept = set(), []
-        for nm, th in out:
-            th = constrain(bank, th)
-            key = np.round(th, 9).tobytes()
-            if key not in seen:
-                seen.add(key)
-                kept.append((nm, th))
+        # BY WHAT THEY COMMAND, not by their coefficients. Under `const` the two
+        # agree, because every law collapses to its intercept. Under a sparse or
+        # absent prior they do not: laws that differ on a column this region
+        # never reads are distinct vectors and the same controller.
+        out = distinct_laws([(nm, constrain(bank, th)) for nm, th in out],
+                            Xd[region],
+                            bank.get("u_range", (-np.inf, np.inf)))
+        kept = out
         out = kept
     return out
 

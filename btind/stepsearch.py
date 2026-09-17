@@ -44,7 +44,7 @@ import numpy as np
 from .betasearch import beta_candidates, churn
 from .lawsearch import discrete_primitives, structural_primitives
 from .memory import check_arms
-from .structure import accept, dedupe_screened, score, ticker
+from .structure import accept, dedupe_screened, distinct_laws, score, ticker
 from .tick import law_of, n_steps_of
 
 
@@ -70,32 +70,6 @@ def with_fail(bank, arm, clause):
     fails = list(bank.get("fails") or [None] * C)
     fails[arm] = [l[:] for l in clause] if clause is not None else None
     return check_arms(dict(bank, fails=fails), "with_fail")
-
-
-def _distinct_laws(pool, Z, u_range):
-    """Keep one law per DISTINCT command on the data.
-
-    A law is a different controller only if it commands something different
-    somewhere. After clipping to the world's range most do not: on a real tree
-    50 laws gave 17 distinct commands, 33 of them the constant 5. One matrix
-    product settles it here, instead of the rollout discovering it 121 screened
-    candidates later.
-    """
-    lo, hi = float(u_range[0]), float(u_range[1])
-    Z = np.asarray(Z, float)
-    seen, out = set(), []
-    for name, th in pool:
-        a = np.asarray(th, float)
-        if a.shape[0] != Z.shape[1] + 1:
-            out.append((name, th))
-            continue
-        u = np.clip(Z @ a[:-1] + a[-1], lo, hi)
-        key = np.round(u, 6).tobytes()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append((name, th))
-    return out
 
 
 def _distinct_advances(cands, Z):
@@ -142,7 +116,9 @@ def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4, Z=None):
     for i in range(n_perturb):
         out.append(("rand%d" % i, parent + sigma * rng.standard_normal(parent.shape)))
     if Z is not None:
-        out = _distinct_laws(out, Z, bank.get("u_range", (-1.0, 1.0)))
+        from .collect import design_matrix
+        out = distinct_laws(out, design_matrix(Z),
+                            bank.get("u_range", (-1.0, 1.0)))
     return out
 
 

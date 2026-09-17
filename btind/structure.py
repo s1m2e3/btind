@@ -133,6 +133,31 @@ LOG_STEPS = False
 _steps = [0]
 
 
+def distinct_laws(pool, Xd, u_range):
+    """Keep one law per DISTINCT command on these rows.
+
+    A law is a different controller only if it commands something different
+    somewhere. Two that differ on a column the region never reads, or that both
+    land outside the world's range and clip to the same bound, are one
+    candidate -- and screening both costs a rollout each. Measured on the
+    signal, 50 laws gave 17 distinct commands, 33 of them the constant 5.
+    """
+    lo, hi = float(u_range[0]), float(u_range[1])
+    Xd = np.asarray(Xd, float)
+    seen, out = set(), []
+    for name, th in pool:
+        a = np.asarray(th, float)
+        if a.shape[0] != Xd.shape[1]:
+            out.append((name, th))
+            continue
+        key = np.round(np.clip(Xd @ a, lo, hi), 6).tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, th))
+    return out
+
+
 def dedupe_screened(rows, score_of=None):
     """Drop candidates whose screen score is bit-identical to one already kept.
 
