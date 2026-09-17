@@ -373,6 +373,13 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # leave 4 per group and switch that protection -- the one that
                # replaced the demand ladder -- off ENTIRELY AND SILENTLY, which
                # is why 20 screens a pool and never decides.
+               # POLISH FOUR, NOT TEN. `rows` is sorted by screen delta
+               # before the slice, so this keeps the best-screened four, and on
+               # a real car round the winner was inside them both times: the
+               # ticker read 4/10 +968.17 then 6, 8 and 10/10 all +968.17, and
+               # the other arm found its best by 2/10. 2.5x off a stage that
+               # measured ~120 s an arm.
+               cem_top=4,
                screen_ep=screen_ep, grow_pool=28,
                # CEM's inner evaluations only RANK candidates to refit its
                # sampling distribution -- `improve_laws` still puts the result

@@ -42,7 +42,7 @@ from .structure import (absorb_universal, collapse_bottom, drop_arm,
 
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
-    grow_pool=60, grow_arms=4, max_arity=3, min_n=400,
+    grow_pool=60, grow_arms=4, max_arity=3, min_n=400, cem_top=10, n_pos=2,
     cem_iter=12, cem_K=96, cem_sigma=0.35,
     mem_at=1, mem_thr=7, mem_refine=3, beta_at=2, steps_at=2, n_cover=6000,
     subtree_at=(1, 2), subtree_arms=2, subtree_pool=30,
@@ -383,6 +383,13 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           min_lab=cfg["value_min_rows"],
                           screen_ep=cfg.get("screen_ep") or cfg["n_ep"],
                           confirm_ep=cfg["n_ep"],
+                          # HOW MANY SCREENED CANDIDATES GET POLISHED. The
+                          # rows are sorted by screen delta first, so this keeps
+                          # the best-screened k. It was pinned at 10 and is the
+                          # second-largest cost in a grow pass -- k x cem_K x
+                          # cem_iter x cem_ep episodes an arm, 25,600 at the
+                          # defaults, measured at ~120 s an arm on the car.
+                          cem_top=cfg["cem_top"], n_pos=cfg["n_pos"],
                           n_confirm=10, T=cfg["T"], seed=rseed,
                           z=cfg["z"], rng=rng, use_library=False,
                           weights=weights, verbose=verbose)

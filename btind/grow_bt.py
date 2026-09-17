@@ -336,7 +336,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
          max_arity=3, min_n=60, min_gain=0.3, n_law=8, labels=None, qhat=None,
          w=None, seed_clauses=None, screen_ep=120, confirm_ep=600,
          n_confirm=12, T=400, seed=777, z=2.0, rng=None, verbose=True,
-         use_library=False, cem_region=True, cem_top=10, cem_iter=3,
+         use_library=False, cem_region=True, cem_top=10, cem_iter=3, n_pos=2,
          cem_K=24, cem_sigma=0.4, cols=None, structural=True, weights=None,
          prefix=None, parent_law=None, where=None, law_sample=60,
          n_perturb=8, progress=None, label="grow", min_lab=20):
@@ -468,7 +468,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
             # one-for-one with the real ones. Two positions that leave the new
             # arm the same rows are likewise one candidate: `_insert` reorders
             # nothing, so every other arm keeps its rows too.
-            seen_pos = set()
+            seen_pos, live = set(), []
             for pos in positions:
                 above = np.zeros(len(Z), bool)
                 for q in range(min(pos, len(bank["clauses"]))):
@@ -478,6 +478,23 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                 if not claim.any() or key in seen_pos:
                     continue
                 seen_pos.add(key)
+                live.append(pos)
+            # SCREEN THE POSITION TOO. The clause pool is screened at one
+            # position and then CONFIRMED at every one of them -- a multiplier
+            # applied only at the expensive end. On a real car round that was 28
+            # confirmations for one arm, 380 s of a 605 s pass, because a
+            # four-arm tree offers five insertion points. The position is now
+            # ranked at `screen_ep` like everything else and only the best
+            # `n_pos` go to the full test.
+            if len(live) > n_pos:
+                pr = []
+                for pos in live:
+                    g = score(env, _insert(bank, cl, th, pos), pol_fn,
+                              screen_ep, T, seed)
+                    pr.append((float((g - cur_cheap).mean()), pos))
+                pr.sort(key=lambda r: -r[0])
+                live = [pos for _, pos in pr[:n_pos]]
+            for pos in live:
                 cand = _insert(bank, cl, th, pos)
                 ok, dl, _ = accept(env, cand, pol_fn, cur_full, confirm_ep, T,
                                    seed_c, z)
