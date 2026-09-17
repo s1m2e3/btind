@@ -225,6 +225,17 @@ R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 200.0, 75.
 # risks, and at R_RED=10 the discovered car ran 52 an episode and made the
 # signal's objective 49.5% its partner's law-breaking.
 R_RED_FLOOR, T_SAFE = 20.0, 3.0
+# CHEAP TALK IS NOT FREE. A declaration that costs nothing is made by every car
+# at every red, and a channel everybody shouts on carries nothing. A car that
+# says it is coming and then stops pays this per tick it stays stopped -- the
+# only thing standing between a signal and noise, since under `veh_reward="car"`
+# declaring also has a direct payoff: it is a bid for the other car to yield.
+W_FALSE_PASS = 8.0
+# Only a car on red, close enough to the line for the question to be live, can
+# declare at all; elsewhere the output is ignored, so the channel cannot be used
+# to broadcast anything but this. The same 60 m as NEAR_INT, written out because
+# that constant is defined further down.
+PASS_GATE_D = 60.0
 # The share of a crossing collision borne by the car that entered without the
 # green. At 1.0 the total is what it was and simply moves onto the responsible
 # party; above 1.0 a pass that ends in a crossing costs MORE than the old
@@ -306,7 +317,16 @@ VEH_NAMES = ["v", "d_stop", "near_int", "green", "t_sig", "t_sig_max", "all_red"
              #              two -- a rival on red doing 9 m/s is not stopping
              # Inferred from the world, not declared by the rival: there is no
              # message to send and so nothing to send falsely.
-             "rival_red", "rival_v"]
+             "rival_red", "rival_v",
+             # WHAT THE RIVAL SAID, as opposed to what it is doing. `rival_red`
+             # and `rival_v` are inference: by the time a car's speed reveals it
+             # is coming, it is nearly there. A DECLARATION arrives earlier --
+             # the whole value of a vehicle-to-vehicle channel is that intent
+             # precedes the physics that would betray it.
+             #
+             # It is the previous tick's broadcast, because every car observes
+             # before any car acts, which is what a received message is.
+             "rival_pass"]
 # Per phase k, over the vehicles whose movement phase k serves and that are
 # approaching (0 < distance to the stop line < QUEUE_D):
 #   q<k>a q<k>b  how many are QUEUED (speed below QUEUE_V) on each of the two
@@ -434,8 +454,8 @@ class IntersectionBatch:
     # observation are never resumed on this one -- a checkpoint that learned
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
-    OBS_VERSION = 9
-    REWARD_VERSION = 7          # part of the store key, like OBS_VERSION
+    OBS_VERSION = 10
+    REWARD_VERSION = 8          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -459,7 +479,7 @@ class IntersectionBatch:
         self.occlude_lo, self.occlude_hi = ((float(occlude[0]), float(occlude[1]))
                                             if occlude else (-1.0, -1.0))
         self.occluded = occlude is not None
-        assert veh_head in ("argmax", "scalar") and sig_head in ("argmax", "duration")
+        assert veh_head in ("argmax", "scalar", "pass")             and sig_head in ("argmax", "duration")
         self.veh_head, self.sig_head = veh_head, sig_head
         self.sig_mode = sig_mode
         self.event = sig_mode == "event"
@@ -492,6 +512,9 @@ class IntersectionBatch:
         self.obs_version = self.OBS_VERSION
         self.reward_version = self.REWARD_VERSION
         self.terms = None               # set to {} to collect per-term totals
+        # last tick's declarations, (n, N); None until a tick has been taken,
+        # which is also what a car hears before anyone has said anything
+        self._said = None
 
     def seed_kernels(self, seed):
         self._kseed = int(seed)
@@ -517,6 +540,14 @@ class IntersectionBatch:
 
     @property
     def n_act(self):
+        # `pass` is the scalar head plus a DECLARATION: output 0 is the
+        # acceleration the world clips to `u_range`, output 1 is a logit whose
+        # sign says "I am coming through". Two outputs, one of them continuous
+        # and one discrete, which is why it is its own head rather than a
+        # widening of `scalar` -- every bank already stored under `scalar` stays
+        # a valid one-output bank.
+        if self.head == "pass":
+            return 2
         if self.head in ("scalar", "duration"):
             return 1
         return self.veh_n_act if self.agent == "vehicle" else self.sig_n_act
@@ -532,6 +563,11 @@ class IntersectionBatch:
         """The continuous leaf's range: acceleration for a car, green time for
         the signal. The world clips every continuous command to it."""
         return (-B_MAX, A_MAX) if self.agent == "vehicle" else (T_MIN, T_MAX)
+
+    @property
+    def veh_declares(self):
+        """Whether the vehicle head carries a declaration alongside its command."""
+        return self.veh_head == "pass"
 
     @property
     def u_null(self):
@@ -925,8 +961,8 @@ class IntersectionBatch:
         best = gap_t.min(2)
         return np.where(np.isfinite(best), best, FAR)
 
-    def _sense(self, m, S, V, act, gm):
-        """The radius sensor's eight columns per slot (see VEH_NAMES)."""
+    def _sense(self, m, S, V, act, gm, said):
+        """The radius sensor's nine columns per slot (see VEH_NAMES)."""
         g = self.geom
         n, N = S.shape
         x, y, hx, hy = self._xy(m, S)
@@ -960,9 +996,11 @@ class IntersectionBatch:
         r_d = np.take_along_axis(d_rv, jr[:, :, None], 2)[:, :, 0]
         r_red = np.take_along_axis((~gm).astype(float), jr, 1)
         r_v = np.take_along_axis(V, jr, 1)
+        r_say = np.take_along_axis(said, jr, 1)
         return (n_near, np.where(has_near, best, FAR), closing, has_rival.astype(float),
                 np.where(has_rival, rbest, FAR), np.where(has_rival, r_d, FAR),
-                np.where(has_rival, r_red, 0.0), np.where(has_rival, r_v, 0.0))
+                np.where(has_rival, r_red, 0.0), np.where(has_rival, r_v, 0.0),
+                np.where(has_rival, r_say, 0.0))
 
     def _d_conf(self, m, s):
         """Distance to MY nearest conflict point still ahead: geometry only."""
@@ -1030,7 +1068,9 @@ class IntersectionBatch:
         # observed column can recover elapsed time from it.
         o[:, :, 13] = np.mod(X[:, 4:5] / self.duration + X[:, 11:12], 1.0)
         o[:, :, 14] = X[:, 5:6]
-        for c_i, col in enumerate(self._sense(m, S, V, act, gm)):
+        said = (self._said if self._said is not None
+                and np.shape(self._said) == S.shape else np.zeros_like(S))
+        for c_i, col in enumerate(self._sense(m, S, V, act, gm, said)):
             o[:, :, 15 + c_i] = col
         o[~act] = 0.0
         return o.reshape(n * N, -1)
@@ -1207,10 +1247,17 @@ class IntersectionBatch:
         N, dt, g = self.N, self.dt, self.geom
         m, S, V, st, dep, X = self._unpack(s)
         n = len(s)
-        a_veh = np.asarray(a_veh, float).reshape(n, N)
+        a_veh = (np.asarray(a_veh, float) if self._veh_head_now == "pass"
+                 else np.asarray(a_veh, float).reshape(n, N))
         # the heads the actions are in were recorded by `_heads` -- by `step`
         # for the generic interface, by `python_rollout` for the reference
-        veh_scalar = self._veh_head_now == "scalar"
+        veh_scalar = self._veh_head_now in ("scalar", "pass")
+        # the `pass` head hands back a command AND a declaration; the command is
+        # column 0 and behaves exactly as the scalar head's single output
+        say = None
+        if self._veh_head_now == "pass":
+            a_veh = np.asarray(a_veh, float).reshape(n, N, 2)
+            say, a_veh = a_veh[:, :, 1], a_veh[:, :, 0]
         acc = (np.clip(a_veh, -B_MAX, A_MAX) if veh_scalar
                else ACCELS[np.clip(np.rint(a_veh), 0, len(ACCELS) - 1).astype(int)])
         sig_duration = (self._sig_head_now == "duration") if a_sig is not None else False
@@ -1292,6 +1339,22 @@ class IntersectionBatch:
         # -- red-light running: crossing the stop line without right of way -
         s_stop = g["s_stop"][m]
         ran = was & (before < s_stop) & (S >= s_stop) & ~gm
+        # WHO SAID THEY WERE COMING. Only a car on red, still short of the line
+        # and inside `PASS_GATE_D`, can declare at all -- elsewhere the output is
+        # ignored, so the channel cannot carry anything but this one message.
+        # Recorded now and read by every OTHER car on the next tick, because all
+        # cars observe before any car acts, which is what receiving a broadcast
+        # is.
+        if say is not None:
+            d_pre = s_stop - before
+            gate = was & ~gm & (d_pre > 0.0) & (d_pre <= PASS_GATE_D)
+            self._said = np.where(gate & (say > 0.0), 1.0, 0.0)
+            # A CAR THAT SAID IT WAS COMING AND STOPPED WAS LYING, and pays for
+            # it while it stays stopped. Without this the declaration is free,
+            # every car makes it at every red, and the channel carries nothing.
+            if self.reward_mode == "car":
+                lied = (self._said > 0.5) & (V < QUEUE_V)
+                r -= W_FALSE_PASS * dt * lied.sum(1)
         X[:, 7] += ran.sum(1)
         car = self.reward_mode == "car"
         if car:

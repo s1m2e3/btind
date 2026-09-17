@@ -31,6 +31,7 @@ from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_ar
 from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_RED_FLOOR,
                            R_STOP, STOP_ZONE, T_SAFE, W_CROSS_FAULT,
+                           PASS_GATE_D, W_FALSE_PASS,
                            W_CAR_DELAY, W_COMFORT, W_DELAY, W_OVER, COMMIT_D,
                            W_QUEUE, W_STUCK_CAR, W_STUCK_FREE, W_STUCK_QUEUE,
                            W_STUCK_EARLY, STOP_ZONE, NEAR_INT,
@@ -51,10 +52,11 @@ def params(env, vehicle_bank=None, signal_bank=None, reward=None):
     assert reward in ("team", "car")
     return np.array([env.N, env.M, env.dt, env.duration, env.gamma,
                      1.0 if env.event else 0.0,
-                     1.0 if vh == "scalar" else 0.0,
+                     1.0 if vh in ("scalar", "pass") else 0.0,
                      1.0 if sh == "duration" else 0.0,
                      env.occlude_lo, env.occlude_hi,
-                     1.0 if reward == "car" else 0.0], np.float64)
+                     1.0 if reward == "car" else 0.0,
+                     1.0 if vh == "pass" else 0.0], np.float64)
 
 
 @njit(cache=True, inline="always")
@@ -243,6 +245,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
     gamma = p[4]
     event = p[5] > 0.5
     vscalar = p[6] > 0.5
+    vpass = p[11] > 0.5
     sduration = p[7] > 0.5
     occ_lo = p[8]
     occ_hi = p[9]
@@ -357,6 +360,8 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         kvs = np.zeros(kmax_s)
         act_v = np.zeros(N, np.int64)
         acc_v = np.zeros(N)
+        say_raw = np.zeros(N)               # this tick's raw declaration logit
+        said = np.zeros(N)                  # last tick's, gated: what others hear
         has_lead = np.zeros(N, np.bool_)
         lead_gap = np.empty(N)
         lead_j = np.zeros(N, np.int64)
@@ -547,12 +552,14 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     # does the one that is coming have the right to?
                     zv[21] = 0.0 if (green_now and green[phase, mv[riv_o]])                         else 1.0
                     zv[22] = v[riv_o]
+                    zv[23] = said[riv_o]            # what it said LAST tick
                 else:
                     zv[18] = 0.0
                     zv[19] = FAR
                     zv[20] = FAR
                     zv[21] = 0.0
                     zv[22] = 0.0
+                    zv[23] = 0.0
                 rdt[q] = zv[19]
                 vhave[q], vage[q] = _write_mem(zv, vn_obs, vslots[q], vhave[q],
                                                vage[q], vmem_cols, vw_col,
@@ -572,6 +579,8 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     elif u > A_MAX:
                         u = A_MAX
                     acc_v[q] = u
+                    if vpass:
+                        say_raw[q] = uv[1]
                     a = 0
                 else:
                     a = _argmax_out(uv, nAv)
@@ -734,6 +743,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             # ---- kinematics, red running ----------------------------------------
             n_ran = 0
             red_sum = 0.0
+            false_sum = 0.0
             green_sum = 0.0
             comfort_sum = 0.0
             # the traced car's OWN reward under the per-car reward, for the
@@ -757,6 +767,19 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 if q == ts:
                     r_me -= W_COMFORT * jerk * dt
                 gm = (not in_ar) and green[phase, m]
+                if vpass:
+                    # GATED: only a car on red and still short of the line by
+                    # less than PASS_GATE_D is saying anything at all. What it
+                    # says is read by every OTHER car on the next tick.
+                    d_pre = s_stop[m] - before
+                    if (not gm) and d_pre > 0.0 and d_pre <= PASS_GATE_D                             and say_raw[q] > 0.0:
+                        said[q] = 1.0
+                    else:
+                        said[q] = 0.0
+                    if car_r and said[q] > 0.5 and v[q] < QUEUE_V:
+                        false_sum += W_FALSE_PASS * dt
+                        if q == ts:
+                            r_me -= W_FALSE_PASS * dt
                 if before < s_stop[m] and s[q] >= s_stop[m]:
                     if gm:
                         green_sum += v[q] / V0
@@ -778,6 +801,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                         if q == ts:
                             r_me -= chg
             r -= (red_sum if car_r else R_RED * n_ran)
+            r -= false_sum
             if car_r:
                 r += R_GREEN * green_sum
                 r -= W_COMFORT * comfort_sum * dt

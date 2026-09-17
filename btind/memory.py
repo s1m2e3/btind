@@ -374,6 +374,12 @@ class MemBank:
         # partition the tree already carves.
         if self.b.get("head") == "argmax":
             return np.argmax(out, axis=1)
+        if self.b.get("head") == "pass":
+            # TWO OUTPUTS, ONE OF EACH KIND. Column 0 is the command the world
+            # clips to its range; column 1 is a logit whose SIGN is a
+            # declaration. Neither is normalised: a direction is meaningless
+            # here, and normalising would couple the two.
+            return out
         if self.b.get("head") in ("scalar", "duration"):
             # A CONTINUOUS LEAF: the affine score IS the command -- an
             # acceleration, a green time -- and the WORLD clips it to its

@@ -201,3 +201,53 @@ def test_signal_sees_speed_and_distance_and_kernel_agrees():
     gp, gk = _both(vb, sb, s)
     assert np.abs(gp - gk).max() < 1e-9, np.abs(gp - gk).max()
     assert np.abs(gk - IF.run(ENV, vb, sig_bank(), s, ENV.duration)).max() > 0
+
+
+def _pass_bank(env):
+    """A `pass`-head vehicle: column 0 the acceleration, column 1 the logit
+    whose sign declares "I am coming through"."""
+    N = list(env.names)
+    d = len(mem_names(N, None)) + 1
+    th = np.zeros((d, 2))
+    th[-1, 0] = 1.2                      # accelerate
+    # declare whenever the light is not green, which the GATE then narrows to
+    # "on red and inside PASS_GATE_D of the line" -- so the test exercises both
+    # the branch that speaks and the branch that is silenced
+    th[N.index("green"), 1] = -1.0
+    th[-1, 1] = 0.5
+    return check_arms(dict(names=N, laws_on_z=True, head="pass", clauses=[],
+                           laws=[], default=th, u_range=env.u_range), "b")
+
+
+def test_the_pass_head_is_exact_and_actually_speaks():
+    """The declaration is a second law output, a per-slot gate, an observation
+    column other cars read a tick later, and a charge for saying it and then
+    stopping. None of that is covered by the scalar or argmax heads, and every
+    piece of it has to agree between the kernel and the reference."""
+    env = IntersectionBatch(n_max=24, T_end=60.0, veh_head="pass",
+                            veh_reward="car")
+    vb = _pass_bank(env)
+    s = env.sample_starts(60, np.random.default_rng(5))
+    env.seed_kernels(5)
+    gk = IF.run(env, vb, None, s, env.duration, reward="car")
+    env.seed_kernels(5)
+    gp = env.python_rollout(vb, None, s)
+    assert np.abs(gp - gk).max() < 1e-9, np.abs(gp - gk).max()
+    assert np.isfinite(gp).all() and gp.std() > 0
+    # and something was actually declared: a head that never speaks would pass
+    # the equivalence above trivially
+    assert env._said is not None and env._said.sum() > 0
+
+
+def test_a_declaration_reaches_the_other_cars():
+    """`rival_pass` is the previous tick's broadcast, so a world where nobody
+    declares and one where somebody does must differ in that column."""
+    env = IntersectionBatch(n_max=24, T_end=60.0, veh_head="pass",
+                            veh_reward="car")
+    N = list(env.names)
+    s = env.sample_starts(40, np.random.default_rng(5))
+    env.seed_kernels(5)
+    env.python_rollout(_pass_bank(env), None, s)
+    heard = env.observe_vehicles(s)[:, N.index("rival_pass")]
+    assert "rival_pass" in N
+    assert heard.shape[0] == s.shape[0] * env.N
