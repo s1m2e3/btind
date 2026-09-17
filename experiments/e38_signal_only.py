@@ -368,7 +368,12 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # fresh sample too, so a small screen cannot be chased.
                cem_ep=screen_ep,
                # FIT LAWS BY VALUE, not only by picking from a vocabulary.
-               value_laws=VALUE_LAWS, value_ep=300)
+               value_laws=VALUE_LAWS, value_ep=300,
+               # GUARDS BY POPULATION SEARCH, priced by rollout like every
+               # other proposal. 0.7 s for 40 generations over 400 labelled
+               # rows, so it is close to free; whether it finds anything the
+               # greedy grower cannot is what the seed pool then settles.
+               evo_clauses=40, evo_generations=40, evo_arity=2)
 
     print("==== e38: the light alone, approach base %g..%g veh/h x skew %g..%g, "
           "%d episodes a test, %d demand groups"

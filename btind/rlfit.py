@@ -51,6 +51,8 @@ DEFAULTS = dict(
     kern_at=(), kern_cfg=None, critic=False, prior=None,
     # a local Q sample per round, and laws fitted by value against it
     value_laws=False, value_ep=300, value_min_rows=20, prior_k=None,
+    # guards proposed by population search over the value loss (`evotm`)
+    evo_clauses=0, evo_generations=40, evo_arity=2,
     stall_before_kick=2, kick_size=1, hop_budget=2,
     seed_stride=1009, val_seed=90210, val_ep=1200,
 )
@@ -274,6 +276,45 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                       "u* mean %.1f sd %.1f"
                       % (len(U_lq), lq["a0"].shape[1], 100 * pk,
                          U_lq.mean(), U_lq.std()), flush=True)
+        # GUARDS BY POPULATION SEARCH. Growing is greedy and monotone: it
+        # adds the one arm that pays now and never revisits a cut, so when the
+        # single-move neighbourhood is empty the search is finished. Measured
+        # on the tree this run reached, it is: all 401 distinct step candidates
+        # priced at the confirm count top out at -729.88, the best subtree
+        # confirm is +13.79 +-119.37, and refitting either law by value loses.
+        #
+        # `evotm.evolve_bank` searches a POPULATION of priority-ordered clause
+        # banks instead, with thresholds that drift continuously rather than
+        # being pinned to the quantile grid a tree grower picks once. It scores
+        # them by the M-weighted value loss -- the same labels the fitted law
+        # uses, which is why this could not be wired until they existed.
+        #
+        # ITS OUTPUT IS A PROPOSAL, NOT AN ANSWER. The clauses join the seed
+        # pool and every one is still priced by paired rollout before it enters
+        # the tree, exactly as `pipeline` used them. Nothing here is accepted
+        # because a surrogate liked it.
+        if cfg.get("evo_clauses") and labels is not None:
+            from .evotm import evolve_bank
+            U_all, M_all = labels
+            lab = np.abs(M_all.reshape(len(M_all), -1)).sum(1) > 1e-12
+            sv = [j for j in range(n_obs)
+                  if float(np.ptp(obs[lab][:, j])) > 1e-9]
+            try:
+                ev = evolve_bank(obs[lab], U_all[lab], M_all[lab], sv, names,
+                                 C=int(cfg["evo_clauses"]),
+                                 generations=int(cfg["evo_generations"]),
+                                 max_arity=int(cfg["evo_arity"]),
+                                 min_n=max(20, int(lab.sum()) // 20),
+                                 max_keep=16, seed=rseed, verbose=False)
+                seeds = list(ev["clauses"]) + list(seeds)
+                if verbose:
+                    print("  evolved %d guards from %d labelled rows "
+                          "(value loss %.1f -> %.1f)"
+                          % (len(ev["clauses"]), int(lab.sum()),
+                             ev["base"], ev["loss"]), flush=True)
+            except Exception as exc:                  # a proposal source may fail
+                if verbose:
+                    print("  evolution produced nothing (%s)" % exc, flush=True)
         hot = np.arange(len(cov), len(obs))
         if verbose and ex is not None:
             sm = EX.summary(ex, actions=bank.get("actions"))
