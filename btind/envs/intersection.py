@@ -455,7 +455,7 @@ class IntersectionBatch:
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
     OBS_VERSION = 10
-    REWARD_VERSION = 8          # part of the store key, like OBS_VERSION
+    REWARD_VERSION = 9          # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -1414,11 +1414,24 @@ class IntersectionBatch:
         before = stopped & (d_now > 0.0)
         led = has & (gap < QUEUE_GAP)
         past = stopped & ~(d_now > 0.0)          # stopped in or past the box
-        w_free = before & gm_eff & ~led
+        # A RED EXCUSES A STOP ONLY WHERE THE LIGHT CAN BE SEEN. The per-car
+        # reward has said so since it was written -- "stopped on red further
+        # back with nobody close ahead is stuck" -- and the code did not do it:
+        # `early` applied its ramp at any distance, so a car halted 79 m out,
+        # 19 m beyond the range at which `observe` hands it the signal at all,
+        # paid 1.6 a second instead of the 75 the same stop costs on green.
+        # Measured on the discovered car: 90.4% of its active car-ticks are
+        # stopped, 99.4% of those with no leader within QUEUE_GAP, at a median
+        # 79.0 m, and only 6.8% of them could see the light they were being
+        # excused by. Standing still beyond the zone is not waiting for a red,
+        # it is abandoning the approach, and it is charged as such.
+        seen = d_now <= NEAR_INT
+        w_free = before & ~led & (gm_eff | ~seen)
         w_queue = before & gm_eff & led
-        # stopped on red with nobody ahead: charged by the road left empty
-        # beyond a normal stopping zone, zero at the line and growing with it
-        early = np.where(before & ~gm_eff & ~led,
+        # stopped on red with nobody ahead, WHERE THE LIGHT IS VISIBLE: charged
+        # by the road left empty beyond a normal stopping zone, zero at the
+        # line and growing with it
+        early = np.where(before & ~gm_eff & ~led & seen,
                          np.maximum(d_now - STOP_ZONE, 0.0) / NEAR_INT, 0.0)
         scale = (W_STUCK_CAR / W_STUCK) if car else 1.0
         t_stuck = scale * dt * (W_STUCK_FREE * (w_free | past).sum(1)

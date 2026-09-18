@@ -134,3 +134,57 @@ def test_rival_dt_is_the_column_the_car_can_see():
     something unobservable."""
     from btind.envs.intersection import VEH_NAMES
     assert "rival_dt" in VEH_NAMES
+
+
+def test_a_red_does_not_excuse_a_stop_the_car_cannot_see():
+    """Beyond NEAR_INT `observe` hands the car no signal, so a red is no excuse.
+
+    The per-car reward has said this since it was written -- "a red excuses a
+    stop only within NEAR_INT of the line, where the light can be seen" -- and
+    `early` applied its by-degree ramp at any distance instead. Measured on the
+    discovered car: 90.4% of its active car-ticks stopped, 99.4% of those with
+    no leader, at a median 79.0 m, and only 6.8% of them able to see the light
+    they were being excused by. It paid 1.6 a second where the same stop on
+    green costs 75, which made halting every car at the entrance the best
+    policy the search could reach.
+    """
+    from btind.envs.intersection import (NEAR_INT, STOP_ZONE, W_STUCK,
+                                         W_STUCK_CAR, W_STUCK_EARLY,
+                                         W_STUCK_FREE)
+    sc = W_STUCK_CAR / W_STUCK
+    far, near = 79.0, 40.0
+    assert far > NEAR_INT >= near
+
+    # what the ramp WOULD have charged, and what a free-lane stop costs
+    ramp = lambda d: sc * W_STUCK_EARLY * max(d - STOP_ZONE, 0.0) / NEAR_INT
+    assert ramp(far) < 0.05 * sc * W_STUCK_FREE          # the hole, quantified
+    assert ramp(near) > 0.0                              # still charged, by degree
+
+
+def test_standing_still_is_now_the_worst_thing_a_car_can_do():
+    """The ranking the fix exists to correct, end to end.
+
+    Under the old charge a constant full brake beat every constant that moved.
+    Scored at 100 episodes on e39's world: full brake -82724, hold speed
+    -40136, gentle accel -30564, full throttle -29992, hand follower -8787.
+    """
+    import numpy as np
+    from btind.memory import MemBank
+    from btind.structure import score
+    from btind.envs.intersection import IntersectionBatch
+
+    env = IntersectionBatch(n_max=64, T_end=120, veh_reward="car",
+                            veh_head="pass", sig_head="duration",
+                            entry_v=(5.5, 11.0)).set_agent("vehicle")
+    zn = list(env.names)
+    d = len(zn) + 3
+
+    def const(a):
+        th = np.zeros((d, 2))
+        th[-1, 0] = a
+        return dict(clauses=[], laws=[], default=th, names=zn, laws_on_z=True,
+                    head="pass", u_range=tuple(env.u_range), actions=None)
+
+    pol = lambda b: MemBank(b, len(zn))
+    g = {a: score(env, const(a), pol, 24, 200, 3).mean() for a in (-4.5, 2.6)}
+    assert g[-4.5] < g[2.6]

@@ -909,6 +909,11 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                             w_st = W_STUCK_FREE
                         elif not red_q:
                             w_st = W_STUCK_QUEUE
+                        elif not led_q and d_q > NEAR_INT:
+                            # a red cannot excuse a stop the car cannot see:
+                            # beyond NEAR_INT `observe` hands it no signal at
+                            # all, so standing there is a free-lane stop
+                            w_st = W_STUCK_FREE
                         elif not led_q:
                             # by degree: the road left empty beyond a normal
                             # stopping zone, zero at the line
