@@ -128,12 +128,31 @@ STALL_BEFORE_KICK, KICK_SIZE, HOP_BUDGET = 2, 1, 2
 # under a class that can carry slopes -- silently, which is the single thing
 # the configuration guard exists to prevent.
 PRIOR, PRIOR_K, VALUE_LAWS = "sparse", 10, True
+# THE DECLARATION CHANNEL IS OFF. `pass` is the scalar head plus a logit whose
+# sign says "I am coming through", and measured on the round-2 tree it was
+# broadcast, received and ignored: no guard tested `rival_pass`, exactly one law
+# touched it, and that law owned 0.02% of rows. Cars saw a declaration on 4.47%
+# of observation rows and did nothing with it.
+#
+# IT IS INERT BECAUSE NOTHING PAYS A YIELDER, not because cars cannot hear each
+# other. Acting on a declaration means giving way, giving way costs the car that
+# does it, and no term returns that. So this is switched off rather than deleted
+# -- the head, the gate, `W_FALSE_PASS` and the `rival_pass` column all remain,
+# and one word here turns the channel back on if a yielding incentive is ever
+# added.
+#
+# WHAT SWITCHING IT OFF BUYS: every law goes from (d, 2) to (d, 1), which halves
+# the dimension CEM searches and the number of coefficients a prior has to
+# allocate. `say` is None on any other head, so the gate block never runs,
+# `rival_pass` reads 0 on every row, and both `scalar_primitives` (which skips a
+# column that does not move) and the pruning pass drop it without being told.
+VEH_HEAD = "scalar"
 
 
 def world(agent, cond=SPAN, groups=N_GROUPS):
     env = IntersectionBatch(n_max=N_MAX_EP, T_end=T_END, conditions=cond,
                             veh_reward="car", entry_v=(5.5, 11.0),
-                            veh_head="pass", sig_head="duration")
+                            veh_head=VEH_HEAD, sig_head="duration")
     env.n_cond_groups = groups
     return env.set_agent(agent)
 
@@ -169,6 +188,14 @@ def config_key():
     return dict(vehicle_only=True, span=list(SPAN["approach_vph"]),
                 skew=list(SPAN["approach_skew"]), groups=N_GROUPS,
                 t_end=T_END, n_max=N_MAX_EP, t_max=T_MAX,
+                # THE CAR'S HEAD BELONGS IN THE KEY and was missing while the
+                # signal's was here. Switching `veh_head` changes the WIDTH of
+                # every law -- `pass` is (d, 2), `scalar` is (d, 1) -- so a bank
+                # grown under one and resumed under the other is either a crash
+                # or, if the widths happen to line up, a controller whose every
+                # coefficient is attached to the wrong output. Exactly the
+                # silent law-class change the guard exists to catch.
+                veh_head=env.veh_head,
                 sig_head=env.sig_head, prior=PRIOR, prior_k=PRIOR_K,
                 value_laws=VALUE_LAWS,
                 obs=env.OBS_VERSION, reward=env.REWARD_VERSION)
