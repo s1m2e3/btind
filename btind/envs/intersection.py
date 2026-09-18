@@ -224,7 +224,23 @@ R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 200.0, 75.
 # The floor is not zero. There is a cost to running a red beyond the crash it
 # risks, and at R_RED=10 the discovered car ran 52 an episode and made the
 # signal's objective 49.5% its partner's law-breaking.
-R_RED_FLOOR, T_SAFE = 20.0, 3.0
+# T_SAFE IS THE GAP AT WHICH A CROSSING STOPS BEING CHARGED FOR RISK, and 3.0
+# was too generous. Measured on the discovered car, 253 red-runs an episode at
+# an average charge of 75.8, which inverts to a post-encroachment time of
+# 3 x (1 - (75.8 - 20)/(200 - 20)) = 2.1 s: it was routinely crossing two
+# seconds ahead of a conflicting movement and paying a third of the maximum for
+# it. In the PET literature 1 s is a serious conflict, 3 s is a conflict and 5 s
+# is the outer bound at which one is still counted -- so the old constant put
+# the whole charge to zero at the point where a traffic engineer would still be
+# recording an event. At 5.0 the same 2.1 s crossing pays 124.4 instead of 75.8.
+#
+# WHAT IS DELIBERATELY UNCHANGED: the floor, and the linearity. A crossing with
+# a genuinely clear junction still pays R_RED_FLOOR and nothing more, which is
+# the opportunistic pass this reward was rewritten to permit; and the ramp stays
+# linear in the gap rather than gaining an exponent, because everything else
+# here is charged BY DEGREE, NOT BY A CLIFF and a convex ramp would put an
+# infinite derivative right at the threshold.
+R_RED_FLOOR, T_SAFE = 20.0, 5.0
 # CHEAP TALK IS NOT FREE. A declaration that costs nothing is made by every car
 # at every red, and a channel everybody shouts on carries nothing. A car that
 # says it is coming and then stops pays this per tick it stays stopped -- the
@@ -455,7 +471,7 @@ class IntersectionBatch:
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
     OBS_VERSION = 10
-    REWARD_VERSION = 9          # part of the store key, like OBS_VERSION
+    REWARD_VERSION = 10         # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
