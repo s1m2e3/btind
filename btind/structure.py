@@ -25,6 +25,7 @@ from collections import OrderedDict
 
 import numpy as np
 
+from .collect import design_matrix
 from .memory import reindex
 
 from .policies import evaluate
@@ -131,6 +132,153 @@ STARTS_CAP = 256 * 1024 ** 2            # bytes of start states kept per world
 # it on with `structure.LOG_STEPS = True`.
 LOG_STEPS = False
 _steps = [0]
+
+
+def _executed(th, X, u_range, col):
+    """What the WORLD does with a law's output column, not what the law says.
+
+    Column 0 of a continuous head is clipped to the world's range before it is
+    executed, and on a `pass` head column 1 is a logit whose SIGN is the whole
+    message -- twice the logit is the same declaration. Comparing raw outputs
+    would call two identical controllers different.
+    """
+    v = X @ np.asarray(th, float)[:, col]
+    if col == 0 and u_range is not None:
+        return np.clip(v, float(u_range[0]), float(u_range[1]))
+    return (v > 0.0).astype(float)
+
+
+def fold_constants(law, X, tol=1e-9):
+    """A slope on a column the region never varies is a DISGUISED INTERCEPT.
+
+    `0.4 * a column that is always 3.0` is the constant 1.2, and dropping the
+    slope would change the command by exactly that. Folding it into the
+    intercept instead is behaviour-preserving to the last bit and leaves a law
+    that reads as what it is. It also lets the elimination below see the term
+    for what it is: after folding it is zero, not "live on every row".
+    """
+    law = np.array(law, float)
+    X = np.asarray(X, float)
+    if not len(X) or law.shape[0] != X.shape[1]:
+        return law
+    for j in range(law.shape[0] - 1):
+        if not np.abs(law[j]).max() > 1e-12:
+            continue
+        col = X[:, j]
+        c = float(col[0])
+        if float(np.abs(col - c).max()) <= tol:
+            law[-1] = law[-1] + law[j] * c
+            law[j] = 0.0
+    return law
+
+
+def dead_slopes(law, X, u_range, frac=0.0, cols=(0,)):
+    """Slopes that cannot move what the world executes, by backward elimination.
+
+    A COEFFICIENT IS NOT A RULE UNLESS IT CHANGES SOMETHING. Measured on the
+    car's tree, 14 of its 50 command slopes could be zeroed without moving one
+    row's command: the default arm carried ten and nine of them were inert,
+    with `lead_gap` doing all the work on 6317 of its 6321 rows. That is the
+    fixed-k prior filling its quota -- `constrain` keeps exactly `prior_k`
+    slopes whether the evidence supports ten or one -- and the surplus reads
+    as a rule the tree does not have.
+
+    WHY NOT L1, which is the obvious answer. A penalty on the fit residual
+    cannot see the clip, and the clip is precisely why these terms are dead:
+    the law asks for +3.04 where the world allows +2.60, so its slopes argue
+    about a command that never happens. L1 also only reaches the one law
+    source that goes through a regression -- CEM is a black-box rollout search
+    with nothing to attach a penalty to, and this test does not care where a
+    law came from.
+
+    `frac` is how much a term must MOVE to earn its place: 0 drops only what
+    is exactly inert, which cannot change behaviour on these rows at all.
+    Above 0 it also drops terms that are live on too few rows to be a rule --
+    on the car, six of arm1's ten moved 13 rows or fewer out of 50303.
+
+    Backward elimination rather than one pass, because at `frac` > 0 dropping
+    a term changes what the others are worth. Each step removes the single
+    least influential survivor while it is under the bar, which is at most
+    k(k+1)/2 matrix-vector products for k slopes.
+    """
+    law = np.asarray(law, float)
+    X = np.asarray(X, float)
+    if not len(X) or law.shape[0] != X.shape[1]:
+        return []
+    keep = np.array(law, float)
+    drop = []
+    alive = [j for j in range(law.shape[0] - 1)
+             if np.abs(law[j, list(cols)]).max() > 1e-12]
+    while alive:
+        base = [_executed(keep, X, u_range, c) for c in cols]
+        best = None
+        for j in alive:
+            th = np.array(keep, float)
+            th[j, list(cols)] = 0.0
+            moved = max(float((np.abs(_executed(th, X, u_range, c) - b) > 1e-9).mean())
+                        for c, b in zip(cols, base))
+            if best is None or moved < best[0]:
+                best = (moved, j)
+        if best[0] > frac:
+            break
+        keep[best[1], list(cols)] = 0.0
+        drop.append(int(best[1]))
+        alive.remove(best[1])
+    return sorted(drop)
+
+
+def prune_laws(bank, Z, frac=0.0, match_fn=None, fold=False):
+    """Every law in the bank, pruned on the rows that law actually owns.
+
+    An arm's law is judged on the rows that REACH it -- the rows matching its
+    clause that no arm above it already claimed -- because a term that matters
+    only where the arm never fires does not matter.
+
+    `Z` is in whatever layout the laws are sized for, which the caller knows
+    and this does not: `laws_on_z` decides it and the rows come from the round
+    that already built them.
+    """
+    from .landscape import _match_cols
+    match_fn = match_fn or _match_cols
+    u_range = bank.get("u_range")
+    Xd = design_matrix(np.asarray(Z, float))
+    n_out = np.shape(bank["default"])[1] if np.ndim(bank["default"]) > 1 else 1
+    cols = tuple(range(n_out))
+    done = np.zeros(len(Z), bool)
+    laws, n_drop = [], 0
+    for c, cl in enumerate(bank["clauses"]):
+        m = match_fn(cl, Z) & ~done
+        done |= m
+        th, n = _prune_one(bank["laws"][c], Xd[m], u_range, frac, cols, fold)
+        laws.append(th)
+        n_drop += n
+    dflt, n = _prune_one(bank["default"], Xd[~done], u_range, frac, cols, fold)
+    return dict(bank, laws=laws, default=dflt), n_drop + n
+
+
+def _prune_one(law, X, u_range, frac, cols, fold=False):
+    """Drop what cannot move the command; optionally fold disguised intercepts.
+
+    `fold` IS OFF BY DEFAULT and it is the one part of this that is not free.
+    Dropping an inert term is robust because "the clip already swallowed it"
+    holds well beyond the rows it was measured on; "this column is constant"
+    often holds only BECAUSE the coverage sample missed the variation, and
+    folding it into the intercept is then exact on those rows and wrong
+    everywhere else. Measured on the car: without folding, 15 slopes go for a
+    paired +0.00 +-0.00; with it, 21 go and the delta is -7.79 +-7.27, which
+    the non-inferiority gate rejects -- so folding buys six coefficients and
+    then loses the whole move.
+    """
+    th = np.array(law, float)
+    if not len(X):
+        return th, 0
+    before = int((np.abs(th[:-1]).max(axis=1) > 1e-12).sum())
+    if fold:
+        th = fold_constants(th, X)
+    for j in dead_slopes(th, X, u_range, frac, cols):
+        th[j, :] = 0.0
+    after = int((np.abs(th[:-1]).max(axis=1) > 1e-12).sum())
+    return th, before - after
 
 
 def distinct_laws(pool, Xd, u_range):

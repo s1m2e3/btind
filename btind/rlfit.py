@@ -37,8 +37,9 @@ from .memory import MemBank, emit, mem_names
 from .memsearch import discover as mem_discover, record
 from .escape import kick
 from .stepsearch import search_fails, search_steps
-from .structure import (absorb_universal, collapse_bottom, drop_arm,
-                         polish_thresholds, reorder, score, simplify)
+from .structure import (absorb_universal, accept, collapse_bottom, drop_arm,
+                         polish_thresholds, prune_laws, reorder, score,
+                         simplify)
 
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
@@ -51,6 +52,8 @@ DEFAULTS = dict(
     kern_at=(), kern_cfg=None, critic=False, prior=None,
     # a local Q sample per round, and laws fitted by value against it
     value_laws=False, value_ep=300, value_min_rows=20, prior_k=None,
+    # None disables the pass; 0 drops only what is provably inert
+    prune_frac=0.0,
     # guards proposed by population search over the value loss (`evotm`)
     evo_clauses=0, evo_generations=40, evo_arity=2,
     stall_before_kick=2, kick_size=1, hop_budget=2,
@@ -457,6 +460,36 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                             names=zn, verbose=verbose)
         if any(x["accepted"] for x in plog):
             rec["moves"].append("thresholds")
+        # A COEFFICIENT THAT CHANGES NOTHING IS NOT A RULE. Every slope that
+        # cannot move what the world EXECUTES is dropped -- the command after
+        # the clip, the declaration after its sign is taken. At `prune_frac` 0
+        # that is exactly the terms the clip has already made inert: measured
+        # on the car's tree, 15 of 60 went and the paired delta was +0.00
+        # +-0.00 on 300 episodes. Above 0 it also drops terms live on too few
+        # rows to be a rule, and that is no longer free -- 28 slopes at 0.005
+        # cost -57.6 +-42.9 and 36 at 0.05 cost -133.0 +-66.0 -- so the test
+        # below is what decides, not the threshold.
+        #
+        # HERE, after the laws and thresholds have settled and before the
+        # kernel stage, because a kernel point's prior mean IS the affine law
+        # underneath it.
+        #
+        # Priced as an EQUIVALENCE move: the honest expected delta is exactly
+        # zero, which a gain test rejects by construction.
+        if cfg.get("prune_frac") is not None and len(Z):
+            pruned, n_drop = prune_laws(bank, Z, frac=cfg["prune_frac"])
+            if n_drop:
+                ok, d, g = accept(env, pruned, pol_fn, cur, cfg["n_ep"],
+                                  cfg["T"], rseed, cfg["z"],
+                                  side="noninferior", margin=0.25)
+                if verbose:
+                    print("    pruned %d slope%s that cannot move the command "
+                          "(%+.2f)%s" % (n_drop, "" if n_drop == 1 else "s", d,
+                                         "" if ok else " -- rejected"),
+                          flush=True)
+                if ok:
+                    bank, cur = pruned, g
+                    rec["moves"].append("prune")
 
         # --- kernel-interpolation leaves: inducing points on the busiest laws --
         # Anchored where deviations paid, columns chosen by rollout, tuned by
