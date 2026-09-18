@@ -89,7 +89,16 @@ def cem_law(env, bank, arm, pol_fn, n_iter=4, K=64, elite_frac=0.25,
             print("      cem it %d: elite %.2f  best %.2f" % (it, trace[-1],
                                                               g.max()),
                   flush=True)
-    return mu, trace
+    # RETURN THE LAW THAT WAS SCORED. Every candidate is priced through
+    # `_with_law`, which puts it in the bank's law class, but `mu` is the mean
+    # of the RAW elites -- and under `prior="sparse"` the mean of differently
+    # sparse laws is dense. Measured on the car's bank: every arm obeyed the
+    # prior and the default alone carried 26 slopes where `constrain` keeps 4,
+    # because the cold start installs this return value directly with no
+    # `accept` in between. The search was optimising one object and handing
+    # back another.
+    from .kernlaw import constrain
+    return constrain(bank, mu), trace
 
 
 def improve_laws(env, bank, pol_fn, arms=None, cur=None, n_ep=400, T=400,

@@ -147,7 +147,26 @@ def _score(A, b, ridge=RIDGE):
         return float(b @ np.linalg.lstsq(A, b, rcond=None)[0])
 
 
-def fit_value_law(X, U, M, ridge=RIDGE, k=None):
+def _standardise(X):
+    """(C, S) such that (X - C) / S has unit-ish columns, intercept untouched.
+
+    Spread is the 10th-to-90th percentile range, the same robust scale
+    `lawsearch.scalar_primitives` uses to size a proportional term, falling
+    back to the standard deviation and then to 1 for a column that does not
+    move. The last column is the intercept and is left alone.
+    """
+    d = X.shape[1]
+    C, S = np.zeros(d), np.ones(d)
+    body = X[:, :-1]
+    if body.shape[1]:
+        sp = np.percentile(body, 90, axis=0) - np.percentile(body, 10, axis=0)
+        sd = body.std(axis=0)
+        sp = np.where(sp > 1e-9, sp, np.where(sd > 1e-9, sd, 1.0))
+        C[:-1], S[:-1] = np.median(body, axis=0), sp
+    return C, S
+
+
+def fit_value_law(X, U, M, ridge=RIDGE, k=None, sweep=None, lam=0.0):
     """Affine law minimising the M-weighted value loss. Returns theta (d, A).
 
     With `k`, the law is SPARSE: fit once, keep the k columns the fit leans on
@@ -159,24 +178,71 @@ def fit_value_law(X, U, M, ridge=RIDGE, k=None):
     and +104 at 4, 6 and 10, so ten named terms carry the whole gain.
 
     The intercept is never dropped: it is the constant a leaf falls back to.
+
+    IT SOLVES IN STANDARDISED COLUMNS and maps the answer back, so the returned
+    theta is in the caller's basis and means the same thing. At `lam` 0 that is
+    a pure reparameterisation -- the same minimiser, better conditioned -- and
+    nothing that does not ask for shrinkage changes.
+
+    `sweep` and `lam` are the shrinkage: with `sweep` the action's half-range, a
+    standardised slope of `sweep` is one whose 10th-to-90th sweep moves the
+    command across half the range, which is exactly the size
+    `scalar_primitives` picks for a proportional term. `lam` charges
+    (slope/sweep)^2 against the average curvature, so it is dimensionless and
+    penalises a law that only fits by asking for a command the world will clip.
+    WHY IT IS NEEDED: this fit sees only the rows carrying a local Q sample --
+    3-6% of them on the car -- and is then applied to the whole region, so
+    large cancelling coefficients that fit the sample extrapolate off the range
+    everywhere else. Measured on the car's own tree, the dense fit came out at
+    a raw -249.9 and every one of its 90.4% of rows emitted the full brake.
     """
     d = X.shape[1]
     nu = np.shape(M)[1]
+    # STANDARDISE OVER THE WHOLE REGION, SOLVE ON THE LABELLED ROWS. The scale
+    # belongs to the rows the law will be APPLIED to; the fit belongs to the
+    # rows that carry evidence. A zero-curvature row contributes exactly zero
+    # to A and to b -- that is how an unlabelled row is represented -- so
+    # dropping it before `_Ab` is the same answer for a fraction of the
+    # memory: `_Ab` materialises (n, A d, A d), which on a 178k-row region 27
+    # columns wide asked for 3.86 GiB and raised.
+    C, S = _standardise(X)
+    Xs_all = (X - C) / S
+    M = np.asarray(M, float)
+    keep = np.abs(M.reshape(len(M), -1)).sum(1) > 1e-12
+    if keep.all():
+        Xf, Uf, Mf = Xs_all, U, M
+    else:
+        Xf, Uf, Mf = Xs_all[keep], np.asarray(U, float)[keep], M[keep]
 
-    def solve(Xs):
-        Ai, bi = _Ab(Xs, U, M)
-        A = Ai.sum(0) + ridge * np.eye(nu * Xs.shape[1])
-        return np.linalg.solve(A, bi.sum(0)).reshape(Xs.shape[1], nu)
+    def solve(cols):
+        Xs = Xf[:, cols]
+        Ai, bi = _Ab(Xs, Uf, Mf)
+        A = Ai.sum(0) + ridge * np.eye(nu * len(cols))
+        if lam and sweep:
+            mu = float(np.trace(Mf.sum(0))) / nu
+            pen = lam * mu / float(sweep) ** 2
+            # the intercept is the constant a leaf falls back to: never charged
+            dg = np.repeat([0.0 if c == d - 1 else pen for c in cols], nu)
+            A = A + np.diag(dg)
+        return np.linalg.solve(A, bi.sum(0)).reshape(len(cols), nu)
 
-    th = solve(X)
+    def unstandardise(th_s, cols):
+        out = np.zeros((d, nu))
+        for r, c in enumerate(cols):
+            out[c] += th_s[r] / S[c]
+            out[d - 1] -= th_s[r] * C[c] / S[c]
+        return out
+
+    all_cols = list(range(d))
+    th_s = solve(all_cols)
     if k is None or k >= d - 1:
-        return th
-    lean = np.abs(th[:-1]).max(axis=1) * X[:, :-1].std(axis=0)
+        return unstandardise(th_s, all_cols)
+    # lean IS the standardised coefficient now: the old form multiplied the raw
+    # coefficient by the column's spread to reach the same quantity
+    lean = np.abs(th_s[:-1]).max(axis=1)
     cols = np.sort(np.argsort(-lean)[:max(0, int(k))])
-    idx = np.concatenate([cols, [d - 1]]).astype(int)
-    out = np.zeros((d, nu))
-    out[idx] = solve(X[:, idx])
-    return out
+    idx = [int(c) for c in cols] + [d - 1]
+    return unstandardise(solve(idx), idx)
 
 
 def best_value_split(X, U, M, Z, cand_vars, n_cand=48, min_frac=0.10,

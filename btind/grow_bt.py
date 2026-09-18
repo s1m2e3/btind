@@ -201,11 +201,18 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
     if structural:
         d_law, n_out = np.shape(arm_parent)
         head = bank.get("head", "vector" if n_out == 2 else "argmax")
-        if head in ("scalar", "duration"):
+        if head in ("scalar", "duration", "pass"):
             # A CONTINUOUS LEAF: constants across the world's range and
             # proportional terms, from `u_range` the world declares.
-            from .lawsearch import scalar_primitives
-            lo, hi = bank.get("u_range", (-1.0, 1.0))
+            #
+            # `pass` BELONGS HERE. It is the scalar head plus a declaration,
+            # and it was falling through to the argmax branch, whose +-1 on a
+            # raw column means "prefer k in proportion to j" -- a shape that
+            # says nothing about a command measured in m/s^2. Measured on the
+            # tree that came out of it, 97.4% of commands were on a clip and
+            # 90.4% of rows were at full brake (`pass_primitives`).
+            from .lawsearch import scalar_primitives, pass_primitives
+            lo, hi = bank.get("u_range") or (-1.0, 1.0)
             # SAMPLED TO `n_sample`, as the discrete branch below already is.
             # It was not, so `law_sample` -- which the subtree search sets to 10
             # precisely because it sweeps every threshold on the region's own
@@ -213,9 +220,11 @@ def _laws_for(bank, region, names, zn, obs, Z, labels, qhat, w, lib, arm_parent,
             # clauses with all 189 laws put one subtree stage at 65 minutes.
             # The constants are kept whole: there are five, and they are the
             # null a proportional term has to beat.
-            prim = list(scalar_primitives(zn, d_law, lo, hi,
-                                          Z=Z[region] if len(region) else Z
-                                          ).items())
+            Zr = Z[region] if len(region) else Z
+            prim = list((pass_primitives(zn, d_law, lo, hi, parent=arm_parent,
+                                         Z=Zr, rng=rng)
+                         if head == "pass" else
+                         scalar_primitives(zn, d_law, lo, hi, Z=Zr)).items())
             const = [p for p in prim if p[0].startswith("const[")]
             rest = [p for p in prim if not p[0].startswith("const[")]
             if n_sample and len(rest) > n_sample:

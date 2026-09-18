@@ -305,3 +305,79 @@ def search_laws(env, bank, names, pol_fn, cur_G=None, n_ep=600, T=400,
                 ("+%.2f" % max(l["delta"] for l in acc)) if acc
                 else "nothing beat the incumbent"), flush=True)
     return out, G, log
+
+
+def pass_primitives(names, d, lo, hi, parent=None, scales=(1.0, 0.1), Z=None,
+                    n_decl=8, rng=None):
+    """The law vocabulary for a continuous command that carries a declaration.
+
+    `pass` is the scalar head plus one more output: column 0 is the command the
+    world clips to [lo, hi], column 1 is a logit whose SIGN is "I am coming
+    through". Two outputs of different kinds, so a vocabulary for it is two
+    vocabularies, and a candidate moves ONE of them.
+
+    WHY IT IS NOT `discrete_primitives`, which is what this head was getting.
+    That vocabulary puts +-1 on a raw column -- "prefer action k in proportion
+    to column j" -- which is the right shape for an argmax head, where only the
+    ORDER of the outputs is ever read. Here column 0 is metres per second
+    squared. Measured on the tree this world reached under it: `+1.0*near_d`
+    with near_d at a median of 200 m is the CONSTANT +2.6 after clipping,
+    `+1.0*t_sig` with t_sig at -1 is the constant -1.0, the dense default came
+    out at a raw -249.9 and 97.4% of the whole tree's commands sat on a clip,
+    90.4% of rows at full brake. The search could not say anything between
+    flooring it and standing on the pedal, so that is the controller it found.
+
+    THE COMMAND TERMS are `scalar_primitives` unchanged: constants across
+    [lo, hi], and single-column terms centred and scaled so one column's
+    10th-to-90th sweep moves the command across half the range.
+
+    THE DECLARATION TERMS are the two constants -- never and always, since only
+    the sign is read, so a magnitude says nothing -- and single-column gates
+    `sgn * (col - median) / spread`, which cross zero at the column's median
+    and saturate over the same sweep. They are capped at `n_decl` because the
+    channel is measured INERT and rationally so: declaring costs the declarer
+    `W_FALSE_PASS` when it does not clear and buys it nothing, so never
+    declaring inside the gate is optimal and is what the tree learned (0.0%
+    declarations, the charge never levied once). It keeps a standing share
+    rather than none because the reward now prices a false declaration, so the
+    car may yet find a use for it, but it does not get half the budget.
+
+    `parent` is the law being perturbed. A command candidate keeps the parent's
+    declaration column and a declaration candidate keeps the parent's command,
+    so neither family silently switches the other off -- which on this head
+    would price a change to one output as a change to both.
+    """
+    par = (np.zeros((d, 2)) if parent is None
+           else np.asarray(parent, float).reshape(d, -1))
+    out = {}
+    for nm, th in scalar_primitives(names, d, lo, hi, scales=scales,
+                                    Z=Z).items():
+        t = np.zeros((d, 2))
+        t[:, 0], t[:, 1] = th[:, 0], par[:, 1]
+        out[nm] = t
+    decl = {}
+    for nm, v in (("never", -1.0), ("always", 1.0)):
+        t = np.zeros((d, 2))
+        t[:, 0] = par[:, 0]
+        t[-1, 1] = v
+        decl["decl:" + nm] = t
+    if Z is not None:
+        for j in range(min(len(names), np.shape(Z)[1])):
+            col = np.asarray(Z[:, j], float)
+            spread = float(np.percentile(col, 90) - np.percentile(col, 10))
+            if spread <= 1e-9:
+                continue                       # a flat column gates nothing
+            centre = float(np.median(col))
+            for sgn in (1.0, -1.0):
+                t = np.zeros((d, 2))
+                t[:, 0] = par[:, 0]
+                t[j, 1] = sgn / spread
+                t[-1, 1] = -sgn * centre / spread
+                decl["decl:%s%s" % ("+" if sgn > 0 else "-", names[j])] = t
+    keys = list(decl)
+    if n_decl is not None and len(keys) > n_decl:
+        r = rng or np.random.default_rng(0)
+        keys = [keys[i] for i in r.choice(len(keys), int(n_decl),
+                                          replace=False)]
+    out.update({k: decl[k] for k in keys})
+    return out

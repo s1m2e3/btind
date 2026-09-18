@@ -554,7 +554,10 @@ class IntersectionBatch:
 
     @property
     def actions(self):
-        if self.head in ("scalar", "duration"):
+        # `pass` has no discrete action set either: its column 0 is the same
+        # continuous command `scalar` emits. It was returning the argmax
+        # ACTIONS list, which a bank then stored and a law label read off.
+        if self.head in ("scalar", "duration", "pass"):
             return None
         return self.veh_actions if self.agent == "vehicle" else self.sig_actions
 

@@ -91,9 +91,12 @@ def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4, Z=None):
     d, n_out = parent.shape
     out = [("same", parent)]
     head = bank.get("head", "vector" if n_out == 2 else "argmax")
-    if head in ("scalar", "duration"):
-        from .lawsearch import scalar_primitives
-        lo, hi = bank.get("u_range", (-1.0, 1.0))
+    if head in ("scalar", "duration", "pass"):
+        # `pass` is the scalar head plus a declaration and takes the same
+        # vocabulary; it was falling through to the argmax branch below, whose
+        # unit coefficients on raw columns are constants after the clip.
+        from .lawsearch import scalar_primitives, pass_primitives
+        lo, hi = bank.get("u_range") or (-1.0, 1.0)
         # SAMPLED, as the discrete branch below already was. The vocabulary is
         # four laws per column -- two scales, both signs -- so it grows with the
         # observation: widening the signal from 24 to 46 columns took it from
@@ -101,7 +104,10 @@ def _law_pool(bank, zn, arm, rng, n_sample=40, n_perturb=4, sigma=0.4, Z=None):
         # The five constants are kept whole. They are the null a proportional
         # term has to beat, there are only five of them, and dropping one at
         # random would make the pool's floor depend on the draw.
-        prim = list(scalar_primitives(zn, d, lo, hi, Z=Z).items())
+        prim = list((pass_primitives(zn, d, lo, hi, parent=parent, Z=Z,
+                                     rng=rng)
+                     if head == "pass" else
+                     scalar_primitives(zn, d, lo, hi, Z=Z)).items())
         const = [p for p in prim if p[0].startswith("const[")]
         rest = [p for p in prim if not p[0].startswith("const[")]
         if len(rest) > n_sample:

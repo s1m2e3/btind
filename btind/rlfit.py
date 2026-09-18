@@ -116,6 +116,19 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         bank["names"] = list(names)
         from .memory import upgrade_layout
         bank = upgrade_layout(bank, names)
+        # WHAT A ROUND TRIP THROUGH JSON LOST. `u_range` was only ever written
+        # for the two heads named at the cold start, so a `pass` bank carried
+        # none and `kernlaw.bounds_of` -- which reads the BANK, with no env to
+        # fall back on -- returned None, leaving every kernel target unbounded.
+        # `prior_k` was not serialised at all, so a bank configured with 10
+        # named terms resumed at `constrain`'s default of 4, silently, which is
+        # the one thing the configuration guard exists to prevent.
+        if head in ("scalar", "duration", "pass") and not bank.get("u_range"):
+            bank["u_range"] = tuple(env.u_range)
+        if cfg.get("prior"):
+            bank["prior"] = cfg["prior"]
+        if cfg.get("prior_k"):
+            bank["prior_k"] = cfg["prior_k"]
         if verbose:
             print("  warm start: %d arms, stored G %.2f (%s, rank %d) | "
                   "run_seed %d" % (len(bank["clauses"]), meta["G"],
@@ -128,9 +141,15 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         # the search would then appear to have found.
         if head == "argmax":
             th0 = np.zeros((len(zn0) + 1, n_act))
-        elif head in ("scalar", "duration"):
-            # the null command for a continuous leaf: the middle of the range
-            th0 = np.zeros((len(zn0) + 1, 1))
+        elif head in ("scalar", "duration", "pass"):
+            # the null command for a continuous leaf: the middle of the range.
+            # `pass` carries a second output, the declaration logit, and its
+            # null is 0 -- "I am claiming nothing". It was falling to the
+            # `else` below and starting from a RANDOM dense 2-wide law, which
+            # on raw columns is a saturated command: the comment there says
+            # outright why a random init is an opinion the search would then
+            # appear to have found, and this head was getting one.
+            th0 = np.zeros((len(zn0) + 1, 2 if head == "pass" else 1))
             lo, hi = env.u_range
             th0[-1, 0] = getattr(env, "u_null", 0.5 * (lo + hi))
         else:
@@ -138,7 +157,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         seed_bank = dict(clauses=[], laws=[], default=th0, names=list(names),
                          laws_on_z=True, head=head, n_act=n_act,
                          actions=list(getattr(env, "actions", []) or []) or None)
-        if head in ("scalar", "duration"):
+        if head in ("scalar", "duration", "pass"):
             seed_bank["u_range"] = tuple(env.u_range)
         if cfg.get("prior"):
             seed_bank["prior"] = cfg["prior"]
