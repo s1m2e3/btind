@@ -83,9 +83,32 @@ VEHICLE = os.path.join(RUNS, "e37_final", "e37_best.json")
 # the train band from -130.4 to -99.0 against the fixed plan and the heavy band
 # from +99.5 to -321.5 in the same move, and was recorded as the best tree ever
 # found. It was selecting on one distribution and reporting on two.
-SPAN = dict(WIDE, approach_vph=(300.0, 800.0), approach_skew=(0.25, 1.75))
+# AND THE SAME LESSON AGAIN, ONE BAND UP. At 300-800 the tree beat the
+# hand-written follower on every band it was scored on -- train +4582.3
+# +-341.0, light +7721.5 +-117.8, heavy +610.3 +-346.1, the last confirmed at
+# +602.1 +-231.2 and +432.4 +-165.0 on two further seeds -- and then lost by
+# -1972.2 +-266.9 and -2695.3 +-223.9 at 700-900, half a band outside it.
+#
+# IT IS NOT THAT THE TREE BREAKS, IT IS THAT IT DOES NOT NOTICE. Measured
+# across the two bands, every arm fires within 2.6 points of the same share
+# and the mean command moves from +0.61 to +0.56, while ticks with a leader
+# inside 6 m grow 1.5% -> 2.4%. The arm that owns 27% of rows emits a flat
+# +2.60 -- "nothing is coming and I am within 30 m of the line, so go" -- and
+# at 300-800 the gap ahead is almost never small enough for that to cost
+# anything, so no paired test ever charges it. Widening the span is not more
+# variety for its own sake: it puts those episodes in the training sample, so
+# that arm starts LOSING, and the search gets a gradient to condition it on
+# `lead_gap`, which its vocabulary already has.
+#
+# THE SLOT COUNT DOES NOT MOVE. The busiest episode at 300-1000 holds 592 cars
+# against `N_MAX_EP` 704 (400 episodes sampled: min 61, median 268, p90 430),
+# so nothing is truncated and no rollout gets slower for it.
+SPAN = dict(WIDE, approach_vph=(300.0, 1000.0), approach_skew=(0.25, 1.75))
 # The band `update_best` and `credit` are scored on: the training span itself.
-MAIN_BAND = "train 300-800"
+MAIN_BAND = "train 300-1000"
+# Five over a wider span, deliberately: the per-demand-group veto in `accept`
+# splits the TRAINING distribution, so the top group is now 860-1000 and the
+# new territory is the one thing a move cannot quietly pay for.
 N_GROUPS = 5
 
 # AN EPISODE MUST HOLD TWO FULL CYCLES. At T_MAX=45 plus 3 s all-red a cycle of
@@ -203,9 +226,13 @@ def evaluate(vb, sb, n_ep=600, seed=999):
     # is exactly what went unseen while heavy demand sat outside the span.
     band = lambda a, b: (world("vehicle", cond=dict(SPAN, approach_vph=(a, b)))
                          .sample_starts(n_ep, np.random.default_rng(seed)))
+    # 600-800 STAYS, though it is no longer the top of the span, because it is
+    # the band the previous configuration was reported on and dropping it would
+    # break the comparison at the exact moment the world changed underneath it.
     sets = {MAIN_BAND: tgt.sample_starts(n_ep, np.random.default_rng(seed)),
             "light 300-500": band(300.0, 500.0),
-            "heavy 600-800": band(600.0, 800.0)}
+            "heavy 600-800": band(600.0, 800.0),
+            "peak 800-1000": band(800.0, 1000.0)}
     rows = {}
     for name, s in sets.items():
         R = lambda v, g: IF.run(tgt, v, g, s, tgt.duration, reward="car")

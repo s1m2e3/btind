@@ -582,13 +582,18 @@ def law_label(theta, bank):
     saying so is the difference between `Action(u = K x + b)` and `LANE_LEFT`.
     """
     th = np.asarray(theta)
-    if bank.get("head") in ("scalar", "duration"):
+    # `pass` IS A CONTINUOUS HEAD and was falling through to the generic label
+    # below, so a leaf commanding the bare constant -1.318 printed as
+    # `Action(u = K x + b)` -- no K, no x, and a `K` that means the affine gain
+    # matrix sitting one line away from the `K[...]` that means the kernel.
+    if bank.get("head") in ("scalar", "duration", "pass"):
         body, bias = th[:-1, 0], th[-1, 0]
+        what = {"duration": "Green"}.get(bank.get("head"), "Accel")
         nz = np.flatnonzero(np.abs(body) > 1e-9)
         if not len(nz):
-            return "%s(%.3g)" % ("Accel" if bank.get("head") == "scalar"
-                                 else "Green", bias)
-        return "%s(theta z)" % ("Accel" if bank.get("head") == "scalar" else "Green")
+            return "%s(%.3g)" % (what, bias)
+        return "%s(%.3g + theta z, %d term%s)" % (what, bias, len(nz),
+                                                  "" if len(nz) == 1 else "s")
     if bank.get("head") == "argmax":
         body, bias = th[:-1], th[-1]
         if not np.any(body) and np.count_nonzero(bias) == 1:
