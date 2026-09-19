@@ -1663,6 +1663,8 @@ class IntersectionBatch:
         else:
             r -= t_queue
         rear = act & has & (gap < 0.0)
+        # the same predicate `_leaders` splits its two lane groups on
+        _past_r = S > g["s_junc"][m] + 2.0
         conf = g["conf"][m[:, :, None], m[:, None, :]]
         idx = np.arange(N)
         conf[:, idx, idx] = False
@@ -1732,14 +1734,20 @@ class IntersectionBatch:
                              ("ttc", -t_ttc), ("ttc_lead", -t_ttc_l),
                              ("ttc_rival", -t_ttc_r), ("n_unavoidable", t_drac),
                              ("n_rear", n_rear.astype(float)),
-                             # WHERE a rear-end happened, because the two are
-                             # different failures: before the line it is
-                             # following on a shared approach lane, past it the
-                             # leader can be a car from ANOTHER movement that
-                             # has just merged onto the same exit edge
-                             # (`_leaders` spans both).
-                             ("n_rear_exit",
-                              (rear & (d_now <= 0.0)).sum(1).astype(float)),
+                             # WHERE a rear-end happened, on the SAME masks
+                             # `_leaders` pairs with -- not on the stop line,
+                             # which is 9.8 m short of the junction entry and
+                             # left a car past the line but still in its own
+                             # approach lane group counted as a merge.
+                             #   same_in   both short of s_junc + 2: following
+                             #             on a shared approach lane
+                             #   same_out  both past it: a shared exit edge,
+                             #             where the leader may come from
+                             #             another movement entirely
+                             ("n_rear_lane",
+                              (rear & ~_past_r).sum(1).astype(float)),
+                             ("n_rear_merge",
+                              (rear & _past_r).sum(1).astype(float)),
                              ("n_cross", n_cross.astype(float))):
                 self.terms[key] = self.terms.get(key, 0.0) + val
 
