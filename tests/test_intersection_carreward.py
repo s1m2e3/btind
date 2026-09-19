@@ -73,8 +73,22 @@ def test_stopping_is_no_refuge_and_the_ladder_exists():
     G = lambda b: IF.run(full, b, None, s, full.duration)
     stop, cruise, hand = G(B["stop"]), G(B["cruise"]), G(full.default_vehicle_bank())
     assert stop.mean() < cruise.mean() < hand.mean()
-    # at full demand the red stop alone is a disaster: cars behind it crash
-    assert _z(G(B["red"]), cruise) < -5
+    # AT FULL DEMAND THE RED STOP ALONE USED TO BE A DISASTER against cruise --
+    # cars behind it crash -- and REWARD_VERSION 12 deliberately ends that.
+    # Measured: red -16975.1, cruise -17860.8, z(red vs cruise) +1.47 where this
+    # once demanded < -5. All three changes push the same way. TTC charges
+    # `cruise` every tick it closes on a leader, and a bank that never brakes
+    # closes on everything; T_SAFE 3 -> 5 and W_CROSS_FAULT 2 -> 5 charge it for
+    # the reds it runs; and W_COMFORT 1.0 -> 0.25 stopped taxing the braking
+    # `red` does. The landscape is LESS deceptive than it was, which is a
+    # property worth recording rather than an assertion worth keeping.
+    #
+    # What replaces it is the claim the TTC term actually justifies, and it is
+    # far stronger than the old one: given the red stop, KEEPING A DISTANCE
+    # pays enormously, +51.26 sigma at full demand against +17.58 at mid.
+    assert _z(G(B["red_close"]), G(B["red"])) > 5
+    # and the piece alone is still nowhere near a controller: -58.09 sigma
+    assert _z(G(B["red"]), hand) < -5
     # AN EMPTY JUNCTION: the red stop no longer pays, and should not. A
     # crossing with nothing to conflict with costs `R_RED_FLOOR` and braking
     # for it costs delay and the rear-end it invites, so stopping is the worse

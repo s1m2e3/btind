@@ -116,9 +116,12 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             print("  transferred a bank from another world: %d arms, it scored "
                   "%.2f there" % (len(bank["clauses"]), meta["G"]), flush=True)
     if bank is not None:
-        bank["names"] = list(names)
+        # RELAYOUT BEFORE RENAMING. `upgrade_layout` reads the layout the bank
+        # was SAVED under from its own `names`, so overwriting them first threw
+        # that away and left a widened world looking like no change at all.
         from .memory import upgrade_layout
-        bank = upgrade_layout(bank, names)
+        bank = upgrade_layout(bank, names, old_names=bank.get("names"))
+        bank["names"] = list(names)
         # WHAT A ROUND TRIP THROUGH JSON LOST. `u_range` was only ever written
         # for the two heads named at the cold start, so a `pass` bank carried
         # none and `kernlaw.bounds_of` -- which reads the BANK, with no env to

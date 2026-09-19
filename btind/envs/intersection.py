@@ -257,12 +257,84 @@ PASS_GATE_D = 60.0
 # party; above 1.0 a pass that ends in a crossing costs MORE than the old
 # both-parties split, which is the "penalised double for crashing" that buys
 # the freedom to cross when it is safe.
-W_CROSS_FAULT = 2.0
+#
+# 2.0 WAS NOT DETERRING IT. Measured at peak demand on 6 episodes, the
+# discovered car takes 2.2 crossing collisions an episode and the hand-written
+# follower takes 0.0 -- the entire term is attributable to entering without the
+# right of way, which is the one behaviour this multiplier exists to price.
+# Rear-ends are nearly even over the same episodes (4.0 against 5.2), so this
+# is the part of the crash bill that belongs to passing and nothing else.
+#
+# A crossing collision is also qualitatively the worse event: two vehicles meet
+# at an angle at full approach speed, where a rear-end is a closing-speed
+# impact between cars already travelling the same way. 5.0 makes an at-fault
+# crossing cost 5000 against a rear-end's 1000.
+W_CROSS_FAULT = 5.0
 # COMFORT: each car's change of speed, squared, per car-second, normalised by
 # the braking limit -- a full-braking second costs W_COMFORT, a gentle stop at
 # half the rate a quarter of that per second. Measured on the discrete tree of
 # e35 cycle 0: every stop, for a red or for a leader, was full braking.
-W_COMFORT = 1.0
+# LOWERED, because it taxes the one thing that avoids a collision. The
+# discovered car pays 1235.8 an episode here against the follower's 548.3, and
+# every unit of it is charged for braking hard -- which is what a car must do
+# when a leader stops or a conflict appears. A regulariser on jerk is worth
+# keeping so a stop is a controlled one, but it should not be bidding against
+# the crash term.
+W_COMFORT = 0.25
+# TIME TO COLLISION, charged every tick a car is on a collision course.
+#
+# WHY A DENSE TERM WHEN THERE IS ALREADY A CRASH TERM. `R_COLL` is terminal and
+# rare: measured at peak demand the whole fleet takes 4.0 rear-ends and 2.2
+# crossings an episode out of ~409 cars, so a single car's crash probability is
+# about 1.5% and the gradient a paired rollout sees is mostly variance. TTC is
+# non-zero seconds before the event and on every tick of the approach, which is
+# what a controller can actually act on.
+#
+# TWO OF THEM, because a collision course has two geometries and one measure
+# cannot see both:
+#
+#   lead_ttc    gap / closing speed, the car-following case. `_leaders` spans
+#               the same approach lane BEFORE the box and the same exit edge
+#               past it, so this covers a leader that merged in from another
+#               movement as well as one that was always ahead.
+#   rival_ttc   two movements converging on a shared conflict point. NOT a
+#               leader/follower pair, so there is no gap along a lane to
+#               divide -- the construction is in `_conflict_ttc` and it is the
+#               time until the condition `cross` TESTS becomes true.
+#
+# THE SHAPE is the excess of inverse TTC over the threshold, `1/ttc - 1/T_TTC`,
+# which is zero at the threshold and grows without bound as the collision
+# approaches -- inverse TTC is the standard surrogate for exactly this reason.
+# `TTC_FLOOR` caps it, because a single tick at an arbitrarily small TTC would
+# otherwise dominate an episode.
+T_TTC, TTC_FLOOR = 3.0, 0.25
+# THE LEADER HALF IS CHARGED AT ZERO, and the column stays. Measured at peak
+# demand, both agents' TTC bills against their actual crash bills:
+#
+#                     disc        hand
+#     ttc_lead      -251.8   -16953.5     <- 67x the WRONG way
+#     ttc_rival    -1449.9       -2.5     <- 580x the right way
+#     crash        -5250.0    -5500.0     <- the outcome is even
+#     n_rear_exit       3.2        0.0
+#     n_unavoidable     0.0       82.8
+#
+# TTC assumes constant velocity, and 100% of the discovered car's rear-ends
+# happen PAST THE STOP LINE between two cars that are SEPARATING -- `_leaders`
+# hands a car on a shared exit edge a leader from another movement at whatever
+# gap the two happen to have. No constant-velocity surrogate can see that:
+# DRAC, which is the principled refinement, splits the same way 200x over
+# (`n_unavoidable` above, a diagnostic kept for exactly this reason).
+#
+# So a leader-side charge taxes the agent that FOLLOWS PROPERLY -- following
+# means closing on a leader to reach a following distance -- and exempts the
+# one that crashes. It made the incumbent look +5997 better against the hand
+# follower while changing nothing about safety. The exit merge is the defect
+# here, not the reward.
+#
+# `lead_ttc` remains in the observation because it costs nothing and a RATIO is
+# the one thing an affine law cannot build, so a guard on it is a rule the tree
+# could not otherwise express.
+W_TTC_LEAD, W_TTC_RIVAL = 0.0, 50.0
 
 ACCELS = np.array([-B_MAX, -1.5, 0.0, 1.0, A_MAX])
 ACTIONS = ["BRAKE_HARD", "BRAKE", "HOLD", "ACCEL", "ACCEL_MAX"]
@@ -342,7 +414,12 @@ VEH_NAMES = ["v", "d_stop", "near_int", "green", "t_sig", "t_sig_max", "all_red"
              #
              # It is the previous tick's broadcast, because every car observes
              # before any car acts, which is what a received message is.
-             "rival_pass"]
+             "rival_pass",
+             # APPENDED, NOT INSERTED. Every index from `n_near` on is
+             # written by hand in the fused kernel (`zv[15]` .. `zv[23]`),
+             # so a new column in the middle silently reattaches nine of
+             # them to the wrong quantity.
+             "lead_ttc", "rival_ttc"]
 # Per phase k, over the vehicles whose movement phase k serves and that are
 # approaching (0 < distance to the stop line < QUEUE_D):
 #   q<k>a q<k>b  how many are QUEUED (speed below QUEUE_V) on each of the two
@@ -470,8 +547,8 @@ class IntersectionBatch:
     # observation are never resumed on this one -- a checkpoint that learned
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
-    OBS_VERSION = 10
-    REWARD_VERSION = 10         # part of the store key, like OBS_VERSION
+    OBS_VERSION = 11
+    REWARD_VERSION = 12         # part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -980,6 +1057,59 @@ class IntersectionBatch:
         best = gap_t.min(2)
         return np.where(np.isfinite(best), best, FAR)
 
+    @staticmethod
+    def _cross_ttc(ok, d_me, d_rv, v_me, v_rv):
+        """Time until two conflicting movements would OCCUPY their shared point.
+
+        The collision test asks whether both vehicles are within `HALF_CONF` of
+        their own conflict point on the same tick. This is the time at which
+        that first becomes true under constant velocity -- so it predicts the
+        event the reward charges rather than proposing a separate idea of
+        danger.
+
+        Each vehicle occupies the point over [(d - HALF_CONF)/v,
+        (d + HALF_CONF)/v]. Overlapping intervals ARE a collision course, and
+        the contact begins when the later of the two arrives. Disjoint
+        intervals never touch and return infinity however narrow the miss --
+        which is the whole difference from `rival_dt`, an unsigned margin
+        between two POINT arrivals that is small and finite for a pair which
+        will physically clear, and equally small for one which will not.
+        """
+        in_me = np.maximum(d_me - HALF_CONF, 0.0) / v_me
+        out_me = (d_me + HALF_CONF) / v_me
+        in_rv = np.maximum(d_rv - HALF_CONF, 0.0) / v_rv
+        out_rv = (d_rv + HALF_CONF) / v_rv
+        course = ok & (in_me < out_rv) & (in_rv < out_me)
+        return np.where(course, np.maximum(in_me, in_rv), np.inf)
+
+    def _conflict(self, m, S, V, act):
+        """(rival_dt, rival_ttc) on one state -- the reward reads both."""
+        g = self.geom
+        x, y, _, _ = self._xy(m, S)
+        dx = x[:, None, :] - x[:, :, None]
+        dy = y[:, None, :] - y[:, :, None]
+        dist = np.sqrt(dx * dx + dy * dy)
+        eye = np.eye(S.shape[1], dtype=bool)[None]
+        inR = act[:, :, None] & act[:, None, :] & ~eye & (dist <= SENSE_R)
+        mq, mo = m[:, :, None], m[:, None, :]
+        d_me = g["s_cp"][mq, mo] - S[:, :, None]
+        d_rv = g["s_cp"][mo, mq] - S[:, None, :]
+        ok = inR & g["conf"][mq, mo] & (d_me > -HALF_CONF) & (d_rv > -HALF_CONF)
+        v_me = np.maximum(V[:, :, None], T_V_MIN)
+        v_rv = np.maximum(V[:, None, :], T_V_MIN)
+        t_me = np.maximum(d_me, 0.0) / v_me
+        t_rv = np.maximum(d_rv, 0.0) / v_rv
+        dt_ = np.where(ok, np.abs(t_rv - t_me), np.inf).min(2)
+        tc = self._cross_ttc(ok, d_me, d_rv, v_me, v_rv).min(2)
+        return (np.where(np.isfinite(dt_), dt_, FAR),
+                np.where(np.isfinite(tc), tc, FAR))
+
+    @staticmethod
+    def ttc_excess(ttc):
+        """`1/ttc - 1/T_TTC` above the threshold, floored so one tick cannot
+        dominate an episode. Zero at and beyond `T_TTC`."""
+        return np.maximum(1.0 / np.maximum(ttc, TTC_FLOOR) - 1.0 / T_TTC, 0.0)
+
     def _sense(self, m, S, V, act, gm, said):
         """The radius sensor's nine columns per slot (see VEH_NAMES)."""
         g = self.geom
@@ -1009,6 +1139,12 @@ class IntersectionBatch:
         t_me = np.maximum(d_me, 0.0) / np.maximum(V[:, :, None], T_V_MIN)
         t_rv = np.maximum(d_rv, 0.0) / np.maximum(V[:, None, :], T_V_MIN)
         gap_t = np.where(ok, np.abs(t_rv - t_me), np.inf)
+        # the MINIMUM over rivals is taken separately for each measure: the
+        # rival closest in arrival time is not always the one on a collision
+        # course, and it is the course that a TTC is about
+        r_ttc = self._cross_ttc(ok, d_me, d_rv,
+                                np.maximum(V[:, :, None], T_V_MIN),
+                                np.maximum(V[:, None, :], T_V_MIN)).min(2)
         jr = np.argmin(gap_t, 2)
         rbest = np.take_along_axis(gap_t, jr[:, :, None], 2)[:, :, 0]
         has_rival = np.isfinite(rbest)
@@ -1019,7 +1155,8 @@ class IntersectionBatch:
         return (n_near, np.where(has_near, best, FAR), closing, has_rival.astype(float),
                 np.where(has_rival, rbest, FAR), np.where(has_rival, r_d, FAR),
                 np.where(has_rival, r_red, 0.0), np.where(has_rival, r_v, 0.0),
-                np.where(has_rival, r_say, 0.0))
+                np.where(has_rival, r_say, 0.0),
+                np.where(np.isfinite(r_ttc), r_ttc, FAR))
 
     def _d_conf(self, m, s):
         """Distance to MY nearest conflict point still ahead: geometry only."""
@@ -1089,8 +1226,18 @@ class IntersectionBatch:
         o[:, :, 14] = X[:, 5:6]
         said = (self._said if self._said is not None
                 and np.shape(self._said) == S.shape else np.zeros_like(S))
-        for c_i, col in enumerate(self._sense(m, S, V, act, gm, said)):
+        sensed = self._sense(m, S, V, act, gm, said)
+        # THE SENSOR'S NINE STAY WHERE THEY WERE, at 15..23. The two TTC
+        # columns are appended at 24 and 25, so the tenth thing `_sense`
+        # returns is placed by hand rather than by the index of the loop.
+        for c_i, col in enumerate(sensed[:9]):
             o[:, :, 15 + c_i] = col
+        dvl = np.where(has, V - v_lead, 0.0)
+        # gap is clamped at zero: a pair already overlapping is at TTC 0, not
+        # at a negative time
+        o[:, :, 24] = np.where(has & (dvl > 1e-6) & (gap < 0.5 * FAR),
+                               np.maximum(gap, 0.0) / np.maximum(dvl, 1e-6), FAR)
+        o[:, :, 25] = sensed[9]
         o[~act] = 0.0
         return o.reshape(n * N, -1)
 
@@ -1379,14 +1526,42 @@ class IntersectionBatch:
         if car:
             # the gap the crossing car SAW, on the state it observed and acted
             # from -- pre-move, which is what `observe_vehicle` reads too
-            riv = self._rival_dt(m, before, v_pre, act)
+            riv, riv_ttc = self._conflict(m, before, v_pre, act)
             risk = np.clip(1.0 - riv / T_SAFE, 0.0, 1.0)
             red_c = np.where(ran, R_RED_FLOOR
                              + (R_RED_CAR - R_RED_FLOOR) * risk, 0.0)
             r -= red_c.sum(1)
+            # TIME TO COLLISION, charged every tick a car is on a course for
+            # one. Both on the PRE-MOVE state, so a car is charged by the
+            # number it observed and acted from -- the same rule the red
+            # charge follows, and the reason the rule that avoids the charge
+            # is one the tree can express.
+            # ON THE PRE-SPAWN SET, `was`, because a car that appeared this
+            # tick has not been driven yet and the kernel's per-slot loop skips
+            # it outright (`status != 1 or fresh`). Summing over the post-spawn
+            # set instead put the two paths 12.37 apart on one episode in
+            # twelve, which `test_intersection_equiv` did not reach.
+            has_p, gap_p, j_p = self._leaders(m, before, was)
+            dvl = np.where(has_p, v_pre - np.take_along_axis(v_pre, j_p, 1), 0.0)
+            l_ttc = np.where(has_p & (dvl > 1e-6) & (gap_p < 0.5 * FAR),
+                             np.maximum(gap_p, 0.0) / np.maximum(dvl, 1e-6), FAR)
+            t_ttc_l = dt * W_TTC_LEAD * np.where(was, self.ttc_excess(l_ttc),
+                                                 0.0).sum(1)
+            t_ttc_r = dt * W_TTC_RIVAL * np.where(was, self.ttc_excess(riv_ttc),
+                                                  0.0).sum(1)
+            t_ttc = t_ttc_l + t_ttc_r
+            r -= t_ttc
+            # DRAC, the deceleration a car would NEED to avoid its leader:
+            # diagnostic only for now, because it is the measure that tells
+            # benign closing from unavoidable closing and TTC does not
+            drac = np.where(has_p & (dvl > 1e-6) & (gap_p < 0.5 * FAR),
+                            dvl ** 2 / (2.0 * np.maximum(gap_p, 0.1)), 0.0)
+            t_drac = np.where(was & (drac > B_MAX), 1.0, 0.0).sum(1)
         else:
             r -= R_RED * ran.sum(1)
         t_comfort = np.zeros(n)
+        if not car:
+            t_ttc = t_ttc_l = t_ttc_r = t_drac = np.zeros(n)
         if car:
             crossed_g = was & (before < s_stop) & (S >= s_stop) & gm
             r += R_GREEN * np.where(crossed_g, V / V0, 0.0).sum(1)
@@ -1554,7 +1729,18 @@ class IntersectionBatch:
                              ("n_red", ran.sum(1).astype(float)),
                              ("exit", R_EXIT * out.sum(1)), ("left", -t_left),
                              ("comfort", -t_comfort),
-                             ("n_rear", n_rear.astype(float)), ("n_cross", n_cross.astype(float))):
+                             ("ttc", -t_ttc), ("ttc_lead", -t_ttc_l),
+                             ("ttc_rival", -t_ttc_r), ("n_unavoidable", t_drac),
+                             ("n_rear", n_rear.astype(float)),
+                             # WHERE a rear-end happened, because the two are
+                             # different failures: before the line it is
+                             # following on a shared approach lane, past it the
+                             # leader can be a car from ANOTHER movement that
+                             # has just merged onto the same exit edge
+                             # (`_leaders` spans both).
+                             ("n_rear_exit",
+                              (rear & (d_now <= 0.0)).sum(1).astype(float)),
+                             ("n_cross", n_cross.astype(float))):
                 self.terms[key] = self.terms.get(key, 0.0) + val
 
         # -- the message has been delivered to every car that OBSERVED from

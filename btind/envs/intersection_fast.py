@@ -30,7 +30,8 @@ from ..kernlaw import kern_args, law_out
 from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_args
 from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
                            QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_RED_FLOOR,
-                           R_STOP, STOP_ZONE, T_SAFE, W_CROSS_FAULT,
+                           R_STOP, STOP_ZONE, T_SAFE, T_TTC, TTC_FLOOR,
+                           W_CROSS_FAULT, W_TTC_LEAD, W_TTC_RIVAL,
                            PASS_GATE_D, W_FALSE_PASS,
                            W_CAR_DELAY, W_COMFORT, W_DELAY, W_OVER, COMMIT_D,
                            W_QUEUE, W_STUCK_CAR, W_STUCK_FREE, W_STUCK_QUEUE,
@@ -352,6 +353,10 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         # `rival_dt` kept per slot: `zv` is one reused scratch vector, and the
         # red-run charge below needs the gap the crossing car SAW this tick
         rdt = np.full(N, FAR)
+        # the same trick for both time-to-collision columns: the charge below
+        # reads the number the car SAW this tick, and `zv` is reused per slot
+        lttc = np.full(N, FAR)
+        rttc = np.full(N, FAR)
         pvx = np.zeros(N)
         pvy = np.zeros(N)
         uv = np.zeros(nAv)
@@ -490,8 +495,17 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 if event and near:
                     told[q] = 1.0              # heard, at observation time
                 zv[7] = gap
-                zv[8] = (v[q] - v[bj]) if has else 0.0
+                dvl = (v[q] - v[bj]) if has else 0.0
+                zv[8] = dvl
                 zv[9] = 1.0 if has else 0.0
+                # TIME TO COLLISION WITH THE LEADER: only while closing, and
+                # the gap floored at zero so an overlapping pair reads 0 and
+                # not a negative time
+                if has and dvl > 1e-6 and gap < 0.5 * FAR:
+                    zv[24] = (gap if gap > 0.0 else 0.0) / dvl
+                else:
+                    zv[24] = FAR
+                lttc[q] = zv[24]
                 zv[10] = d_conf
                 zv[11] = 1.0 if dirs[m] == 2 else 0.0
                 zv[12] = 1.0 if dirs[m] == 0 else 0.0
@@ -502,6 +516,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 near_best = 1e18
                 near_rate = 0.0
                 riv_best = 1e18
+                rttc_best = 1e18
                 riv_d = FAR
                 riv_o = -1
                 # THE OTHER QUADRATIC LOOP, and the dominant one: this runs per
@@ -538,6 +553,30 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                                 riv_best = gt
                                 riv_d = d_rv
                                 riv_o = o
+                            # A COLLISION COURSE, NOT A NEAR MISS. Each of the
+                            # two occupies its conflict point over an interval
+                            # of half-width HALF_CONF; overlapping intervals
+                            # are exactly the condition the crossing collision
+                            # test checks, and contact begins when the later
+                            # one arrives. Tracked on its OWN minimum: the
+                            # rival nearest in arrival time is not always the
+                            # one you are going to hit.
+                            vq = v[q] if v[q] > T_V_MIN else T_V_MIN
+                            vo = v[o] if v[o] > T_V_MIN else T_V_MIN
+                            i_me = (d_me - HALF_CONF) / vq
+                            if i_me < 0.0:
+                                i_me = 0.0
+                            o_me = (d_me + HALF_CONF) / vq
+                            i_rv = (d_rv - HALF_CONF) / vo
+                            if i_rv < 0.0:
+                                i_rv = 0.0
+                            o_rv = (d_rv + HALF_CONF) / vo
+                            if i_me < o_rv and i_rv < o_me:
+                                tc = i_me if i_me > i_rv else i_rv
+                                if tc < rttc_best:
+                                    rttc_best = tc
+                zv[25] = rttc_best if rttc_best < 1e17 else FAR
+                rttc[q] = zv[25]
                 zv[15] = n_near
                 if near_best < 1e17:
                     zv[16] = near_best
@@ -746,6 +785,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             false_sum = 0.0
             green_sum = 0.0
             comfort_sum = 0.0
+            ttc_sum = 0.0
             # the traced car's OWN reward under the per-car reward, for the
             # trace (a per-car value function needs it; G is unchanged)
             r_me = 0.0
@@ -800,11 +840,32 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                         red_sum += chg
                         if q == ts:
                             r_me -= chg
+                if car_r:
+                    # TIME TO COLLISION, every tick, on both geometries. The
+                    # excess of inverse TTC over the threshold, floored so one
+                    # tick at a vanishing TTC cannot dominate an episode.
+                    a = lttc[q]
+                    if a < TTC_FLOOR:
+                        a = TTC_FLOOR
+                    e_l = 1.0 / a - 1.0 / T_TTC
+                    if e_l < 0.0:
+                        e_l = 0.0
+                    b = rttc[q]
+                    if b < TTC_FLOOR:
+                        b = TTC_FLOOR
+                    e_r = 1.0 / b - 1.0 / T_TTC
+                    if e_r < 0.0:
+                        e_r = 0.0
+                    pen = W_TTC_LEAD * e_l + W_TTC_RIVAL * e_r
+                    ttc_sum += pen
+                    if q == ts:
+                        r_me -= pen * dt
             r -= (red_sum if car_r else R_RED * n_ran)
             r -= false_sum
             if car_r:
                 r += R_GREEN * green_sum
                 r -= W_COMFORT * comfort_sum * dt
+                r -= ttc_sum * dt
 
             # ---- collisions -----------------------------------------------------
             n_rear = 0

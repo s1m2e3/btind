@@ -498,28 +498,46 @@ def widen(bank, old_zn, new_zn):
                 laws_on_z=True)
 
 
-def upgrade_layout(bank, names):
+def upgrade_layout(bank, names, old_names=None):
     """Bring a stored bank onto the current column layout, by name.
 
-    A bank saved before `mem_age` existed has laws one column narrower than
-    `mem_names` now says; multiplying them by today's design matrix would
-    either raise or bind every coefficient past the slots to the wrong column.
-    The old layout is known -- names, V_hat, leverage, the slots, have_mem --
-    so the laws are relaid out by name and the new column is zero-filled.
+    Two ways a stored bank can be narrower than today's layout, and it used to
+    handle only the first:
+
+      THE BLACKBOARD GREW. A bank saved before `mem_age` existed has laws one
+      column short of what `mem_names` now says.
+
+      THE WORLD GREW. Adding an observation column widens the design matrix for
+      every bank, memory or not. `lead_ttc` and `rival_ttc` took the
+      intersection's car from 24 columns to 26, and the early return below --
+      `if not bank.get("mem")` -- sent every memoryless bank straight through
+      unchanged. A 27-row law against a 29-wide design matrix either raises or,
+      where the widths happen to line up, binds every coefficient past the new
+      column to the wrong quantity.
+
+    `old_names` is the layout the bank was SAVED under. It defaults to the
+    bank's own `names`, which is why the caller must not overwrite those first.
     """
-    if not bank.get("mem") or not bank.get("laws_on_z"):
+    if not bank.get("laws_on_z"):
         return bank
-    want = len(mem_names(names, bank["mem"])) + 1
+    old_names = list(old_names or bank.get("names") or names)
+    want = len(mem_names(names, bank.get("mem"))) + 1
     have = np.asarray(bank["default"]).shape[0]
     if have == want:
         return bank
-    old_zn = (base_names(names)
-              + ["mem_%s" % names[j] for j in bank["mem"]["cols"]] + ["have_mem"])
+    mem = bank.get("mem")
+    old_zn = mem_names(old_names, mem)
+    # the pre-`mem_age` layout, which is the same list one column shorter
+    if len(old_zn) + 1 != have and mem:
+        alt = (base_names(old_names)
+               + ["mem_%s" % old_names[j] for j in mem["cols"]] + ["have_mem"])
+        if len(alt) + 1 == have:
+            old_zn = alt
     if len(old_zn) + 1 != have:
-        raise ValueError("stored bank has %d law rows; neither the current "
-                         "layout (%d) nor the pre-age one (%d)"
-                         % (have, want, len(old_zn) + 1))
-    return widen(bank, old_zn, mem_names(names, bank["mem"]))
+        raise ValueError("stored bank has %d law rows; its own %d names give "
+                         "%d and the current layout wants %d"
+                         % (have, len(old_names), len(old_zn) + 1, want))
+    return widen(bank, old_zn, mem_names(names, bank.get("mem")))
 
 
 def without_memory(bank, names):
