@@ -1748,6 +1748,24 @@ class IntersectionBatch:
                               (rear & ~_past_r).sum(1).astype(float)),
                              ("n_rear_merge",
                               (rear & _past_r).sum(1).astype(float)),
+                             # WHICH FIX THE MERGE NEEDS. If a car crossing the
+                             # junction simply cannot SEE the queue on its exit,
+                             # the gaps it lives at once past are ordinary and
+                             # the answer is another observation column. If the
+                             # pairing itself hands it an unrecoverable state,
+                             # there is a mass of very tight gaps that no
+                             # controller could have avoided, and the answer is
+                             # `_leaders`. These count car-ticks past the
+                             # junction holding a leader, by how much room.
+                             ("n_merge_tick",
+                              (act & has & _past_r).sum(1).astype(float)),
+                             ("n_merge_lt5",
+                              (act & has & _past_r & (gap < 5.0)).sum(1).astype(float)),
+                             ("n_merge_lt2",
+                              (act & has & _past_r & (gap < 2.0)).sum(1).astype(float)),
+                             ("merge_gap_sum",
+                              np.where(act & has & _past_r & (gap < 0.5 * FAR),
+                                       gap, 0.0).sum(1)),
                              ("n_cross", n_cross.astype(float))):
                 self.terms[key] = self.terms.get(key, 0.0) + val
 
