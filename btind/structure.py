@@ -429,7 +429,11 @@ def heldout(env, bank, seeds=(11, 12, 13), n_ep=1000, T=None):
     gs = []
     for sd in seeds:
         env.seed_kernels(sd)
-        g = fast_rollout(env, bank, starts(env, n_ep, sd), T)
+        if hasattr(env, "score_bank"):       # a world that scores its own episodes
+            from .memory import MemBank
+            g = env.score_bank(bank, lambda b: MemBank(b, len(env.names)), starts(env, n_ep, sd), T)
+        else:
+            g = fast_rollout(env, bank, starts(env, n_ep, sd), T)
         if g is None:
             return None
         gs.append(g)
