@@ -124,6 +124,9 @@ class Weights:
 
 
 def _path(env, root=RUNS):
+    # A world may keep its store outside this repository (`store_root`), so a
+    # project that imports btind does not write into btind's own runs/.
+    root = getattr(env, "store_root", None) or root
     return os.path.join(root, "store", _key(env) + ".weights.json")
 
 

@@ -40,6 +40,14 @@ def score(env, bank, pol_fn, n_ep, T, seed):
     cannot run a bank whose guards read `V_hat` or `leverage` -- those need an
     xgboost predict and a critic solve per tick -- so those fall back silently.
     """
+    # A WORLD THAT SCORES ITS OWN EPISODES. A portfolio episode is many rows --
+    # one per stock -- sharing ONE return, so the generic `evaluate`, which
+    # returns a G per row, would hand the paired test N perfectly correlated
+    # copies of each episode and shrink its standard error by sqrt(N). Such a
+    # world returns one G per episode, on the same memoised starts, so common
+    # random numbers across a candidate pair are preserved.
+    if hasattr(env, "score_bank"):
+        return env.score_bank(bank, pol_fn, starts(env, n_ep, seed), T)
     g = _fast_score(env, bank, n_ep, T, seed)
     if g is not None:
         return g
