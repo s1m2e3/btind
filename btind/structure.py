@@ -456,6 +456,16 @@ def _fast_score_highway(env, bank, n_ep, T, seed):
     return _fast_score(env, bank, n_ep, T, seed)
 
 
+def adopted(env, bank):
+    """Tell a watching world that the search now HOLDS `bank`: after a grown arm, a refitted
+    law, a simplification, a pruning, the end of a round. Passing `accept` is not enough --
+    grow confirms several variants of one arm and keeps only the best. The world is told
+    after every phase, changed or not, and ignores a tree it already has."""
+    hook = getattr(env, "on_adopt", None)
+    if callable(hook):
+        hook(bank)
+
+
 def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
            margin=0.25):
     """Paired z-test. 'gain' demands improvement; 'noninferior' absence of loss.

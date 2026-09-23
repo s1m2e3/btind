@@ -53,7 +53,7 @@ import numpy as np
 from .collect import design_matrix
 from .evotm import Alphabet, _match, _rand_literal, dedupe_literals
 from .lawsearch import library, structural_primitives
-from .structure import accept, dedupe_screened, distinct_laws, score, ticker
+from .structure import accept, adopted, dedupe_screened, distinct_laws, score, ticker
 from .valuesplit import fit_value_law
 
 
@@ -523,6 +523,7 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                       % (k, min_gain, time.time() - t0), flush=True)
             break
         bank, last = best, best_cl
+        adopted(env, bank)
         claimed |= _match(best_cl, Z)
         if verbose:
             print("    arm %d: %-58s %+6.2f  [%.0fs]"

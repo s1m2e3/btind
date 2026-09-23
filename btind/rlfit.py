@@ -33,6 +33,7 @@ from . import valuesplit as VS
 from .betasearch import search_beta
 from .grow_bt import failure_states, grow
 from .lawcem import cem_law, improve_laws
+from .structure import adopted
 from .memory import MemBank, emit, mem_names
 from .memsearch import discover as mem_discover, record
 from .escape import kick
@@ -173,6 +174,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                         K=cfg["cem_K"], sigma0=cfg["cem_sigma"],
                         n_ep=cfg["n_ep"], T=cfg["T"], seed=cfg["seed"], rng=rng)
         bank = dict(seed_bank, default=th)
+        adopted(env, bank)
         if verbose:
             print("  cold start: default law by CEM, G %.2f"
                   % score(env, bank, pol_fn, cfg["n_ep"], cfg["T"],
@@ -427,6 +429,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         bank, cur, _ = simplify(env, bank, pol_fn, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=rseed, z=cfg["z"],
                                 names=zn, verbose=verbose)
+        adopted(env, bank)
         # BEFORE ANYTHING IS APPENDED, make sure the end of the tree is
         # reachable. A guard that matches every state turns its arm into a
         # second default and every arm below it into dead code -- which is
@@ -435,6 +438,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                                n_ep=cfg["n_ep"], T=cfg["T"],
                                                seed=rseed, z=cfg["z"],
                                                names=zn, verbose=verbose)
+        adopted(env, bank)
         if absorbed:
             rec["moves"].append("absorb")
         # A GUARD THAT IS A PASSENGER GOES. The bottom arm's law is offered
@@ -448,6 +452,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             if not did:
                 break
             rec["moves"].append("collapse")
+            adopted(env, bank)
         bank, cur, llog = improve_laws(env, bank, pol_fn, cur=cur,
                                        n_ep=cfg["n_ep"], T=cfg["T"],
                                        seed=rseed, z=cfg["z"],
@@ -461,6 +466,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                             n_ep=cfg["n_ep"], T=cfg["T"],
                                             seed=rseed, z=cfg["z"],
                                             names=zn, verbose=verbose)
+        adopted(env, bank)
         if any(x["accepted"] for x in plog):
             rec["moves"].append("thresholds")
         # A COEFFICIENT THAT CHANGES NOTHING IS NOT A RULE. Every slope that
@@ -493,6 +499,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                 if ok:
                     bank, cur = pruned, g
                     rec["moves"].append("prune")
+                    adopted(env, bank)
 
         # --- kernel-interpolation leaves: inducing points on the busiest laws --
         # Anchored where deviations paid, columns chosen by rollout, tuned by
@@ -653,6 +660,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
 
         bank, cur, _ = drop_arm(env, bank, pol_fn, cur, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=rseed, z=cfg["z"])
+        adopted(env, bank)
         rec["G_out"] = float(score(env, bank, pol_fn, cfg["n_ep"], cfg["T"],
                                    rseed).mean())
         rec["n_arms"] = len(bank["clauses"])
@@ -673,6 +681,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           flush=True)
                 bank = best_bank
                 rec["moves"].append("hop-abandoned")
+                adopted(env, bank)
         stalled = 0 if rec["moves"] else stalled + 1
         log.append(rec)
         # CHECKPOINT. A run killed in round 4 used to leave nothing behind, and
@@ -699,6 +708,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                   " -- reverting to the best bank held" % (final, best_V),
                   flush=True)
         bank = best_bank
+        adopted(env, bank)
 
     from .structure import heldout
     m = None
