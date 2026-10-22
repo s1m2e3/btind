@@ -53,7 +53,7 @@ import numpy as np
 from .collect import design_matrix
 from .evotm import Alphabet, _match, _rand_literal, dedupe_literals
 from .lawsearch import library, structural_primitives
-from .structure import accept, dedupe_screened, distinct_laws, score, ticker
+from .structure import accept, clears, dedupe_screened, distinct_laws, score, ticker
 from .valuesplit import fit_value_law
 
 
@@ -509,8 +509,10 @@ def grow(env, bank, names, zn, pol_fn, obs, Z, max_arms=6, pool=60,
                                    seed_c, z)
                 log.append(dict(arm=k, law=lname, pos=pos, screen=d, delta=dl,
                                 rows=nrow, clause=[l[:] for l in cl],
-                                accepted=bool(ok and dl > min_gain)))
-                if ok and dl > best_d:
+                                accepted=clears(ok, dl, min_gain)))
+                # a safer candidate below the bar may hold the slot until a
+                # candidate that clears it on return beats it (SAFER_ACCEPTS)
+                if clears(ok, dl, min_gain) and (best is None or dl > best_d):
                     best, best_d, best_cl = cand, dl, cl
                     desc = "%s -> %s @%d (%d rows)" % (
                         " AND ".join("%s%s%.3f" % (names[j] if j < len(names)

@@ -28,7 +28,7 @@ from numba import njit, prange
 
 from ..kernlaw import kern_args, law_out
 from ..tick import _fires, _tick, flatten, no_dev, no_trace, tick_args, world_args
-from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF,
+from .intersection import (A_MAX, ACCELS, B_MAX, FAR, FIXED_GREEN, HALF_CONF, TAIL_CONF,
                            QUEUE_GAP, R_GREEN, R_LEFT, R_RED_CAR, R_RED_FLOOR,
                            R_STOP, STOP_ZONE, T_SAFE, T_TTC, TTC_FLOOR,
                            W_CROSS_FAULT, W_TTC_LEAD, W_TTC_RIVAL,
@@ -137,7 +137,8 @@ def geometry(env):
             np.ascontiguousarray(g["n_vert"], np.int64))
 
 
-def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None, reward=None):
+def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None, reward=None,
+        stats=None):
     """Roll both trees from the states `s`. `signal_bank` None = fixed plan.
     `reward` "team" or "car" overrides the return the world would score.
 
@@ -157,7 +158,11 @@ def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None, reward=None)
                 continue
             tr = None if trace is None or trace.shape[0] != len(s) else trace[a:b]
             dv = None if dev is None or dev.shape[0] != len(s) else dev[a:b]
-            G[a:b] = run(env, v, g, s[a:b], T, tr, dv, reward)
+            sub = {} if stats is not None else None
+            G[a:b] = run(env, v, g, s[a:b], T, tr, dv, reward, sub)
+            if sub is not None:
+                for k, arr in sub.items():
+                    stats.setdefault(k, np.zeros(len(s)))[a:b] = arr
         return G
     if vehicle_bank is None:
         vehicle_bank = env.default_vehicle_bank()
@@ -170,12 +175,19 @@ def run(env, vehicle_bank, signal_bank, s, T, trace=None, dev=None, reward=None)
         fs = flatten(signal_bank, len(env.sig_names))
         use_sig = True
     G = np.empty(len(s))
+    st = np.zeros((len(s), 5))
     rollout(np.ascontiguousarray(s), params(env, vehicle_bank, signal_bank, reward),
-            *geometry(env), T, G,
+            *geometry(env), T, G, st,
             no_trace() if trace is None else trace,
             no_dev() if dev is None else dev,
             *world_args(fv), *world_args(fs), use_sig,
             tick_args(fv), tick_args(fs), kern_args(fv), kern_args(fs))
+    if stats is not None:
+        stats["rear"] = st[:, 0]
+        stats["cross"] = st[:, 1]
+        stats["v_sum"] = st[:, 2]
+        stats["v_cnt"] = st[:, 3]
+        stats["out"] = st[:, 4]
     return G
 
 
@@ -234,7 +246,7 @@ def _write_mem(z, n_obs_flagged, slots, have, age, mem_cols, w_col, w_thr, w_neg
 @njit(cache=True, parallel=True)
 def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             dirs, lane_group, to_edge, green, fixed_green, cps, appr, cum, pts, n_vert,
-            T, G,
+            T, G, stats,
             trace, dev,
             vlaws, vmem_cols, vw_col, vw_thr, vw_neg, vn_obs,
             slaws, smem_cols, sw_col, sw_thr, sw_neg, sn_obs, use_sig, vt, st,
@@ -394,6 +406,13 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
         ts = int(dev[i, 3]) if deviating else -1
         g = 0.0
         disc = 1.0
+        # EPISODE TOTALS FOR REPORTING, never for the return: crashes, the
+        # car-ticks they are counted against, and the speed those cars held
+        st_rear = 0.0
+        st_cross = 0.0
+        st_vsum = 0.0
+        st_vcnt = 0.0
+        st_out = 0.0
 
         for t in range(T_run):
             time_now = t * dt
@@ -433,18 +452,30 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 xq = path_len[m] - s[q]
                 best = 1e18
                 bj = 0
+                ebest = 1e18
+                ej = 0
                 for o in range(N):
                     if o == q or status[o] != 1.0:
                         continue
                     mr = mv[o]
                     past_r = s[o] > s_junc[mr] + 2.0
+                    # the exit queue, from ANY movement and wherever I am --
+                    # `_exit_ahead`, the observation half only
+                    if past_r and to_edge[mr] == to_edge[m]:
+                        xe = path_len[mr] - s[o]
+                        if xe < xq and xq - xe < ebest:
+                            ebest = xq - xe
+                            ej = o
                     if (not past_q) and (not past_r) and lane_group[mr] == lane_group[m]:
                         if s[o] > s[q]:
                             dd = s[o] - s[q]
                             if dd < best:
                                 best = dd
                                 bj = o
-                    if past_q and past_r and to_edge[mr] == to_edge[m]:
+                    # a leader on my exit, seen from the box or my own lane
+                    # too -- `_leaders`' `same_out`
+                    if past_r and to_edge[mr] == to_edge[m] and (
+                            past_q or s[q] > s_stop[m] or lane_group[mr] == lane_group[m]):
                         xr = path_len[mr] - s[o]
                         if xr < xq:
                             dd = xq - xr
@@ -545,7 +576,7 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     if conf[m, mo]:
                         d_me = s_cp[m, mo] - s[q]
                         d_rv = s_cp[mo, m] - s[o]
-                        if d_me > -HALF_CONF and d_rv > -HALF_CONF:
+                        if d_me > -TAIL_CONF and d_rv > -TAIL_CONF:
                             t_me = (d_me if d_me > 0.0 else 0.0) / (v[q] if v[q] > T_V_MIN else T_V_MIN)
                             t_rv = (d_rv if d_rv > 0.0 else 0.0) / (v[o] if v[o] > T_V_MIN else T_V_MIN)
                             gt = abs(t_rv - t_me)
@@ -566,16 +597,23 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                             i_me = (d_me - HALF_CONF) / vq
                             if i_me < 0.0:
                                 i_me = 0.0
-                            o_me = (d_me + HALF_CONF) / vq
+                            o_me = (d_me + TAIL_CONF) / vq
                             i_rv = (d_rv - HALF_CONF) / vo
                             if i_rv < 0.0:
                                 i_rv = 0.0
-                            o_rv = (d_rv + HALF_CONF) / vo
+                            o_rv = (d_rv + TAIL_CONF) / vo
                             if i_me < o_rv and i_rv < o_me:
                                 tc = i_me if i_me > i_rv else i_rv
                                 if tc < rttc_best:
                                     rttc_best = tc
                 zv[25] = rttc_best if rttc_best < 1e17 else FAR
+                if ebest < 1e17:
+                    eg = ebest - L_VEH
+                    zv[26] = eg if eg < FAR else FAR
+                    zv[27] = v[q] - v[ej]
+                else:
+                    zv[26] = FAR
+                    zv[27] = 0.0
                 rttc[q] = zv[25]
                 zv[15] = n_near
                 if near_best < 1e17:
@@ -926,6 +964,21 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                             if dd < best:
                                 best = dd
                                 bj = rr
+                    # and a leader already on my exit (`_leaders`' `same_out`);
+                    # a tie across the two buckets goes to the lower slot, as
+                    # argmin gives it
+                    in_box = s[q] > s_stop[m]
+                    ee = to_edge[m]
+                    for ri in range(edg_cnt[ee]):
+                        rr = edg_slots[ee, ri]
+                        if not in_box and lane_group[mv[rr]] != gg:
+                            continue
+                        xr = path_len[mv[rr]] - s[rr]
+                        if xr < xq:
+                            dd = xq - xr
+                            if dd < best or (dd == best and rr < bj):
+                                best = dd
+                                bj = rr
                 if best < 1e17:
                     has_lead[q] = True
                     lead_gap[q] = best - L_VEH
@@ -960,7 +1013,10 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     if v[q] < QUEUE_V:
                         d_q = d_now_q
                         red_q = in_ar or (not green[phase, m])
-                        led_q = has_lead[q] and lead_gap[q] < QUEUE_GAP
+                        # a queue is a leader that cannot move either: a leader
+                        # driving away leaves a stop unexcused (`intersection.py`)
+                        led_q = (has_lead[q] and lead_gap[q] < QUEUE_GAP
+                                 and v[lead_j[q]] < QUEUE_V)
                         # three cases, worst first: stopped on green with a free
                         # lane; stopped on green behind a queue that should be
                         # moving; stopped on red much too far short of the line
@@ -1009,6 +1065,10 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                 if sp_cnt[a4] > 0.0:
                     ms += sp_sum[a4] / sp_cnt[a4]
                     na += 1.0
+                # the FLEET mean wants every car weighted once, not every
+                # approach -- so the raw sums, not the per-approach means
+                st_vsum += sp_sum[a4]
+                st_vcnt += sp_cnt[a4]
             if na > 0.0 and not car_r:
                 r += W_SPEED * (ms / na) * dt
             r -= (W_CAR_DELAY if car_r else W_DELAY) * delay * dt
@@ -1045,15 +1105,16 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             for ai in range(n_act_s):
                 q = act_idx[ai]
                 m = mv[q]
-                if s[q] < cp_lo[m] - HALF_CONF or s[q] > cp_hi[m] + HALF_CONF:
+                if s[q] < cp_lo[m] - HALF_CONF or s[q] > cp_hi[m] + TAIL_CONF:
                     continue
                 for ri in range(ai + 1, n_act_s):
                     rr = act_idx[ri]
                     mr = mv[rr]
                     if not conf[m, mr]:
                         continue
-                    if abs(s_cp[m, mr] - s[q]) < HALF_CONF and \
-                            abs(s_cp[mr, m] - s[rr]) < HALF_CONF:
+                    dq = s_cp[m, mr] - s[q]
+                    dr = s_cp[mr, m] - s[rr]
+                    if -TAIL_CONF < dq < HALF_CONF and -TAIL_CONF < dr < HALF_CONF:
                         hit[q] = True
                         hit[rr] = True
                         if not ((not in_ar) and green[phase, m]):
@@ -1089,6 +1150,9 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
                     if q == ts:
                         r_me += R_EXIT
             r += R_EXIT * n_out
+            st_rear += n_rear
+            st_cross += n_cross
+            st_out += n_out
 
             if t + 1 >= duration:
                 n_left = 0
@@ -1107,3 +1171,8 @@ def rollout(states, p, path_len, s_stop, s_junc, s_spawn, s_exit, s_cp, conf,
             g += disc * r
             disc *= gamma
         G[i] = g
+        stats[i, 0] = st_rear
+        stats[i, 1] = st_cross
+        stats[i, 2] = st_vsum
+        stats[i, 3] = st_vcnt
+        stats[i, 4] = st_out

@@ -44,7 +44,7 @@ import numpy as np
 from .betasearch import beta_candidates, churn
 from .lawsearch import discrete_primitives, structural_primitives
 from .memory import check_arms
-from .structure import accept, dedupe_screened, distinct_laws, score, ticker
+from .structure import accept, clears, dedupe_screened, distinct_laws, score, ticker
 from .tick import law_of, n_steps_of
 
 
@@ -214,10 +214,10 @@ def search_steps(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_adv=16,
         for dlt, adv, alab, lname, th in rows[:n_confirm]:
             cand = with_step(bank, c, adv, th)
             ok, d, g = accept(env, cand, pol_fn, cur, confirm_ep, T, seed, z)
-            keep = bool(ok and d > min_gain)
+            keep = clears(ok, d, min_gain)
             log.append(dict(kind="step", arm=c, clause=adv, adv=alab, law=lname,
                             screen=dlt, delta=d, accepted=keep))
-            if keep and d > best_d:
+            if keep and (best is None or d > best_d):
                 best, best_d, best_lab = cand, d, "%s -> %s" % (alab, lname)
         if verbose:
             print("    steps on arm %d (share %.0f%%, %d steps): %s"
@@ -277,10 +277,10 @@ def search_fails(env, bank, zn, Z, pol_fn, cur_G=None, arms=None, n_try=24,
         for cl, label in cands:
             cand = with_fail(bank, c, cl)
             ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed, z)
-            keep = bool(ok and d > min_gain)
+            keep = clears(ok, d, min_gain)
             log.append(dict(kind="fail", arm=c, clause=cl, fail=label, delta=d,
                             accepted=keep))
-            if keep and d > best_d:
+            if keep and (best is None or d > best_d):
                 best, best_d, best_lab = cand, d, label
         if verbose:
             print("    fail on arm %d (share %.0f%%): %s"

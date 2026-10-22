@@ -134,6 +134,14 @@ GEOM_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 V0, A_MAX, B_MAX = 11.0, 2.6, 4.5
 L_VEH, W_VEH = 5.0, 1.8
 HALF_CONF = 0.5 * (L_VEH + W_VEH)      # occupancy half-width at a conflict point
+# A CAR STAYS ON A CONFLICT POINT UNTIL ITS BODY HAS CLEARED IT. `S` is the
+# front bumper, so a window of +-HALF_CONF about it released the point while
+# the car's rear was still over it. Held against SUMO's own collision detector
+# (experiments/sumo_bt.py --audit), crossings happened with a front bumper
+# 6.3 m past the point, where btind had already called it clear -- and
+# `rival_ttc` had stopped looking. Ahead of the bumper the window is unchanged;
+# behind it, it now runs a body length further.
+TAIL_CONF = HALF_CONF + L_VEH
 SPAWN_GAP = 8.0
 T_AR, T_MIN, T_MAX = 3.0, 5.0, 45.0
 # T_MAX IS THE CYCLE'S SCALE. Four phases at the cap plus all-red is a
@@ -240,7 +248,19 @@ R_STOP, R_GREEN, W_CAR_DELAY, R_RED_CAR, W_STUCK_CAR = 3.0, 2.0, 0.1, 200.0, 75.
 # linear in the gap rather than gaining an exponent, because everything else
 # here is charged BY DEGREE, NOT BY A CLIFF and a convex ramp would put an
 # infinite derivative right at the threshold.
-R_RED_FLOOR, T_SAFE = 20.0, 5.0
+#
+# THE FLOOR WAS STILL A FLAT FEE, AND IT DECIDED THE QUESTION. A red crossing of
+# a clear junction saves the wait -- W_CAR_DELAY 0.1/s x the 30-40 s left of a
+# red on the fixed plan's 92 s cycle, +3 to +4 -- and forgoes R_GREEN, -1 to -2.
+# Against a floor of 20 that nets about -18, so waiting ALWAYS won and gating
+# could not be learned: e39 round 5's red arm is `-4.687 + 0.019*rival_dt`,
+# which reads the cross traffic only to choose how hard to stop, and it ran 3.6%
+# of its crossings on red against the hand follower's 4.0% -- all-red entries,
+# not decisions. At 1 a clear crossing nets about +2 and stays just below
+# anything that saves nothing; a crossing inside T_SAFE of a rival still pays up
+# to R_RED_CAR, and `structure.CRASH_GATE` now refuses any move that crashes
+# more, which is the guard e34's 52 red-runs an episode did not have.
+R_RED_FLOOR, T_SAFE = 1.0, 5.0
 # CHEAP TALK IS NOT FREE. A declaration that costs nothing is made by every car
 # at every red, and a channel everybody shouts on carries nothing. A car that
 # says it is coming and then stops pays this per tick it stays stopped -- the
@@ -334,7 +354,15 @@ T_TTC, TTC_FLOOR = 3.0, 0.25
 # `lead_ttc` remains in the observation because it costs nothing and a RATIO is
 # the one thing an affine law cannot build, so a guard on it is a rule the tree
 # could not otherwise express.
-W_TTC_LEAD, W_TTC_RIVAL = 0.0, 50.0
+#
+# THE RIVAL HALF WAS TOO CHEAP TO BE WORTH LEARNING. At 50, a car on the green
+# with a rival under 3 s from contact was commanded to brake on 4% of those rows
+# (e39 round 4, 20 episodes): the arm that drives it on green reads its own
+# speed and nothing else, and at 0.16% of rows the charge it pays there did not
+# repay the search for a rival term. The lawful car carries none of the crash
+# (fault follows right of way), so this dense term is the ONLY price it sees for
+# driving into a red-runner. Tripled; the at-fault crossing still costs 5000.
+W_TTC_LEAD, W_TTC_RIVAL = 0.0, 150.0
 
 ACCELS = np.array([-B_MAX, -1.5, 0.0, 1.0, A_MAX])
 ACTIONS = ["BRAKE_HARD", "BRAKE", "HOLD", "ACCEL", "ACCEL_MAX"]
@@ -419,7 +447,21 @@ VEH_NAMES = ["v", "d_stop", "near_int", "green", "t_sig", "t_sig_max", "all_red"
              # written by hand in the fused kernel (`zv[15]` .. `zv[23]`),
              # so a new column in the middle silently reattaches nine of
              # them to the wrong quantity.
-             "lead_ttc", "rival_ttc"]
+             "lead_ttc", "rival_ttc",
+             # THE EXIT QUEUE, BEFORE THE MERGE. `_leaders` pairs a car with a
+             # vehicle on its exit edge only when that vehicle came from the
+             # same approach lane, or once the car itself is past the stop line.
+             # One that merged in from ANOTHER approach is invisible to a car
+             # still on its approach, and is handed to it as a leader in one
+             # tick when it crosses the line -- 83% of the discovered car's
+             # rear-ends were exactly that pair (commit 810a8db), at a gap no
+             # braking could recover. These two say it earlier:
+             #   exit_gap  bumper gap to the nearest vehicle already past the
+             #             junction on MY exit edge and ahead of me along it,
+             #             whatever movement it came from (FAR when none)
+             #   exit_dv   my speed minus its speed (0 when none)
+             # Information, not a leader: collisions and `lead_*` are unchanged.
+             "exit_gap", "exit_dv"]
 # Per phase k, over the vehicles whose movement phase k serves and that are
 # approaching (0 < distance to the stop line < QUEUE_D):
 #   q<k>a q<k>b  how many are QUEUED (speed below QUEUE_V) on each of the two
@@ -547,8 +589,8 @@ class IntersectionBatch:
     # observation are never resumed on this one -- a checkpoint that learned
     # to read elapsed time off `t_norm` must not warm-start a world where
     # `t_norm` carries nothing.
-    OBS_VERSION = 11
-    REWARD_VERSION = 12         # part of the store key, like OBS_VERSION
+    OBS_VERSION = 13          # 13: exit_gap, exit_dv -- the exit queue, seen before the merge
+    REWARD_VERSION = 16         # 16: R_RED_FLOOR 20 -> 1 (15: W_TTC_RIVAL 50 -> 150); part of the store key, like OBS_VERSION
 
     def __init__(self, n_max=64, T_end=150.0, dt=0.5, vph=(200.0, 60.0, 60.0),
                  gamma=0.999, spawn_back=90.0, exit_after=40.0, seed=0,
@@ -562,6 +604,24 @@ class IntersectionBatch:
                            if self.cond else "")
         assert veh_reward in ("team", "car")
         self.veh_reward = veh_reward
+        # WHERE THE EPISODES ARE DRAWN FROM, when that is not uniform over the
+        # demand span. `band_w` is a weight per equal sub-band of
+        # `approach_vph`; None draws as before, and the rng is consumed
+        # identically in that case so every stored result still reproduces.
+        # It is deliberately NOT part of `conditions`, the store key: the world
+        # is the same world, and a tree trained on a re-weighted batch is still
+        # judged on the uniform one (`credit`, the per-band report, the stored
+        # best). Weighting what the search proposes on is not a change to what
+        # counts as better.
+        self.band_w = None
+        # AND THE SAME FOR THE LEFT-TURN SHARE, on its own axis. Measured on
+        # e39's round-8 car at 200 episodes a point, the deficit against the
+        # hand follower IS the left share: +22.7 at 0.10-0.15, -2769.2 at
+        # 0.10-0.30, -10871.0 at 0.25-0.40, -14068.9 at 0.40-0.55, and it
+        # arrives as crossing collisions (0.96 -> 3.23 an episode while the
+        # follower holds 0.39 -> 0.40). The two draws are independent in
+        # `sample_starts`, so the weights are too.
+        self.left_w = None
         # ENTRY SPEEDS. By default every car enters at V0, so a cold start never
         # sees a slow car and cannot tell HOLD (keep this speed) from ACCEL:
         # measured, CEM picked HOLD on one seed in three, and a tree that brakes
@@ -711,6 +771,49 @@ class IntersectionBatch:
     def sample_states(self, n, rng):
         return self.sample_starts(n, rng)
 
+    def _draw_band(self, rng, U, key, weights, size=None):
+        """A draw from `cond[key]`: uniform, or uniform inside a sub-band chosen
+        by `weights`.
+
+        The band is drawn first and the value uniformly inside it, so the
+        marginal is a step function over the same range rather than a different
+        range -- everything the world contains stays reachable, which is what
+        keeps the per-group acceptance guard and the uniform judge meaningful.
+
+        ONE BAND AN EPISODE, not one per approach. Each approach draws its own
+        load and its own turn shares, and drawing them from different bands
+        would make every episode average out to the middle -- the busy episode,
+        or the left-heavy one, that this exists to produce would never occur.
+        """
+        if weights is None:
+            return U(key, size)
+        lo, hi = self.cond[key]
+        k = len(weights)
+        b = int(rng.choice(k, p=weights))
+        w = (hi - lo) / k
+        return rng.uniform(lo + b * w, lo + (b + 1) * w, size)
+
+    def _draw_vph(self, rng, U, size=None):
+        return self._draw_band(rng, U, "approach_vph", self.band_w, size)
+
+    @staticmethod
+    def _norm_w(w):
+        if w is None:
+            return None
+        w = np.asarray(w, float)
+        assert w.min() >= 0.0 and w.sum() > 0.0
+        return w / w.sum()
+
+    def set_band_weights(self, w):
+        """Weights over equal sub-bands of `approach_vph`, or None for uniform."""
+        self.band_w = self._norm_w(w)
+        return self
+
+    def set_left_weights(self, w):
+        """Weights over equal sub-bands of `left`, or None for uniform."""
+        self.left_w = self._norm_w(w)
+        return self
+
     def sample_starts(self, n, rng):
         """Episodes: a Poisson arrival schedule per movement, sorted by time.
 
@@ -736,10 +839,11 @@ class IntersectionBatch:
                 # its keep where the approaches disagree, so the skew has to
                 # vary at a fixed total and the total at a fixed skew.
                 if "approach_skew" in cd:
-                    q_app = float(U("approach_vph")) * U("approach_skew", 4)
+                    q_app = float(self._draw_vph(rng, U)) * U("approach_skew", 4)
                 else:
-                    q_app = U("approach_vph", 4)
-                sh_l, sh_r = U("left", 4), U("right", 4)
+                    q_app = self._draw_vph(rng, U, 4)
+                sh_l = self._draw_band(rng, U, "left", self.left_w, 4)
+                sh_r = U("right", 4)
                 share = np.stack([sh_r, 1.0 - sh_l - sh_r, sh_l], 1)   # by dirs r, s, l
                 rate = np.array([q_app[a] * share[a, int(dd)] for a, dd in
                                  zip(self.geom["appr"], self.geom["dirs"])]) / 3600.0
@@ -995,10 +1099,21 @@ class IntersectionBatch:
         lg = self.lane_group[m]
         te = g["to_edge"][m]
         past = s > g["s_junc"][m] + 2.0
+        inbox = s > g["s_stop"][m]
         x_out = g["path_len"][m] - s                       # distance to the end
         A = act[:, :, None] & act[:, None, :]
-        same_in = (lg[:, :, None] == lg[:, None, :]) & ~past[:, :, None] & ~past[:, None, :]
-        same_out = (te[:, :, None] == te[:, None, :]) & past[:, :, None] & past[:, None, :]
+        lg_eq = lg[:, :, None] == lg[:, None, :]
+        same_in = lg_eq & ~past[:, :, None] & ~past[:, None, :]
+        # A LEADER ON THE EXIT IS STILL A LEADER TO WHOEVER IS BEHIND IT ON THE
+        # WAY THERE. Both halves once needed the pair on the same side of
+        # `s_junc + 2`, so the car at the stop line lost the one it followed
+        # the tick that one cleared the box, and a car crossing it saw nothing
+        # on its exit until it was on it too. Held against SUMO's collision
+        # detector (sumo_bt.py --audit), every rear-end `lead_ttc` failed to
+        # predict was a pair inside that hole. The follower keeps the leader
+        # while it is in the box, or on the same approach lane.
+        same_out = ((te[:, :, None] == te[:, None, :]) & past[:, None, :]
+                    & (past[:, :, None] | inbox[:, :, None] | lg_eq))
         ahead_in = s[:, None, :] > s[:, :, None]
         ahead_out = x_out[:, None, :] < x_out[:, :, None]
         d_in = np.where(A & same_in & ahead_in, s[:, None, :] - s[:, :, None], np.inf)
@@ -1010,6 +1125,27 @@ class IntersectionBatch:
         best = np.take_along_axis(d, j[:, :, None], 2)[:, :, 0]
         has = np.isfinite(best)
         return has, np.where(has, best - L_VEH, FAR), j
+
+    def _exit_ahead(self, m, s, act):
+        """The nearest vehicle already past the junction on my exit edge and
+        ahead of me along it, from ANY movement -- the `same_out` half of
+        `_leaders` without its condition on where the follower is. Ordered by
+        distance to the path end, as `_leaders` orders a shared exit."""
+        n, N = s.shape
+        g = self.geom
+        te = g["to_edge"][m]
+        past = s > g["s_junc"][m] + 2.0
+        x_out = g["path_len"][m] - s
+        ok = (act[:, :, None] & act[:, None, :] & past[:, None, :]
+              & (te[:, :, None] == te[:, None, :])
+              & (x_out[:, None, :] < x_out[:, :, None]))
+        d = np.where(ok, x_out[:, :, None] - x_out[:, None, :], np.inf)
+        idx = np.arange(N)
+        d[:, idx, idx] = np.inf
+        j = np.argmin(d, axis=2)
+        best = np.take_along_axis(d, j[:, :, None], 2)[:, :, 0]
+        has = np.isfinite(best)
+        return has, np.where(has, np.minimum(best - L_VEH, FAR), FAR), j
 
     def _xy(self, m, S):
         """Position (x, y) in the plane and unit heading (hx, hy) of each slot,
@@ -1050,7 +1186,7 @@ class IntersectionBatch:
         mq, mo = m[:, :, None], m[:, None, :]
         d_me = g["s_cp"][mq, mo] - S[:, :, None]
         d_rv = g["s_cp"][mo, mq] - S[:, None, :]
-        ok = inR & g["conf"][mq, mo] & (d_me > -HALF_CONF) & (d_rv > -HALF_CONF)
+        ok = inR & g["conf"][mq, mo] & (d_me > -TAIL_CONF) & (d_rv > -TAIL_CONF)
         t_me = np.maximum(d_me, 0.0) / np.maximum(V[:, :, None], T_V_MIN)
         t_rv = np.maximum(d_rv, 0.0) / np.maximum(V[:, None, :], T_V_MIN)
         gap_t = np.where(ok, np.abs(t_rv - t_me), np.inf)
@@ -1068,7 +1204,7 @@ class IntersectionBatch:
         danger.
 
         Each vehicle occupies the point over [(d - HALF_CONF)/v,
-        (d + HALF_CONF)/v]. Overlapping intervals ARE a collision course, and
+        (d + TAIL_CONF)/v] -- until its body has cleared it. Overlapping intervals ARE a collision course, and
         the contact begins when the later of the two arrives. Disjoint
         intervals never touch and return infinity however narrow the miss --
         which is the whole difference from `rival_dt`, an unsigned margin
@@ -1076,9 +1212,9 @@ class IntersectionBatch:
         will physically clear, and equally small for one which will not.
         """
         in_me = np.maximum(d_me - HALF_CONF, 0.0) / v_me
-        out_me = (d_me + HALF_CONF) / v_me
+        out_me = (d_me + TAIL_CONF) / v_me
         in_rv = np.maximum(d_rv - HALF_CONF, 0.0) / v_rv
-        out_rv = (d_rv + HALF_CONF) / v_rv
+        out_rv = (d_rv + TAIL_CONF) / v_rv
         course = ok & (in_me < out_rv) & (in_rv < out_me)
         return np.where(course, np.maximum(in_me, in_rv), np.inf)
 
@@ -1094,7 +1230,7 @@ class IntersectionBatch:
         mq, mo = m[:, :, None], m[:, None, :]
         d_me = g["s_cp"][mq, mo] - S[:, :, None]
         d_rv = g["s_cp"][mo, mq] - S[:, None, :]
-        ok = inR & g["conf"][mq, mo] & (d_me > -HALF_CONF) & (d_rv > -HALF_CONF)
+        ok = inR & g["conf"][mq, mo] & (d_me > -TAIL_CONF) & (d_rv > -TAIL_CONF)
         v_me = np.maximum(V[:, :, None], T_V_MIN)
         v_rv = np.maximum(V[:, None, :], T_V_MIN)
         t_me = np.maximum(d_me, 0.0) / v_me
@@ -1135,7 +1271,7 @@ class IntersectionBatch:
         conf = g["conf"][mq, mo]
         d_me = g["s_cp"][mq, mo] - S[:, :, None]
         d_rv = g["s_cp"][mo, mq] - S[:, None, :]
-        ok = inR & conf & (d_me > -HALF_CONF) & (d_rv > -HALF_CONF)
+        ok = inR & conf & (d_me > -TAIL_CONF) & (d_rv > -TAIL_CONF)
         t_me = np.maximum(d_me, 0.0) / np.maximum(V[:, :, None], T_V_MIN)
         t_rv = np.maximum(d_rv, 0.0) / np.maximum(V[:, None, :], T_V_MIN)
         gap_t = np.where(ok, np.abs(t_rv - t_me), np.inf)
@@ -1238,6 +1374,9 @@ class IntersectionBatch:
         o[:, :, 24] = np.where(has & (dvl > 1e-6) & (gap < 0.5 * FAR),
                                np.maximum(gap, 0.0) / np.maximum(dvl, 1e-6), FAR)
         o[:, :, 25] = sensed[9]
+        e_has, e_gap, e_j = self._exit_ahead(m, S, act)
+        o[:, :, 26] = e_gap
+        o[:, :, 27] = np.where(e_has, V - np.take_along_axis(V, e_j, 1), 0.0)
         o[~act] = 0.0
         return o.reshape(n * N, -1)
 
@@ -1603,7 +1742,18 @@ class IntersectionBatch:
         ar_now = X[:, 2] > 0.5
         gm_eff = gm & ~ar_now[:, None]
         before = stopped & (d_now > 0.0)
-        led = has & (gap < QUEUE_GAP)
+        # A QUEUE IS A LEADER THAT CANNOT MOVE EITHER. `led` asked only for a
+        # leader within QUEUE_GAP, so a car standing still on green with the
+        # road ahead opening up was charged the queue rate of W_STUCK_QUEUE
+        # instead of the W_STUCK_FREE a pointless stop costs -- a third of the
+        # price for a standstill with no reason at all. Measured in SUMO on the
+        # round-8 car (700 veh/h, 35% left turns): of 289 car-seconds stopped,
+        # 27 had a green light and a clear road, and 17.8 of those came from one
+        # arm, `lead_gap<=28.930 -> Accel(-1.24)` -- a constant brake with no
+        # gap or closing term, which at rest keeps commanding brake and cannot
+        # release until its leader drifts past 28.9 m. Mean gap ahead while it
+        # held them there: 10.5 m, inside QUEUE_GAP, so it billed as a queue.
+        led = has & (gap < QUEUE_GAP) & (np.take_along_axis(V, j, 1) < QUEUE_V)
         past = stopped & ~(d_now > 0.0)          # stopped in or past the box
         # A RED EXCUSES A STOP ONLY WHERE THE LIGHT CAN BE SEEN. The per-car
         # reward has said so since it was written -- "stopped on red further
@@ -1671,8 +1821,8 @@ class IntersectionBatch:
         s_me = g["s_cp"][m[:, :, None], m[:, None, :]]
         s_rv = g["s_cp"][m[:, None, :], m[:, :, None]]
         both = (act[:, :, None] & act[:, None, :] & conf
-                & (np.abs(s_me - S[:, :, None]) < HALF_CONF)
-                & (np.abs(s_rv - S[:, None, :]) < HALF_CONF))
+                & (s_me - S[:, :, None] < HALF_CONF) & (s_me - S[:, :, None] > -TAIL_CONF)
+                & (s_rv - S[:, None, :] < HALF_CONF) & (s_rv - S[:, None, :] > -TAIL_CONF))
         cross = both.any(2)
         hit = rear | cross
         # each rear-end also removes the leader it hit

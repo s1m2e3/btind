@@ -76,7 +76,7 @@ import numpy as np
 from . import explore as EX
 from . import kernlaw as KL
 from .collect import design_matrix
-from .structure import accept, dedupe_screened, score, ticker
+from .structure import accept, clears, dedupe_screened, score, ticker
 from .tick import n_steps_of
 
 
@@ -328,8 +328,8 @@ def add_points(env, bank, c, k, cands, kern, pol_fn, cur, cfg, verbose=False,
             ok, d, g = accept(env, cand, pol_fn, cur, cfg["n_ep"], cfg["T"],
                               cfg["seed_c"], cfg["z"])
             log.append(dict(op="add", arm=c, step=k, screen=float(d_screen), src=src,
-                            delta=d, accepted=bool(ok and d > cfg["min_gain"])))
-            if ok and d > cfg["min_gain"] and (best is None or d > best[0]):
+                            delta=d, accepted=clears(ok, d, cfg["min_gain"])))
+            if clears(ok, d, cfg["min_gain"]) and (best is None or d > best[0]):
                 best = (d, j, kc, cand, g)
         if best is None:
             break
@@ -373,7 +373,7 @@ def cem_kernel(env, bank, c, k, kern, pol_fn, cur, cfg, rng, scale, y_sigma,
     kc = unpack(mu)
     cand = KL.with_kern(bank, c, k, kc)
     ok, d, g = accept(env, cand, pol_fn, cur, cfg["n_ep"], cfg["T"], cfg["seed_c"], cfg["z"])
-    keep = bool(ok and d > cfg["min_gain"])
+    keep = clears(ok, d, cfg["min_gain"])
     if verbose:
         print("      tune %d points on %s: %+.2f %s"
               % (M, _where(c, k), d, "accepted" if keep else "rejected"), flush=True)
@@ -581,7 +581,7 @@ def joint_sets(env, bank, joint, pol_fn, cur, cfg, verbose=False, top=2):
     log = []
     for d_screen, b, combo in rows[:cfg["n_confirm"] // 2 or 1]:
         ok, d, g = accept(env, b, pol_fn, cur, cfg["n_ep"], cfg["T"], cfg["seed_c"], cfg["z"])
-        keep = bool(ok and d > cfg["min_gain"])
+        keep = clears(ok, d, cfg["min_gain"])
         log.append(dict(op="add", arm=laws[0][0], step=0, screen=d_screen, delta=d,
                         src="joint", accepted=keep))
         if keep:

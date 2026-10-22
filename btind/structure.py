@@ -21,6 +21,7 @@ Three operators, one acceptance rule, and one asymmetry that matters:
 """
 import sys
 import time
+import weakref
 from collections import OrderedDict
 
 import numpy as np
@@ -40,8 +41,11 @@ def score(env, bank, pol_fn, n_ep, T, seed):
     cannot run a bank whose guards read `V_hat` or `leverage` -- those need an
     xgboost predict and a critic solve per tick -- so those fall back silently.
     """
-    g = _fast_score(env, bank, n_ep, T, seed)
+    st = {}
+    g = _fast_score(env, bank, n_ep, T, seed, stats=st)
     if g is not None:
+        if "rear" in st:
+            _remember_crashes(g, n_ep, T, seed, st["rear"] + st["cross"])
         return g
     env.seed_kernels(seed)
     if hasattr(env, "_search_bank"):
@@ -91,7 +95,7 @@ def kernel_for(env, bank):
     return None
 
 
-def fast_rollout(env, bank, s, T, trace=None, dev=None):
+def fast_rollout(env, bank, s, T, trace=None, dev=None, stats=None):
     """Roll `bank` from the states `s` on the fused kernel. Returns G, or None.
 
     `trace` and `dev` are the kernel's optional per-tick record and per-episode
@@ -109,8 +113,9 @@ def fast_rollout(env, bank, s, T, trace=None, dev=None):
         # joint round accepts on. Naming it here too would be a second place
         # for the two paths to disagree.
         if env.agent == "signal":
-            return IF.run(env, env.vehicle_bank, bank, s, T, trace, dev)
-        return IF.run(env, bank, env.signal_bank, s, T, trace, dev)
+            return IF.run(env, env.vehicle_bank, bank, s, T, trace, dev,
+                          stats=stats)
+        return IF.run(env, bank, env.signal_bank, s, T, trace, dev, stats=stats)
     from .tick import flatten, no_dev, no_trace, tick_args, world_args
     params, rollout = k
     f = flatten(bank, len(bank["names"]))
@@ -132,6 +137,82 @@ STARTS_CAP = 256 * 1024 ** 2            # bytes of start states kept per world
 # it on with `structure.LOG_STEPS = True`.
 LOG_STEPS = False
 _steps = [0]
+
+# A CHANGE MAY NOT BUY RETURN WITH CRASHES. The return already prices a crash,
+# but at a rate: 1000 an at-fault rear-end against a per-car return in the tens
+# of thousands, so a move that gains throughput and adds a crash on the SAME
+# episodes can clear the gain test -- and every one of them accepted is a tree
+# that crashes more than the one it replaced. So on top of the return test,
+# `accept` counts collisions (rear-ends + crossings, every car in the episode)
+# on the very episodes both banks were scored on, and a candidate whose total
+# exceeds the incumbent's by more than CRASH_TOL is rejected, whatever its return.
+# Paired, so no statistics: same starts, same seeds, same count or fewer.
+CRASH_GATE, CRASH_TOL = True, 0
+# AND FEWER CRASHES COUNT ON THEIR OWN. With the gate alone a crash removed was
+# worth only what the return charges for it, and every search stage then demands
+# a return gain of `min_gain` on top -- e39's first gated round turned away
+# candidates at 7->4 and 7->5 crashes because they gained +19 and +82 against a
+# bar of +100. A candidate that crashes STRICTLY less on the same episodes and
+# does not lose return on average (mean delta >= 0) is accepted and exempt from
+# the bar: `accept` passes it, and `clears` is how a stage asks whether an
+# accepted candidate may skip its `min_gain`. The demand-group veto still
+# applies, so no condition pays for another here either.
+SAFER_ACCEPTS = True
+_last = dict(safer=False)
+
+
+def clears(ok, d, bar):
+    """Did the candidate `accept` just judged clear a stage's `min_gain` bar --
+    by gaining more than it, or by crashing less at no cost (SAFER_ACCEPTS)?
+    Call it right after that `accept`."""
+    return bool(ok and (d > bar or _last["safer"]))
+# per-episode crash counts of recent scores, keyed by what was scored: the
+# returns array's CONTENTS and the (n_ep, T, seed) it was scored on -- so a
+# caller's copy of an incumbent's returns still finds its counts
+_crash_memo = OrderedDict()
+_CRASH_MEMO_N = 512
+# AND BY THE ARRAY ITSELF, for as long as it lives. The memo above is bounded,
+# and `grow` scores its incumbent once and then screens hundreds of candidates
+# (CEM included) before it confirms any: the incumbent's entry was evicted by
+# then, and every grow step of e39's first gated round logged "crashes
+# unchecked". An incumbent's returns are held by the caller for exactly as long
+# as they are compared against, so tying the counts to that object's lifetime
+# keeps them precisely as long as they can be asked for.
+_crash_live = {}
+
+
+def _forget_live(k, r):
+    e = _crash_live.get(k)
+    if e is not None and e[0] is r:
+        del _crash_live[k]
+
+
+def _crash_key(G, n_ep, T, seed):
+    G = np.ascontiguousarray(G, np.float64)
+    return (int(n_ep), None if T is None else int(T), int(seed), G.tobytes())
+
+
+def _remember_crashes(G, n_ep, T, seed, crashes):
+    c = np.asarray(crashes, float).copy()
+    if isinstance(G, np.ndarray):
+        i = id(G)
+        _crash_live[i] = (weakref.ref(G, lambda r, i=i: _forget_live(i, r)),
+                          (int(n_ep), None if T is None else int(T), int(seed)), c)
+    k = _crash_key(G, n_ep, T, seed)
+    _crash_memo[k] = c
+    _crash_memo.move_to_end(k)
+    while len(_crash_memo) > _CRASH_MEMO_N:
+        _crash_memo.popitem(last=False)
+
+
+def crashes_of(G, n_ep, T, seed):
+    """Per-episode collision counts behind a returns array from `score`, or
+    None when that array was not produced by a kernel score on these episodes."""
+    e = _crash_live.get(id(G))
+    if (e is not None and e[0]() is G
+            and e[1] == (int(n_ep), None if T is None else int(T), int(seed))):
+        return e[2]
+    return _crash_memo.get(_crash_key(G, n_ep, T, seed))
 
 
 def _executed(th, X, u_range, col):
@@ -429,11 +510,13 @@ def heldout(env, bank, seeds=(11, 12, 13), n_ep=1000, T=None):
     return dict(G=float(g.mean()), ci=float(1.96 * g.std() / np.sqrt(len(g))))
 
 
-def _fast_score(env, bank, n_ep, T, seed):
+def _fast_score(env, bank, n_ep, T, seed, stats=None):
     """Fused rollout, or None when this bank/world combination cannot use it."""
     if kernel_for(env, bank) is None:
         return None
     env.seed_kernels(seed)
+    if stats is not None and type(env).__name__ == "IntersectionBatch":
+        return fast_rollout(env, bank, starts(env, n_ep, seed), T, stats=stats)
     return fast_rollout(env, bank, starts(env, n_ep, seed), T)
 
 
@@ -464,6 +547,24 @@ def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
     _steps[0] += 1
     _step_row = (_steps[0], sys._getframe(1).f_code.co_name, int(n_ep),
                  float(d.mean()), float(se), side)
+    # the crash counts of both, on these same episodes (see CRASH_GATE)
+    n_new = n_ref = None
+    crash_txt = ""
+    if CRASH_GATE:
+        c_new = crashes_of(g, n_ep, T, seed)
+        c_ref = crashes_of(ref_G, n_ep, T, seed)
+        if c_new is not None and c_ref is not None and len(c_new) == len(c_ref):
+            n_new, n_ref = float(c_new.sum()), float(c_ref.sum())
+            crash_txt = "  crashes %d->%d" % (n_ref, n_new)
+        elif c_new is not None:
+            crash_txt = "  crashes unchecked (no count for the incumbent)"
+    # FEWER CRASHES AT NO COST IS A GAIN (see SAFER_ACCEPTS): a candidate that
+    # crashes strictly less on these episodes and does not lose return on
+    # average passes the gain test without having to show a return gain
+    safer = bool(SAFER_ACCEPTS and side == "gain" and n_new is not None
+                 and n_new < n_ref and d.mean() >= 0.0)
+    if safer:
+        ok = True
     # NO CONDITION MAY PAY FOR ANOTHER. On a world with a condition
     # distribution an average gain can hide a significant loss in light or in
     # heavy traffic; a move is rejected if any demand group loses by more than
@@ -477,12 +578,19 @@ def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
             if len(dg) > 5 and dg.mean() < -z * max(dg.std() / np.sqrt(len(dg)), 1e-12):
                 ok, worst = False, int(gi)
                 break
+    # NOR MAY IT CRASH MORE, on these same episodes (see CRASH_GATE)
+    crash_rej = False
+    if ok and n_new is not None and n_new > n_ref + CRASH_TOL:
+        ok, crash_rej = False, True
+    _last["safer"] = bool(ok and safer)
     if LOG_STEPS:
         n, who, nep, dm, sem, sd = _step_row
-        print("      step %5d  %-18s %4d ep  %+8.2f +-%5.2f  %-11s %s"
+        print("      step %5d  %-18s %4d ep  %+8.2f +-%5.2f  %-11s %s%s"
               % (n, who, nep, dm, sem, sd,
-                 "ACCEPT" if ok else ("reject: demand group %d loses" % worst
-                                      if worst is not None else "reject")),
+                 ("ACCEPT (fewer crashes)" if _last["safer"] else "ACCEPT") if ok else
+                 ("reject: more crashes" if crash_rej else
+                  "reject: demand group %d loses" % worst
+                  if worst is not None else "reject"), crash_txt),
               flush=True)
     return bool(ok), float(d.mean()), g
 
@@ -539,6 +647,91 @@ def drop_arm(env, bank, pol_fn, cur_G, n_ep=1000, T=200, seed=777, z=2.0,
         if ok:
             return cand, g, log
     return bank, cur_G, log
+
+
+def _loosen(a, b):
+    """The weakest conjunction implied by both guards, or None if there is none.
+
+    A literal is kept only where both guards test the SAME column the SAME way,
+    and its threshold moves to whichever of the two admits more: the lower bound
+    for `>`, the upper for `<=`. Literals one guard has and the other does not
+    are dropped -- keeping one would exclude the states the other owns, which is
+    the opposite of a merge. An empty result means the two share nothing, and a
+    guard of no literals matches every state, so that pair is refused rather
+    than turned into a second default (`absorb_universal` exists for arms that
+    have already become one).
+    """
+    out = []
+    for j, t, neg in a:
+        for j2, t2, neg2 in b:
+            if j2 == j and neg2 == neg:
+                out.append([j, (max(t, t2) if neg else min(t, t2)), neg])
+                break
+    return out or None
+
+
+def _law_gap(a, b):
+    """Relative distance between two laws, or inf when they are not comparable."""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if a.shape != b.shape:
+        return np.inf
+    scale = np.abs(a).sum() + np.abs(b).sum()
+    return float(np.abs(a - b).sum() / scale) if scale > 1e-12 else 0.0
+
+
+def merge_arms(env, bank, pol_fn, cur_G=None, n_ep=400, T=400, seed=777, z=2.0,
+               margin=0.25, max_pairs=8, verbose=True, names=None):
+    """Two arms that do the same thing in neighbouring regions, made one.
+
+    Every structural move in this file either REMOVES (`drop_arm`, `simplify`,
+    `collapse_bottom`) or NESTS (`search_subtrees`); nothing put two arms back
+    together, so a tree accumulates near-duplicates that no single move can
+    remove -- neither arm is droppable, because between them they own the
+    region. Measured on e39's round-8 car: `lead_dv>0.827 -> Accel(0.309)` and
+    `lead_dv>0.000 -> Accel(-0.765)` are one rule split at two thresholds, and
+    two arms share `rival_dt>3.640`.
+
+    PAIRS ARE TRIED IN ORDER OF HOW ALIKE THEIR LAWS ARE, since that is what
+    makes a merge plausible, and the guard is the loosening of the two. The test
+    is `drop_arm`'s: a merge is kept when the tree is no worse for it, never
+    because it is smaller. Compaction that preserves behaviour gains exactly
+    zero by construction, so a gain test could never accept one; what it buys is
+    that every later CEM sweep, threshold sweep and polish pass has one arm
+    fewer to iterate over, and one arm less surface to overfit.
+    """
+    from .memory import reindex
+    cl = bank["clauses"]
+    n = len(cl)
+    cur = (score(env, bank, pol_fn, n_ep, T, seed) if cur_G is None else cur_G)
+    log = []
+    pairs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            g = _loosen(cl[i], cl[j])
+            if g is None:
+                continue
+            pairs.append((_law_gap(bank["laws"][i], bank["laws"][j]), i, j, g))
+    pairs.sort(key=lambda p: p[0])
+    for gap, i, j, g in pairs[:max_pairs]:
+        if not np.isfinite(gap):
+            break
+        cand = reindex(bank, [k for k in range(n) if k != j])
+        cls = [[l[:] for l in x] for x in cand["clauses"]]
+        cls[i] = g                                  # j > i, so i keeps its index
+        cand = dict(cand, clauses=cls)
+        ok, d, gg = accept(env, cand, pol_fn, cur, n_ep, T, seed, z,
+                           side="noninferior", margin=margin)
+        log.append(dict(kind="merge", arms=(i, j), law_gap=gap, delta=d,
+                        accepted=bool(ok)))
+        if ok:
+            if verbose:
+                txt = " AND ".join("%s%s%.3f" % (names[c] if names else c,
+                                                 "<=" if ng else ">", t)
+                                   for c, t, ng in g)
+                print("    merge: arms %d and %d -> %s (%+.2f, law gap %.2f)"
+                      % (i, j, txt, d, gap), flush=True)
+            return cand, gg, log
+    return bank, cur, log
 
 
 def reorder(env, bank, pol_fn, cur_G, match_fn, Z, n_ep=1000, T=200, seed=777,
@@ -759,8 +952,8 @@ def polish_thresholds(env, bank, pol_fn, Z, cur_G=None, n_ep=400, T=400,
                         ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed,
                                           z)
                         log.append(dict(arm=c, lit=k, thr=float(new), delta=d,
-                                        accepted=bool(ok and d > min_gain)))
-                        if ok and d > best_d:
+                                        accepted=clears(ok, d, min_gain)))
+                        if clears(ok, d, min_gain) and (best is None or d > best_d):
                             best, best_d, best_g, best_thr = cand, d, g, new
                 if best is not None:
                     if verbose:

@@ -64,7 +64,12 @@ _STALE = pytest.mark.xfail(reason=(
     "written around."), strict=True)
 
 
-@_STALE
+# BACK SINCE REWARD_VERSION 16 AND SAFER_ACCEPTS. Measured on this world: the
+# search gains +95.00 (-113.87 -> -18.86) with an anchor set on (rival_ttc,
+# green). With `structure.SAFER_ACCEPTS` off it still gains +82.84 -- the rival
+# TTC charge at 150 gives the leaf something to buy -- but on (rival_ttc,
+# d_stop), and never reads the light. Fewer crashes at no loss of return is what
+# lets the red-stop point in, so the planted rule is learnable again.
 def test_discrete_leaf_learns_a_red_stop_point():
     g0, g1, kern, N = _run("argmax")
     assert g1 > g0 + 10.0

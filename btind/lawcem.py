@@ -29,7 +29,7 @@ would wave through anything.
 """
 import numpy as np
 
-from .structure import accept, score
+from .structure import accept, clears, score
 
 
 def _with_law(bank, arm, th):
@@ -122,7 +122,7 @@ def improve_laws(env, bank, pol_fn, arms=None, cur=None, n_ep=400, T=400,
                             rng=rng, verbose=verbose, **cem_kw)
         cand = _with_law(bank, arm, th)
         ok, d, g = accept(env, cand, pol_fn, cur, n_ep, T, seed, z)
-        keep = bool(ok and d > min_gain)
+        keep = clears(ok, d, min_gain)
         log.append(dict(arm=int(arm), delta=d, accepted=keep, trace=trace))
         if keep:
             bank, cur = cand, g

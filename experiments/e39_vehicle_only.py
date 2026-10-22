@@ -64,7 +64,9 @@ from btind.escape import kick
 from btind.memory import MemBank
 from btind.rlfit import fit
 from btind.memory import emit
-from btind.runlog import RUNS, bank_from_json, bank_json
+from btind.runlog import RUNS, bank_json
+from btind.runlog import bank_from_json as _bank_from_json
+from btind.memory import upgrade_layout
 from btind.envs import intersection_fast as IF
 
 from experiments.e35_condition_cycle import N_MAX, actuated
@@ -103,7 +105,26 @@ VEHICLE = os.path.join(RUNS, "e37_final", "e37_best.json")
 # THE SLOT COUNT DOES NOT MOVE. The busiest episode at 300-1000 holds 592 cars
 # against `N_MAX_EP` 704 (400 episodes sampled: min 61, median 268, p90 430),
 # so nothing is truncated and no rollout gets slower for it.
-SPAN = dict(WIDE, approach_vph=(300.0, 1000.0), approach_skew=(0.25, 1.75))
+# THE LEFT SHARE IS WHERE THE CAR ACTUALLY LOSES, so it is now trained over a
+# range wide enough to contain the states that expose it. Measured on round 8's
+# car, 200 episodes a point, against the hand follower on the same episodes:
+#
+#     left share    300-1000      800-1000     its crossings   the follower's
+#     0.10-0.15        +22.7       -4969.8          0.96             0.39
+#     0.10-0.30      -2769.2      -13489.4          1.53             0.42
+#     0.25-0.40     -10871.0      -27810.4          2.88             0.57
+#     0.40-0.55     -14068.9      -31432.6          3.23             0.40
+#
+# AT A LOW LEFT SHARE THE DISCOVERED CAR IS THE FOLLOWER'S EQUAL, +22.7 on 200
+# episodes, and it moves more traffic doing it. The whole deficit arrives as
+# crossing collisions on left turns -- its own rise 3.4x with the share while
+# the follower, which stops on red, does not move. Under 0.1-0.3 drawn
+# uniformly half the episodes sat below 0.2, where the weakness barely shows,
+# so nothing ever charged the car for the one competence it lacks. The range
+# widens; `focus` then decides how much of the batch goes there, which is the
+# part the search gets to answer for itself.
+SPAN = dict(WIDE, approach_vph=(300.0, 1000.0), approach_skew=(0.25, 1.75),
+            left=(0.1, 0.4))
 # The band `update_best` and `credit` are scored on: the training span itself.
 MAIN_BAND = "train 300-1000"
 # Five over a wider span, deliberately: the per-demand-group veto in `accept`
@@ -155,6 +176,19 @@ def world(agent, cond=SPAN, groups=N_GROUPS):
                             veh_head=VEH_HEAD, sig_head="duration")
     env.n_cond_groups = groups
     return env.set_agent(agent)
+
+
+def bank_from_json(d):
+    """A stored car ON TODAY'S COLUMN LAYOUT. A tree seeded from an older world
+    (`from_sig=`) was saved with fewer observation columns; `fit` widens what it
+    is given, but this script also runs the incumbent itself -- the kick, the
+    held-out credit, the per-band report -- and those read its laws against the
+    current design matrix directly."""
+    b = _bank_from_json(d)
+    names = list(world("vehicle").veh_names)
+    b = upgrade_layout(b, names, old_names=b.get("names") or names)
+    b["names"] = names
+    return b
 
 
 def _unused_load_vehicle(which="hand", path=VEHICLE):
@@ -256,10 +290,15 @@ def evaluate(vb, sb, n_ep=600, seed=999):
     # 600-800 STAYS, though it is no longer the top of the span, because it is
     # the band the previous configuration was reported on and dropping it would
     # break the comparison at the exact moment the world changed underneath it.
+    lband = lambda a, b: (world("vehicle", cond=dict(SPAN, left=(a, b)))
+                          .sample_starts(n_ep, np.random.default_rng(seed)))
     sets = {MAIN_BAND: tgt.sample_starts(n_ep, np.random.default_rng(seed)),
             "light 300-500": band(300.0, 500.0),
             "heavy 600-800": band(600.0, 800.0),
-            "peak 800-1000": band(800.0, 1000.0)}
+            "peak 800-1000": band(800.0, 1000.0),
+            # the second focus axis, reported on the same footing as demand
+            "few lefts .10-.25": lband(0.10, 0.25),
+            "many lefts .25-.40": lband(0.25, 0.40)}
     rows = {}
     for name, s in sets.items():
         R = lambda v, g: IF.run(tgt, v, g, s, tgt.duration, reward="car")
@@ -282,16 +321,70 @@ def evaluate(vb, sb, n_ep=600, seed=999):
     return rows
 
 
+FOCUS_FLOOR = 0.12          # the share of episodes a band keeps however far ahead
+
+
+def _share(deficits, floor):
+    """Weights over bands from their deficits, with a floor under each."""
+    d = [max(-x, 0.0) for x in deficits]           # positive = behind the hand car
+    n = len(d)
+    if sum(d) <= 0.0:
+        return [1.0 / n] * n                       # ahead everywhere: uniform
+    w = [floor + (1.0 - n * floor) * x / sum(d) for x in d]
+    return [x / sum(w) for x in w]
+
+
+def focus_weights(rows, floor=FOCUS_FLOOR):
+    """Training weights over three sub-bands of the span, from where the car is
+    losing to the hand follower.
+
+    THE DEFICIT, NOT THE RETURN. Peak demand scores worse than light demand
+    under any controller -- more cars cost more -- so weighting by the return
+    would pour every episode into the busiest band forever, whatever was
+    learnable there. `vs_hand` is the same episodes run by the follower, so it
+    is zero where this car already matches it and large only where a better
+    policy is known to exist. Measured at round 5: light +3869, heavy -5127,
+    peak -15437, which is the whole 15k deficit sitting in one band.
+
+    THE FLOOR IS THE POINT OF THE GUARD. `structure.accept` refuses a candidate
+    that loses on any demand group of the batch, and a band with no episodes
+    has no group -- so without a floor the search would be free to buy peak
+    demand with the light traffic it is currently winning. Every band keeps at
+    least `floor` of the batch, which is what leaves the guard something to see.
+    """
+    return dict(
+        demand=_share([rows["light 300-500"]["vs_hand"],
+                       rows["heavy 600-800"]["vs_hand"],
+                       rows["peak 800-1000"]["vs_hand"]], floor),
+        # TWO AXES, WEIGHTED INDEPENDENTLY, because `sample_starts` draws them
+        # independently: how busy the junction is, and how much of it turns
+        # left. A single joint table over both would need nine cells measured
+        # every round to fill it, and the floors alone would eat the budget.
+        left=_share([rows["few lefts .10-.25"]["vs_hand"],
+                     rows["many lefts .25-.40"]["vs_hand"]], floor))
+
+
 def credit(tgt, s, sb, new_vb, old_vb, z=2.0, g0=None):
-    """Did this car pass lose ground on held-out episodes? Signal held fixed."""
-    g1 = IF.run(tgt, new_vb, sb, s, tgt.duration, reward="car")
-    g0 = (IF.run(tgt, old_vb, sb, s, tgt.duration, reward="car")
-          if g0 is None else g0)
+    """Did this car pass lose ground on held-out episodes? Signal held fixed.
+
+    And did it crash more on them: the same rule `structure.accept` applies to
+    every move (`structure.CRASH_GATE`), applied once more to the whole pass,
+    since a round is many accepted moves and they are each judged on their own
+    episodes, not on these."""
+    st1, st0 = {}, {}
+    g1 = IF.run(tgt, new_vb, sb, s, tgt.duration, reward="car", stats=st1)
+    g0 = IF.run(tgt, old_vb, sb, s, tgt.duration, reward="car", stats=st0)
     d = g1 - g0
     se = float(d.std() / np.sqrt(len(d))) or 1e-9
     keep = float(d.mean()) > -z * se
-    print("   car on held-out episodes: %+.1f +-%.1f%s"
-          % (d.mean(), se, "" if keep else "   -- reverting this pass"), flush=True)
+    c1 = float((st1["rear"] + st1["cross"]).sum())
+    c0 = float((st0["rear"] + st0["cross"]).sum())
+    more = ST.CRASH_GATE and c1 > c0 + ST.CRASH_TOL
+    keep = keep and not more
+    print("   car on held-out episodes: %+.1f +-%.1f, crashes %d -> %d%s"
+          % (d.mean(), se, c0, c1, "" if keep else
+             "   -- reverting this pass" + (" (more crashes)" if more else "")),
+          flush=True)
     return keep, (g1 if keep else g0), float(d.mean()), se
 
 
@@ -335,21 +428,39 @@ def update_best(st, rows, r):
     return cur < best["train"] - 2.0 * max(se, best["se"])
 
 
-def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
-         n_guard=400, from_sig="", kern_every=3, car="hand", resume="best"):
+def main(rounds=100, n_ep=100, screen_ep=50, critic=1, seed=0, verbose=1,
+         n_guard=400, from_sig="", kern_every=3, car="hand", resume="best",
+         cem_ep=20, focus=1):
     rounds, n_ep, seed = int(rounds), int(n_ep), int(seed)
     critic, verbose, n_guard = bool(int(critic)), bool(int(verbose)), int(n_guard)
-    kern_every, screen_ep = int(kern_every), int(screen_ep)
+    kern_every, screen_ep, cem_ep = int(kern_every), int(screen_ep), int(cem_ep)
+    focus = bool(int(focus))
     # one line per learning step: every candidate priced against the incumbent
     ST.LOG_STEPS = True
     st = load_state()
     # START FROM WHAT WAS ALREADY FOUND. The state file is refused across a
     # configuration change -- the world is a different one -- but the tree is
     # still a tree, so it is seeded as the incumbent rather than thrown away.
-    if st["veh"] is None and from_sig and os.path.exists(from_sig):
+    # A SEED THAT CANNOT BE FOUND IS AN ERROR, not a cold start. The path was
+    # tested with `os.path.exists` against the working directory only, so
+    # `from_sig=runs/e39_best.json` typed from `experiments/` found nothing and
+    # the run began from a blank tree at G -198511 with no word said. A relative
+    # path is now also tried against the repo root, and if neither exists the
+    # run stops before it spends a round on the wrong incumbent.
+    if from_sig and not os.path.exists(from_sig):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        alt = os.path.join(root, from_sig)
+        if os.path.isabs(from_sig) or not os.path.exists(alt):
+            raise SystemExit("from_sig=%s: no such file (looked in %s and %s)"
+                             % (from_sig, os.getcwd(), root))
+        from_sig = alt
+    if st["veh"] is None and from_sig:
         with open(from_sig, encoding="utf-8") as fh:
             st["veh"] = json.load(fh)["veh"]
         print("   seeded the car from %s" % from_sig, flush=True)
+    elif from_sig:
+        print("   from_sig=%s IGNORED: %s already holds a car (round %d); move it "
+              "aside to seed" % (from_sig, STATE, st["round"]), flush=True)
     # RESUME FROM THE BEST TREE, NOT THE LAST ONE. `st["veh"]` is wherever the
     # search happened to stop, and a round is kept whenever it is not
     # SIGNIFICANTLY worse, so a run can drift down and did: rounds 3 and 4 of
@@ -385,7 +496,16 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # episodes by `credit`, which reverts a pass that lost ground.
                z=1.0,
                n_cover=6000, cover_ep=80, cem_iter=4, cem_K=32,
-               min_gain=1.0, critic=critic,
+               min_gain=1.0,
+               # A NEW ARM COSTS MORE THAN IT CLEARS. `min_gain` 1.0 is right
+               # for refining what is already there and far too low for adding
+               # to it: round 9 accepted `is_left>0.976 AND near_d<=5.415 ->
+               # const[2.6]` at +9.48 and `near_d>36.031` at +89.12, and every
+               # CEM sweep, threshold sweep and simplify pass from then on
+               # iterates over both. 100 is roughly a tenth of the noise a
+               # 100-episode paired test carries, so a structural move has to
+               # be worth seeing before it becomes permanent.
+               grow_min_gain=100.0, critic=critic,
                # A SPARSE PRIOR, NOT A CONSTANT ONE. `const` keeps only a
                # leaf's intercept so that every state dependence is a named
                # inducing point and "nothing hides in a dense affine prior".
@@ -459,6 +579,18 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # the other arm found its best by 2/10. 2.5x off a stage that
                # measured ~120 s an arm.
                cem_top=4,
+               # SCREEN 50, NOT 20. A screen ranks candidates by the maximum of
+               # noisy estimates, so its winner is the luckiest one, not the
+               # best: measured on this machine, the subtree stage screens 153
+               # candidates at 9.4 episodes/s, and at 20 episodes each carries
+               # se ~2500, which puts the expected maximum of 153 draws of pure
+               # noise near +6500. The block that prompted this screened
+               # +4809.05 and its six best confirmed at +200, +258, -1333,
+               # +1311, +214, +289 -- every one of them noise. At 50 the se is
+               # ~1550 and the inflation ~+4100, on 2.5x the screening time
+               # (326 s -> ~815 s for that stage). The principled fix is fewer
+               # candidates rather than more episodes; this is the half of it
+               # that costs nothing to try.
                screen_ep=screen_ep, grow_pool=28,
                # CEM's inner evaluations only RANK candidates to refit its
                # sampling distribution -- `improve_laws` still puts the result
@@ -467,7 +599,12 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
                # episode-units an arm against ~1000 for growing's confirms.
                # Measured 36.6 s -> 6.0 s at 20. Each iteration now draws a
                # fresh sample too, so a small screen cannot be chased.
-               cem_ep=screen_ep,
+               # ITS OWN KNOB SINCE THE SCREEN MOVED TO 50. These were one
+               # flag, so raising the screen would have carried CEM's 24x4
+               # evaluations an arm up with it -- the cost this comment was
+               # written to avoid. The screen has to discriminate; CEM only has
+               # to rank its own population.
+               cem_ep=cem_ep,
                # FIT LAWS BY VALUE, not only by picking from a vocabulary.
                value_laws=VALUE_LAWS,
                # GUARDS BY POPULATION SEARCH, priced by rollout like every
@@ -507,6 +644,21 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
         # has never fired: `fit` owns the stall counter, e38 calls it with
         # rounds=1, so `stalled` was reset to 0 before every single check.
         # The counter belongs out here, where the rounds actually are.
+        # WHERE THIS ROUND'S EPISODES COME FROM. `focus` re-weights the demand
+        # AND THE LEFT SHARE the SEARCH proposes and screens on, from the
+        # previous round's measured deficit against the hand follower; `tgt` -- the held-out credit, the
+        # per-band report and the stored best -- is never re-weighted, so what
+        # counts as better is the same question it was on round 0.
+        if focus and st.get("focus"):
+            f = st["focus"]
+            f = f if isinstance(f, dict) else dict(demand=f)     # older state files
+            env.set_band_weights(f.get("demand"))
+            env.set_left_weights(f.get("left"))
+            pc = lambda w: "/".join("%.0f%%" % (100 * x) for x in w)
+            print("   focus: demand %s (light/heavy/peak), left share %s (few/many)"
+                  % (pc(f["demand"]), pc(f["left"]) if f.get("left") else "uniform"),
+                  flush=True)
+
         kicked = None
         if sb is not None and st.get("stalled", 0) >= STALL_BEFORE_KICK:
             cov, _ = env.coverage_rows(sb, n_ep=60, seed=r)
@@ -566,7 +718,24 @@ def main(rounds=100, n_ep=100, screen_ep=20, critic=1, seed=0, verbose=1,
         save_state(st)
 
         rows = evaluate(sb, sig_partner)
-        st["stalled"] = 0 if mv else st.get("stalled", 0) + 1
+        if focus:
+            st["focus"] = focus_weights(rows)
+        # A MOVE IS NOT PROGRESS, and the cheap moves are always available. This
+        # reset on any accepted move, so a round that bought nothing still
+        # cleared the counter: round 5 accepted `prune` and scored +0.0 +-0.0 on
+        # held-out episodes, round 6 accepted `fit`'s slope prune at +244.86
+        # +-241.45. Three flat rounds in a row and `stalled` never passed 1, so
+        # `escape.kick` -- the one operator that exists for a tree with no
+        # accepted move left -- could not fire. The same starvation the counter
+        # was moved out of `fit` to fix, one level down. What counts is the
+        # held-out credit clearing its own noise; where there is no credit to
+        # read (the first round, or a hop in flight) an accepted move stands in
+        # for it, as before.
+        gained = bool(mv) and (cred["d"] > cred["se"] if cred else True)
+        st["stalled"] = 0 if gained else st.get("stalled", 0) + 1
+        if not gained and verbose:
+            print("   no progress this round -- stalled %d of %d before a kick"
+                  % (st["stalled"], STALL_BEFORE_KICK), flush=True)
         st["history"].append(dict(round=r, eval=rows, moves=mv, credit=cred,
                                   kick=kicked, stalled=st["stalled"]))
         revert = update_best(st, rows, r)

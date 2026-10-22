@@ -38,11 +38,25 @@ from .memsearch import discover as mem_discover, record
 from .escape import kick
 from .stepsearch import search_fails, search_steps
 from .structure import (absorb_universal, accept, collapse_bottom, drop_arm,
-                         polish_thresholds, prune_laws, reorder, score,
-                         simplify)
+                         merge_arms, polish_thresholds, prune_laws, reorder,
+                         score, simplify)
 
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
+    # WHAT A NEW ARM HAS TO BE WORTH, apart from what a refinement has to be
+    # worth. None follows `min_gain`. A structural move that clears the paired
+    # test but buys nothing is still a permanent cost: measured on e39 round 9,
+    # `is_left>0.976 AND near_d<=5.415 -> const[2.6]` was accepted at +9.48 and
+    # `near_d>36.031` at +89.12, and every later CEM sweep, threshold polish
+    # and simplify pass then iterates over them. Refinements inside existing
+    # arms are free by comparison, so they keep the lower bar.
+    grow_min_gain=None,
+    # AND IT RISES WITH THE TREE. An arm is not a one-off cost: every CEM sweep,
+    # threshold sweep, simplify pass and drop test from then on iterates over
+    # it, so the thirteenth arm has to earn more than the third did. The bar is
+    # `grow_min_gain * n_arms / grow_ref_arms`, floored at the flat value.
+    grow_ref_arms=8,
+    merge_at=1,
     grow_pool=60, grow_arms=4, max_arity=3, min_n=400, cem_top=10, n_pos=2,
     cem_iter=12, cem_K=96, cem_sigma=0.35,
     mem_at=1, mem_thr=7, mem_refine=3, beta_at=2, steps_at=2, n_cover=6000,
@@ -82,6 +96,8 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
     masked runs returned the same tree to the decimal.
     """
     cfg = dict(DEFAULTS, **(cfg or {}))
+    g_min = (cfg["min_gain"] if cfg.get("grow_min_gain") is None
+             else float(cfg["grow_min_gain"]))
     # THE HEAD COMES FROM THE WORLD, not from a flag. A world that offers a
     # discrete action set says so (`n_act`), and the law simply gets that many
     # outputs instead of two. Everything downstream -- CEM, grow, simplify,
@@ -382,44 +398,107 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         rec = dict(round=r, G_in=float(cur.mean()), V_in=v_in, seed=rseed,
                    moves=[], kick=rec_kick)
 
+        seeds = [c for c in seeds if all(l[0] < Z.shape[1] for l in c)]
+        # --- reshape what is already here, BEFORE anything is added ----------
+        # THE ROUND STARTS BY PUTTING THE TREE BACK TOGETHER. Both of these
+        # moves make the tree smaller or deeper without making it better --
+        # they are judged on absence of loss -- and both were running after
+        # `grow`, which is the wrong order twice over. A merge frees the arm
+        # budget that `grow`'s arm-count bar is charging against, so growing
+        # first pays the higher price and then discovers the duplicate it was
+        # charged for; and a subtree grown into a child is a better parent than
+        # the child plus whatever arm was appended beside it that round.
+        #
+        # PUT NEAR-DUPLICATES BACK TOGETHER. `simplify` and `drop_arm` can only
+        # take a tree apart, and neither can touch two arms that are one rule
+        # split in two: between them they own the region, so dropping either
+        # loses it. Runs on the rounds `merge_at` names, since it costs a paired
+        # test per pair tried.
+        if cfg.get("merge_at") is not None and r % max(cfg["merge_at"], 1) == 0:
+            n_before = len(bank["clauses"])
+            bank, cur, _mlog = merge_arms(env, bank, pol_fn, cur_G=cur,
+                                          n_ep=cfg["n_ep"], T=cfg["T"],
+                                          seed=rseed, z=cfg["z"], names=zn,
+                                          verbose=verbose)
+            if len(bank["clauses"]) < n_before:
+                rec["moves"].append("merge")
+        # --- nested subtrees: grow children INSIDE an existing child ---------
+        # On that child's own rows, with an alphabet fitted there and its law
+        # as the starting point (`subtree.py`). It ran after steps and
+        # terminations, so that a latched or multi-step child was never offered
+        # as a parent; running first it sees the arms as the previous round
+        # left them, and this round's latches are offered next round instead.
+        if r in cfg["subtree_at"]:
+            from .subtree import search_subtrees
+            zn_t = mem_names(names, bank.get("mem"))
+            pt = pol_fn(bank)
+            pt.reset(len(obs))
+            Zt = pt.z(obs, update=False)
+            bank, tlog = search_subtrees(
+                env, bank, names, zn_t, pol_fn, obs, Zt, verbose=verbose,
+                max_arms=cfg["subtree_arms"], pool=cfg["subtree_pool"],
+                min_gain=g_min,
+                screen_ep=cfg.get("screen_ep") or min(cfg["n_ep"], 120),
+                confirm_ep=cfg["n_ep"], T=cfg["T"], seed=rseed, z=cfg["z"],
+                rng=rng, weights=weights, cem_iter=max(2, cfg["cem_iter"] // 3),
+                cem_K=max(12, cfg["cem_K"] // 4))
+            if any(e.get("accepted") for e in tlog):
+                rec["moves"].append("subtree")
+                cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
+            weights.update_many(tlog)
+
+        # THE FORCED CLAUSE POOL BELONGS TO `grow` AND ONLY TO IT. `hot` indexes
+        # the rows of the FULL observation, and `search_subtrees` grows on a
+        # CHILD'S rows (`obs[own]`), so with the override installed a subtree
+        # round died on an index of 16033 into 10243 rows. It is installed here,
+        # after the moves that reshape the tree, and restored right after
+        # growing.
         import btind.grow_bt as _GB
         _cp = _GB._clause_pool
         _GB._clause_pool = (lambda rg, al, ZZ, _h, pl, ma, la, sd, *a,
                             _hot=hot, **kw:
                             _cp(rg, al, ZZ, _hot if len(_hot) else None, pl, ma,
                                 la, sd, *a, **kw))
-        seeds = [c for c in seeds if all(l[0] < Z.shape[1] for l in c)]
+        # the guard features follow the bank, and the bank may have just been
+        # reshaped; `grow` reads `Z` below
+        p = pol_fn(bank)
+        p.reset(len(obs))
+        Z = p.z(obs, update=False)
         n_arms_in = len(bank["clauses"])
-        bank, glog = grow(env, bank, names, zn, pol_fn, obs, Z,
-                          max_arms=cfg["grow_arms"], pool=cfg["grow_pool"],
-                          max_arity=cfg["max_arity"], min_n=cfg["min_n"],
-                          # `labels` was pinned to None here, which is what
-                          # kept the fitted-law source dark on every world.
-                          # `qhat` stays None: the gradient source needs an
-                          # advantage critic and this one sits at rank 0.05.
-                          min_gain=cfg["min_gain"], qhat=None,
-                          seed_clauses=seeds if r == 0 else None,
-                          # SCREEN CHEAP, CONFIRM FULL. Growing screened its whole
-                          # pool at the full episode count -- 40 candidates x n_ep
-                          # -- while every other search screens at a fraction and
-                          # only confirms survivors. Defaults to n_ep so nothing
-                          # that does not set it changes.
-                          labels=labels,
-                          min_lab=cfg["value_min_rows"],
-                          screen_ep=cfg.get("screen_ep") or cfg["n_ep"],
-                          confirm_ep=cfg["n_ep"],
-                          # HOW MANY SCREENED CANDIDATES GET POLISHED. The
-                          # rows are sorted by screen delta first, so this keeps
-                          # the best-screened k. It was pinned at 10 and is the
-                          # second-largest cost in a grow pass -- k x cem_K x
-                          # cem_iter x cem_ep episodes an arm, 25,600 at the
-                          # defaults, measured at ~120 s an arm on the car.
-                          cem_top=cfg["cem_top"], n_pos=cfg["n_pos"],
-                          n_confirm=10, T=cfg["T"], seed=rseed,
-                          z=cfg["z"], rng=rng, use_library=False,
-                          weights=weights, verbose=verbose)
+        try:
+            bank, glog = grow(env, bank, names, zn, pol_fn, obs, Z,
+                              max_arms=cfg["grow_arms"], pool=cfg["grow_pool"],
+                              max_arity=cfg["max_arity"], min_n=cfg["min_n"],
+                              # `labels` was pinned to None here, which is what
+                              # kept the fitted-law source dark on every world.
+                              # `qhat` stays None: the gradient source needs an
+                              # advantage critic and this one sits at rank 0.05.
+                              min_gain=g_min * max(1.0, n_arms_in
+                                                   / max(cfg["grow_ref_arms"], 1)),
+                              qhat=None,
+                              seed_clauses=seeds if r == 0 else None,
+                              # SCREEN CHEAP, CONFIRM FULL. Growing screened its whole
+                              # pool at the full episode count -- 40 candidates x n_ep
+                              # -- while every other search screens at a fraction and
+                              # only confirms survivors. Defaults to n_ep so nothing
+                              # that does not set it changes.
+                              labels=labels,
+                              min_lab=cfg["value_min_rows"],
+                              screen_ep=cfg.get("screen_ep") or cfg["n_ep"],
+                              confirm_ep=cfg["n_ep"],
+                              # HOW MANY SCREENED CANDIDATES GET POLISHED. The
+                              # rows are sorted by screen delta first, so this keeps
+                              # the best-screened k. It was pinned at 10 and is the
+                              # second-largest cost in a grow pass -- k x cem_K x
+                              # cem_iter x cem_ep episodes an arm, 25,600 at the
+                              # defaults, measured at ~120 s an arm on the car.
+                              cem_top=cfg["cem_top"], n_pos=cfg["n_pos"],
+                              n_confirm=10, T=cfg["T"], seed=rseed,
+                              z=cfg["z"], rng=rng, use_library=False,
+                              weights=weights, verbose=verbose)
+        finally:
+            _GB._clause_pool = _cp
         weights.update_many(glog)
-        _GB._clause_pool = _cp
         # a round that grew an arm is not a stalled round: the stall detector
         # (e35's curriculum) reads `moves`, and growth was never written there
         if len(bank["clauses"]) > n_arms_in:
@@ -627,29 +706,6 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                 rec["moves"].append("fail")
                 cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
             weights.update_many(slog + flog)
-
-        # --- nested subtrees: grow children INSIDE an existing child ---------
-        # On that child's own rows, with an alphabet fitted there and its law
-        # as the starting point (`subtree.py`). After steps and terminations,
-        # because a latched or multi-step child is not offered as a parent.
-        if r in cfg["subtree_at"]:
-            from .subtree import search_subtrees
-            zn = mem_names(names, bank.get("mem"))
-            p = pol_fn(bank)
-            p.reset(len(obs))
-            Zt = p.z(obs, update=False)
-            bank, tlog = search_subtrees(
-                env, bank, names, zn, pol_fn, obs, Zt, verbose=verbose,
-                max_arms=cfg["subtree_arms"], pool=cfg["subtree_pool"],
-                min_gain=cfg["min_gain"],
-                screen_ep=cfg.get("screen_ep") or min(cfg["n_ep"], 120),
-                confirm_ep=cfg["n_ep"], T=cfg["T"], seed=rseed, z=cfg["z"],
-                rng=rng, weights=weights, cem_iter=max(2, cfg["cem_iter"] // 3),
-                cem_K=max(12, cfg["cem_K"] // 4))
-            if any(e.get("accepted") for e in tlog):
-                rec["moves"].append("subtree")
-                cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
-            weights.update_many(tlog)
 
         bank, cur, _ = drop_arm(env, bank, pol_fn, cur, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=rseed, z=cfg["z"])

@@ -251,3 +251,21 @@ def test_a_declaration_reaches_the_other_cars():
     heard = env.observe_vehicles(s)[:, N.index("rival_pass")]
     assert "rival_pass" in N
     assert heard.shape[0] == s.shape[0] * env.N
+
+
+def test_exit_queue_columns_exact():
+    """`exit_gap` / `exit_dv` agree between `_exit_ahead` and the kernel.
+
+    The other cases here never READ them, so a wrong column would still agree
+    on the return; this tree brakes on them, and the check that it changed the
+    return is what makes the agreement mean something."""
+    s = _starts()
+    extra = [[[IX("exit_gap"), 20.0, True], [IX("d_stop"), 0.0, False]],
+             [[IX("exit_dv"), 1.0, False], [IX("near_int"), 0.5, False]]]
+    base = veh_bank()
+    d = len(mem_names(N, None)) + 1
+    vb = check_arms(dict(base, clauses=extra + base["clauses"],
+                         laws=[_pref(0, d, 5), _pref(1, d, 5)] + base["laws"]), "veh")
+    gp, gk = _both(vb, None, s)
+    assert np.abs(gp - gk).max() < 1e-9, np.abs(gp - gk).max()
+    assert np.abs(gk - IF.run(ENV, base, None, s, ENV.duration)).max() > 0
