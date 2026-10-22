@@ -33,6 +33,7 @@ from . import valuesplit as VS
 from .betasearch import search_beta
 from .grow_bt import failure_states, grow
 from .lawcem import cem_law, improve_laws
+from .structure import adopted
 from .memory import MemBank, emit, mem_names
 from .memsearch import discover as mem_discover, record
 from .escape import kick
@@ -40,6 +41,11 @@ from .stepsearch import search_fails, search_steps
 from .structure import (absorb_universal, accept, collapse_bottom, drop_arm,
                          merge_arms, polish_thresholds, prune_laws, reorder,
                          score, simplify)
+
+# pseudo-trials a world's column prior is worth (`env.column_prior`): against the
+# Beta(2, 6) start, a column at prior 1 is proposed at (2+3)/(8+3) = 0.45, one at
+# 0 at 2/11 = 0.18 -- a tilt that a few real accept / reject outcomes outweigh
+PRIOR_N = 3.0
 
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
@@ -71,6 +77,12 @@ DEFAULTS = dict(
     # guards proposed by population search over the value loss (`evotm`)
     evo_clauses=0, evo_generations=40, evo_arity=2,
     stall_before_kick=2, kick_size=1, hop_budget=2,
+    # EPSILON-GREEDY SEARCH (off at eps0 = 0): in round r, eps = eps0 * eps_decay**r is both
+    # the share of proposal columns drawn uniformly (proposal.Weights.eps) and the chance
+    # of an exploratory kick from the incumbent -- a random new arm (escape.explore_arm) or
+    # a structural kick -- when the search is not stalled. Early rounds explore, later ones
+    # exploit; a kick is kept only if it pays on the validation seed within hop_budget rounds
+    eps0=0.0, eps_decay=0.5,
     seed_stride=1009, val_seed=90210, val_ep=1200,
 )
 
@@ -189,6 +201,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                         K=cfg["cem_K"], sigma0=cfg["cem_sigma"],
                         n_ep=cfg["n_ep"], T=cfg["T"], seed=cfg["seed"], rng=rng)
         bank = dict(seed_bank, default=th)
+        adopted(env, bank)
         if verbose:
             print("  cold start: default law by CEM, G %.2f"
                   % score(env, bank, pol_fn, cfg["n_ep"], cfg["T"],
@@ -196,6 +209,27 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
 
     weights = PR.load(env, len(mem_names(names, None)) + 8)
     weights.n = len(mem_names(names, None)) + 8
+    # A WORLD'S OWN PRIOR ON ITS COLUMNS. A world that can measure what each
+    # column is worth per decision -- a portfolio's per-stock credit on its
+    # search episodes (`column_prior`, in [0, 1] per column) -- tilts the
+    # proposal weights toward those columns by PRIOR_N pseudo-trials, ONCE per
+    # world (`prior_applied` is stored with the weights, so weights learned
+    # before the prior existed get it too); the learned accept / try counts
+    # take over as they accumulate. It only aims proposals: every move is still
+    # accepted by the paired test.
+    if hasattr(env, "column_prior") and not getattr(weights, "prior_applied", False):
+        p = env.column_prior(bank)
+        if p is not None:
+            k = min(len(p), weights.n)
+            weights.acc[:k] += PRIOR_N * np.asarray(p[:k], float)
+            weights.tried[:k] += PRIOR_N
+            weights.prior_applied = True
+            PR.save(env, weights)
+            if verbose:
+                zn_ = mem_names(names, None)
+                best = np.argsort(-np.asarray(p[:k]))[:6]
+                print("  column prior from the world's credit: %s"
+                      % ", ".join("%s %.2f" % (zn_[j], p[j]) for j in best), flush=True)
     if verbose:
         top = weights.top(mem_names(names, None) + ["mem"] * 8, k=5)
         if any(t[3] for t in top):
@@ -381,7 +415,23 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         # THE HOP HAPPENS AFTER A STALLED ROUND, not on a schedule. A round
         # that accepted something has not run out of monotone moves yet, and
         # kicking it would throw away progress the test had already bought.
-        if stalled >= cfg["stall_before_kick"]:
+        eps_r = float(cfg.get("eps0", 0.0)) * float(cfg.get("eps_decay", 0.5)) ** r
+        weights.eps = eps_r
+        explore_now = (eps_r > 0 and stalled < cfg["stall_before_kick"] and rng.random() < eps_r)
+        if explore_now:
+            from .escape import explore_arm
+            if not best_bank["clauses"] or rng.random() < 0.5:
+                bank, why = explore_arm(best_bank, rng, Z)
+            else:
+                bank, why = kick(best_bank, Z, rng, n=cfg["kick_size"])
+            hop_left = cfg["hop_budget"]
+            cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
+            if verbose:
+                print("  [round %d] epsilon %.2f -- explore: %s  (G %.2f -> %.2f, to be re-optimised)"
+                      % (r, eps_r, why, best_V if best_V is not None else float("nan"), cur.mean()),
+                      flush=True)
+            rec_kick = "explore: " + why
+        elif stalled >= cfg["stall_before_kick"]:
             # PROPOSE FROM THE INCUMBENT, always. A hop starts where the search
             # actually is, not where the last abandoned hop left it.
             bank, why = kick(best_bank, Z, rng, n=cfg["kick_size"])
@@ -506,6 +556,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         bank, cur, _ = simplify(env, bank, pol_fn, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=rseed, z=cfg["z"],
                                 names=zn, verbose=verbose)
+        adopted(env, bank)
         # BEFORE ANYTHING IS APPENDED, make sure the end of the tree is
         # reachable. A guard that matches every state turns its arm into a
         # second default and every arm below it into dead code -- which is
@@ -514,6 +565,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                                n_ep=cfg["n_ep"], T=cfg["T"],
                                                seed=rseed, z=cfg["z"],
                                                names=zn, verbose=verbose)
+        adopted(env, bank)
         if absorbed:
             rec["moves"].append("absorb")
         # A GUARD THAT IS A PASSENGER GOES. The bottom arm's law is offered
@@ -527,6 +579,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
             if not did:
                 break
             rec["moves"].append("collapse")
+            adopted(env, bank)
         bank, cur, llog = improve_laws(env, bank, pol_fn, cur=cur,
                                        n_ep=cfg["n_ep"], T=cfg["T"],
                                        seed=rseed, z=cfg["z"],
@@ -540,6 +593,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                                             n_ep=cfg["n_ep"], T=cfg["T"],
                                             seed=rseed, z=cfg["z"],
                                             names=zn, verbose=verbose)
+        adopted(env, bank)
         if any(x["accepted"] for x in plog):
             rec["moves"].append("thresholds")
         # A COEFFICIENT THAT CHANGES NOTHING IS NOT A RULE. Every slope that
@@ -572,6 +626,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                 if ok:
                     bank, cur = pruned, g
                     rec["moves"].append("prune")
+                    adopted(env, bank)
 
         # --- kernel-interpolation leaves: inducing points on the busiest laws --
         # Anchored where deviations paid, columns chosen by rollout, tuned by
@@ -709,6 +764,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
 
         bank, cur, _ = drop_arm(env, bank, pol_fn, cur, n_ep=cfg["n_ep"],
                                 T=cfg["T"], seed=rseed, z=cfg["z"])
+        adopted(env, bank)
         rec["G_out"] = float(score(env, bank, pol_fn, cfg["n_ep"], cfg["T"],
                                    rseed).mean())
         rec["n_arms"] = len(bank["clauses"])
@@ -729,6 +785,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           flush=True)
                 bank = best_bank
                 rec["moves"].append("hop-abandoned")
+                adopted(env, bank)
         stalled = 0 if rec["moves"] else stalled + 1
         log.append(rec)
         # CHECKPOINT. A run killed in round 4 used to leave nothing behind, and
@@ -755,6 +812,7 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                   " -- reverting to the best bank held" % (final, best_V),
                   flush=True)
         bank = best_bank
+        adopted(env, bank)
 
     from .structure import heldout
     m = None

@@ -27,7 +27,7 @@ is worse by construction. Judging the kick itself would reject every hop.
 """
 import numpy as np
 
-from .memory import reindex
+from .memory import insert_arm, reindex
 
 
 def _drop(bank, rng):
@@ -114,3 +114,29 @@ def kick(bank, Z, rng, n=1):
         if b is not None:
             out, _ = b, why.append(lab)
     return out, "; ".join(why) or "no-op"
+
+
+def explore_arm(bank, rng, Z, max_lits=2):
+    """EPSILON EXPLORATION: a random arm on top of the tree -- a guard of 1..max_lits
+    literals on uniformly drawn observation columns, each threshold at a random quantile
+    (10-90%) of the rows the tree sees (Z), a random side, and a constant preference for a
+    random action -- applied without a test, like `kick`. Unlike `kick` it can move a tree
+    with NO arms, which every other kick leaves untouched ("kick: no-op"), so an empty tree
+    sitting in its basin still gets pushed out of it. The hop that follows re-optimises it;
+    the run keeps it only if it pays on the validation seed within `hop_budget` rounds."""
+    n_obs = len(bank["names"])
+    law = np.zeros_like(np.asarray(bank["default"], float))
+    a = int(rng.integers(law.shape[1]))
+    law[-1, a] = 1.0
+    clause = []
+    for _ in range(int(rng.integers(1, max_lits + 1))):
+        j = int(rng.integers(n_obs))
+        col = Z[:, j][np.isfinite(Z[:, j])] if len(Z) else np.zeros(0)
+        if len(col) < 10 or np.ptp(col) == 0:
+            continue
+        clause.append([j, float(np.quantile(col, rng.uniform(0.1, 0.9))), bool(rng.random() < 0.5)])
+    if not clause:
+        return bank, "no-op"
+    names = list(bank["names"])
+    lab = " AND ".join("%s%s%.3g" % (names[j], "<=" if neg else ">", t) for j, t, neg in clause)
+    return insert_arm(bank, clause, law, 0), "new arm IF %s -> action %d" % (lab, a)
