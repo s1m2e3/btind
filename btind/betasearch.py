@@ -35,7 +35,14 @@ def churn(env, bank, pol_fn, n_ep=200, T=400, seed=11):
     Returns, for each arm, how often an episode leaves it and comes back, and
     the mean length of an uninterrupted run. Ranking by re-entries puts the
     arms that might want to persist at the front of the search.
+
+    A world that simulates whole episodes and has no observe / step (PortfolioWorld)
+    supplies the trace itself: `env.arm_trace(bank, pol_fn, n_ep, seed)` returns the arm
+    of every row at every decision and whether the row was alive.
     """
+    if hasattr(env, "arm_trace"):
+        A, AL = env.arm_trace(bank, pol_fn, n_ep=n_ep, seed=seed)
+        return _churn_stats(bank, A, AL, n_ep)
     A, AL, row_scale = _arms_on_kernel(env, bank, n_ep, T, seed)
     if A is not None:
         return _churn_stats(bank, A, AL, n_ep, row_scale)

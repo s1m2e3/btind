@@ -78,7 +78,15 @@ class Weights:
             m[list(cols)] = True
             w = np.where(m, w, 0.0)
         s = w.sum()
-        return w / s if s > 0 else np.full(self.n, 1.0 / self.n)
+        p = w / s if s > 0 else np.full(self.n, 1.0 / self.n)
+        # EPSILON: with probability `eps` (rlfit sets it per round, decaying) a column is
+        # drawn uniformly among the allowed ones instead of by what was learned -- early
+        # rounds explore columns the learned weights and the world's prior would starve
+        eps = float(getattr(self, "eps", 0.0) or 0.0)
+        if eps > 0:
+            allowed = (w > 0) if s > 0 else np.ones(self.n, bool)
+            p = (1.0 - eps) * p + eps * allowed / allowed.sum()
+        return p
 
     def update(self, clause, accepted):
         for lit in clause:
@@ -112,7 +120,8 @@ class Weights:
     def to_json(self):
         return dict(n=self.n, a=self.a, b=self.b, acc=self.acc.tolist(),
                     tried=self.tried.tolist(),
-                    src={k: list(v) for k, v in self.src.items()})
+                    src={k: list(v) for k, v in self.src.items()},
+                    prior_applied=bool(getattr(self, "prior_applied", False)))
 
     @classmethod
     def from_json(cls, d):
@@ -120,6 +129,9 @@ class Weights:
         w.acc = np.asarray(d["acc"], float)
         w.tried = np.asarray(d["tried"], float)
         w.src = {k: [float(v[0]), float(v[1])] for k, v in (d.get("src") or {}).items()}
+        # whether a world's column prior (rlfit, env.column_prior) was already added: once
+        # per world, so weights learned before the prior existed get it too, and never twice
+        w.prior_applied = bool(d.get("prior_applied", False))
         return w
 
 

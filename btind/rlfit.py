@@ -42,6 +42,11 @@ from .structure import (absorb_universal, accept, collapse_bottom, drop_arm,
                          polish_thresholds, prune_laws, reorder, score,
                          simplify)
 
+# pseudo-trials a world's column prior is worth (`env.column_prior`): against the
+# Beta(2, 6) start, a column at prior 1 is proposed at (2+3)/(8+3) = 0.45, one at
+# 0 at 2/11 = 0.18 -- a tilt that a few real accept / reject outcomes outweigh
+PRIOR_N = 3.0
+
 DEFAULTS = dict(
     n_ep=400, T=400, seed=777, z=2.0, min_gain=0.3,
     grow_pool=60, grow_arms=4, max_arity=3, min_n=400, cem_top=10, n_pos=2,
@@ -58,6 +63,12 @@ DEFAULTS = dict(
     # guards proposed by population search over the value loss (`evotm`)
     evo_clauses=0, evo_generations=40, evo_arity=2,
     stall_before_kick=2, kick_size=1, hop_budget=2,
+    # EPSILON-GREEDY SEARCH (off at eps0 = 0): in round r, eps = eps0 * eps_decay**r is both
+    # the share of proposal columns drawn uniformly (proposal.Weights.eps) and the chance
+    # of an exploratory kick from the incumbent -- a random new arm (escape.explore_arm) or
+    # a structural kick -- when the search is not stalled. Early rounds explore, later ones
+    # exploit; a kick is kept only if it pays on the validation seed within hop_budget rounds
+    eps0=0.0, eps_decay=0.5,
     seed_stride=1009, val_seed=90210, val_ep=1200,
 )
 
@@ -182,6 +193,27 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
 
     weights = PR.load(env, len(mem_names(names, None)) + 8)
     weights.n = len(mem_names(names, None)) + 8
+    # A WORLD'S OWN PRIOR ON ITS COLUMNS. A world that can measure what each
+    # column is worth per decision -- a portfolio's per-stock credit on its
+    # search episodes (`column_prior`, in [0, 1] per column) -- tilts the
+    # proposal weights toward those columns by PRIOR_N pseudo-trials, ONCE per
+    # world (`prior_applied` is stored with the weights, so weights learned
+    # before the prior existed get it too); the learned accept / try counts
+    # take over as they accumulate. It only aims proposals: every move is still
+    # accepted by the paired test.
+    if hasattr(env, "column_prior") and not getattr(weights, "prior_applied", False):
+        p = env.column_prior(bank)
+        if p is not None:
+            k = min(len(p), weights.n)
+            weights.acc[:k] += PRIOR_N * np.asarray(p[:k], float)
+            weights.tried[:k] += PRIOR_N
+            weights.prior_applied = True
+            PR.save(env, weights)
+            if verbose:
+                zn_ = mem_names(names, None)
+                best = np.argsort(-np.asarray(p[:k]))[:6]
+                print("  column prior from the world's credit: %s"
+                      % ", ".join("%s %.2f" % (zn_[j], p[j]) for j in best), flush=True)
     if verbose:
         top = weights.top(mem_names(names, None) + ["mem"] * 8, k=5)
         if any(t[3] for t in top):
@@ -367,7 +399,23 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
         # THE HOP HAPPENS AFTER A STALLED ROUND, not on a schedule. A round
         # that accepted something has not run out of monotone moves yet, and
         # kicking it would throw away progress the test had already bought.
-        if stalled >= cfg["stall_before_kick"]:
+        eps_r = float(cfg.get("eps0", 0.0)) * float(cfg.get("eps_decay", 0.5)) ** r
+        weights.eps = eps_r
+        explore_now = (eps_r > 0 and stalled < cfg["stall_before_kick"] and rng.random() < eps_r)
+        if explore_now:
+            from .escape import explore_arm
+            if not best_bank["clauses"] or rng.random() < 0.5:
+                bank, why = explore_arm(best_bank, rng, Z)
+            else:
+                bank, why = kick(best_bank, Z, rng, n=cfg["kick_size"])
+            hop_left = cfg["hop_budget"]
+            cur = score(env, bank, pol_fn, cfg["n_ep"], cfg["T"], rseed)
+            if verbose:
+                print("  [round %d] epsilon %.2f -- explore: %s  (G %.2f -> %.2f, to be re-optimised)"
+                      % (r, eps_r, why, best_V if best_V is not None else float("nan"), cur.mean()),
+                      flush=True)
+            rec_kick = "explore: " + why
+        elif stalled >= cfg["stall_before_kick"]:
             # PROPOSE FROM THE INCUMBENT, always. A hop starts where the search
             # actually is, not where the last abandoned hop left it.
             bank, why = kick(best_bank, Z, rng, n=cfg["kick_size"])
@@ -399,7 +447,10 @@ def fit(env, names, rounds=3, warm=True, cfg=None, rng=None, verbose=True,
                           # kept the fitted-law source dark on every world.
                           # `qhat` stays None: the gradient source needs an
                           # advantage critic and this one sits at rank 0.05.
-                          min_gain=cfg["min_gain"], qhat=None,
+                          # a NEW ARM may demand more than the other moves:
+                          # grow_min_gain when the world sets it (a portfolio's
+                          # 0.4 %/yr), else min_gain -- it was set and never read
+                          min_gain=cfg.get("grow_min_gain", cfg["min_gain"]), qhat=None,
                           seed_clauses=seeds if r == 0 else None,
                           # SCREEN CHEAP, CONFIRM FULL. Growing screened its whole
                           # pool at the full episode count -- 40 candidates x n_ep

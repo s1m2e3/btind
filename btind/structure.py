@@ -426,19 +426,22 @@ def heldout(env, bank, seeds=(11, 12, 13), n_ep=1000, T=None):
     has. Returns dict(G, ci) or None when the bank cannot run on a kernel.
     """
     T = T if T is not None else getattr(env, "duration", 400)
-    gs = []
+    gs, sts = [], []
     for sd in seeds:
         env.seed_kernels(sd)
+        st = starts(env, n_ep, sd)
         if hasattr(env, "score_bank"):       # a world that scores its own episodes
             from .memory import MemBank
-            g = env.score_bank(bank, lambda b: MemBank(b, len(env.names)), starts(env, n_ep, sd), T)
+            g = env.score_bank(bank, lambda b: MemBank(b, len(env.names)), st, T)
         else:
-            g = fast_rollout(env, bank, starts(env, n_ep, sd), T)
+            g = fast_rollout(env, bank, st, T)
         if g is None:
             return None
         gs.append(g)
+        sts.append(np.asarray(st))
     g = np.concatenate(gs)
-    return dict(G=float(g.mean()), ci=float(1.96 * g.std() / np.sqrt(len(g))))
+    # cluster-robust where the world says which episodes share history (see mean_se)
+    return dict(G=float(g.mean()), ci=float(1.96 * mean_se(env, g, np.concatenate(sts))))
 
 
 def _fast_score(env, bank, n_ep, T, seed):
@@ -466,6 +469,53 @@ def adopted(env, bank):
         hook(bank)
 
 
+def mean_se(env, d, st):
+    """Standard error of mean(d) over the episodes starting at `st`.
+
+    A world whose episodes OVERLAP in time says which ones share history through
+    `env.cluster_ids(starts)`; the SE is then cluster-robust (the spread of the
+    per-cluster sums of deviations, small-sample corrected), never below the naive
+    std / sqrt(n). Measured on the portfolio world: 400 six-month episodes drawn from
+    five held-out years were ~10 independent half-years, and the naive SE (+13.8 +- 0.6
+    held out) let through a tree that lost 11.5 on untouched years. Worlds without the
+    hook are unchanged.
+    """
+    d = np.asarray(d, float)
+    naive = d.std() / np.sqrt(len(d))
+    if not hasattr(env, "cluster_ids") or st is None or len(st) != len(d):
+        return max(naive, 1e-12)
+    _, inv = np.unique(np.asarray(env.cluster_ids(np.asarray(st))), return_inverse=True)
+    G = int(inv.max()) + 1
+    if G < 2:
+        return max(naive, 1e-12)
+    s = np.bincount(inv, weights=d - d.mean(), minlength=G)
+    return max(np.sqrt(G / (G - 1) * np.sum(s ** 2)) / len(d), naive, 1e-12)
+
+
+def weighted_mean_se(env, d, st, w):
+    """(weighted mean of d, its cluster-robust SE, the EFFECTIVE number of clusters) with
+    episode weights w > 0: the influence w_i (d_i - m) / sum(w) summed per cluster
+    (env.cluster_ids), small-sample corrected, never below the naive weighted SE. Weighting
+    leans on some clusters more than others, so it holds fewer independent pieces of
+    evidence than it has clusters: G_eff = (sum W_g)^2 / sum W_g^2 of the clusters' total
+    weights -- what the t critical value and the evidence minimum must use (measured on a
+    heteroskedastic null: t(G - 1) accepted 9.2% at a nominal 6.7%)."""
+    d, w = np.asarray(d, float), np.asarray(w, float)
+    m = float((w * d).sum() / w.sum())
+    u = w * (d - m) / w.sum()
+    naive = float(np.sqrt((u ** 2).sum()))
+    if not hasattr(env, "cluster_ids") or st is None or len(st) != len(d):
+        return m, max(naive, 1e-12), None
+    _, inv = np.unique(np.asarray(env.cluster_ids(np.asarray(st))), return_inverse=True)
+    G = int(inv.max()) + 1
+    if G < 2:
+        return m, max(naive, 1e-12), float(G)
+    s = np.bincount(inv, weights=u, minlength=G)
+    W = np.bincount(inv, weights=w, minlength=G)
+    g_eff = float(W.sum() ** 2 / (W ** 2).sum())
+    return m, max(float(np.sqrt(G / (G - 1) * np.sum(s ** 2))), naive, 1e-12), g_eff
+
+
 def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
            margin=0.25):
     """Paired z-test. 'gain' demands improvement; 'noninferior' absence of loss.
@@ -480,12 +530,37 @@ def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
     """
     g = score(env, cand, pol_fn, n_ep, T, seed)
     d = g - ref_G
-    se = max(d.std() / np.sqrt(len(d)), 1e-12)
-    ok = (d.mean() > z * se if side == "gain"
-          else (d.mean() > -margin and d.mean() > -z * se))
+    st = starts(env, n_ep, seed) if hasattr(env, "cluster_ids") else None
+    # CONDITIONAL WEIGHTS (optional, `env.episode_weights(starts)`): a world that knows, at
+    # each episode's START, how noisy that episode's paired difference will be -- a
+    # portfolio's volatility forecast -- weights each episode by the inverse of that
+    # variance (GLS): a calm half-year's win then counts for more than a crash's coin flip.
+    # Weights use nothing after the start; the SE is the weighted cluster-robust one.
+    w = env.episode_weights(np.asarray(st)) if (st is not None and hasattr(env, "episode_weights")) else None
+    g_eff = None
+    if w is not None:
+        dm, se, g_eff = weighted_mean_se(env, d, st, w)
+    else:
+        dm, se = float(d.mean()), mean_se(env, d, st)
+    zc, enough = z, True
+    if st is not None:
+        # FEW CLUSTERS, THIN EVIDENCE. With G clusters the mean over them is compared with
+        # Student's t on G - 1 degrees of freedom at the confidence z stands for, not with
+        # the normal; and a GAIN needs at least `env.min_clusters` of them. Measured on the
+        # portfolio world: a walk-forward window whose held-out fold was 2008-2009 alone (4
+        # half-years) accepted a crash rule at +36.6 +- 37.8 %/yr -- one crash, not evidence.
+        from scipy import stats
+        n_cl = len(np.unique(np.asarray(env.cluster_ids(np.asarray(st)))))
+        if g_eff is not None:                         # weighted: its effective clusters
+            n_cl = min(n_cl, g_eff)
+        if n_cl >= 2:
+            zc = float(stats.t.ppf(stats.norm.cdf(z), n_cl - 1))
+        enough = n_cl >= getattr(env, "min_clusters", 0)
+    ok = (dm > zc * se and enough if side == "gain"
+          else (dm > -margin and dm > -zc * se))
     _steps[0] += 1
     _step_row = (_steps[0], sys._getframe(1).f_code.co_name, int(n_ep),
-                 float(d.mean()), float(se), side)
+                 float(dm), float(se), side)
     # NO CONDITION MAY PAY FOR ANOTHER. On a world with a condition
     # distribution an average gain can hide a significant loss in light or in
     # heavy traffic; a move is rejected if any demand group loses by more than
@@ -495,8 +570,9 @@ def accept(env, cand, pol_fn, ref_G, n_ep, T, seed, z=2.0, side="gain",
     worst = None
     if groups is not None:
         for gi in np.unique(groups):
-            dg = d[groups == gi]
-            if len(dg) > 5 and dg.mean() < -z * max(dg.std() / np.sqrt(len(dg)), 1e-12):
+            m = groups == gi
+            dg = d[m]
+            if len(dg) > 5 and dg.mean() < -zc * mean_se(env, dg, None if st is None else np.asarray(st)[m]):
                 ok, worst = False, int(gi)
                 break
     if LOG_STEPS:
